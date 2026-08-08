@@ -82,18 +82,12 @@ class UnverifiedWearProtocol implements WearProtocol {
 
   InstallTask _blockedTask(InstallKind kind, String path, String chain) {
     final name = path.split(RegExp(r'[/\\]')).last;
-    final capabilityOk = switch (kind) {
-      InstallKind.watchface => deviceProfile?.capabilities.watchface ?? false,
-      InstallKind.quickApp => deviceProfile?.capabilities.thirdPartyApp ?? false,
-    };
     return InstallTask(
       kind: kind,
       fileName: name,
       stage: InstallStage.waitingForProtocol,
-      message: capabilityOk
-          ? '设备已声明能力，但私有协议尚未通过 HCI 验证，未发送任何数据。'
-              '（$chain）'
-          : '设备未声明该能力或协议未验证，未发送任何数据。',
+      message: '认证和 Mass 外层已验证；预安装/结果业务命令的加密计数器'
+          '尚待真机帧逐条确认，未发送任何数据。 （$chain）',
     );
   }
 }

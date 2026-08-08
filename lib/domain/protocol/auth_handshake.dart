@@ -58,6 +58,7 @@ abstract final class XiaomiAuth {
       int? subtype;
       int? status;
       int? authStatus;
+      List<int>? appNonce;
       List<int>? watchNonce;
       List<int>? watchHmac;
       while (!r.isAtEnd) {
@@ -72,6 +73,16 @@ abstract final class XiaomiAuth {
             final (commandField, commandWire) = command.readFieldHeader();
             if (commandField == 3 && commandWire == 0) {
               authStatus = command.readVarint();
+            } else if (commandField == 30 && commandWire == 2) {
+              final verify = ProtoReader(command.readBytes());
+              while (!verify.isAtEnd) {
+                final (verifyField, verifyWire) = verify.readFieldHeader();
+                if (verifyField == 1 && verifyWire == 2) {
+                  appNonce = verify.readBytes();
+                } else {
+                  verify.skipField(verifyWire);
+                }
+              }
             } else if (commandField == 31 && commandWire == 2) {
               final verify = ProtoReader(command.readBytes());
               while (!verify.isAtEnd) {
@@ -109,6 +120,7 @@ abstract final class XiaomiAuth {
         subtype: subtype,
         status: status,
         authStatus: authStatus,
+        appNonce: appNonce,
         watchNonce: watchNonce,
         watchHmac: watchHmac,
       );
@@ -257,6 +269,7 @@ class ParsedAuthCommand {
     this.subtype,
     this.status,
     this.authStatus,
+    this.appNonce,
     this.watchNonce,
     this.watchHmac,
   });
@@ -265,6 +278,7 @@ class ParsedAuthCommand {
   final int? subtype;
   final int? status;
   final int? authStatus;
+  final List<int>? appNonce;
   final List<int>? watchNonce;
   final List<int>? watchHmac;
 }

@@ -1,3 +1,6 @@
+import 'dart:io';
+import 'dart:typed_data';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -6,6 +9,7 @@ import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
 import 'application/device_controller.dart';
 import 'domain/device_profile.dart';
 import 'domain/install_task.dart';
+import 'domain/protocol/hci_decoder.dart';
 import 'domain/wear_protocol.dart';
 
 void main() => runApp(const MiWearableApp());
@@ -113,7 +117,18 @@ class HomePage extends StatelessWidget {
   Widget build(BuildContext context) {
     final device = controller.connectedDevice;
     return Scaffold(
-      appBar: AppBar(title: const Text('MiWearable 安装工具')),
+      appBar: AppBar(
+        title: const Text('MiWearable 安装工具'),
+        actions: [
+          IconButton(
+            tooltip: '离线 HCI 解码',
+            icon: const Icon(Icons.data_object_outlined),
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(builder: (_) => const _HciDecoderPage()),
+            ),
+          ),
+        ],
+      ),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
@@ -167,19 +182,24 @@ class HomePage extends StatelessWidget {
               ),
           ] else ...[
             const SizedBox(height: 12),
-            Text('实验性安装', style: Theme.of(context).textTheme.titleMedium),
-            const Text('文件可被选择，但私有协议尚未验证前不会发送数据。'),
+            _SessionStatusCard(
+              sessionReady: controller.sessionReady,
+              installTransportVerified: kProtocolVerified,
+            ),
+            const SizedBox(height: 12),
+            Text('安装准备', style: Theme.of(context).textTheme.titleMedium),
+            const Text('可导入表盘或快应用以检查安装入口；未完成数据通道真机验证前，程序不会传输文件。'),
             const SizedBox(height: 8),
             FilledButton.tonalIcon(
               onPressed: () => _pickAndTry(context, InstallKind.watchface),
               icon: const Icon(Icons.watch),
-              label: const Text('选择表盘 .bin 并尝试'),
+              label: const Text('选择表盘 .bin，生成安装计划'),
             ),
             const SizedBox(height: 8),
             FilledButton.tonalIcon(
               onPressed: () => _pickAndTry(context, InstallKind.quickApp),
               icon: const Icon(Icons.apps),
-              label: const Text('选择快应用 .rpk 并尝试'),
+              label: const Text('选择快应用 .rpk，生成安装计划'),
             ),
             const SizedBox(height: 8),
             if (controller.isConnected)
@@ -188,7 +208,7 @@ class HomePage extends StatelessWidget {
                 child: Text(
                   kProtocolVerified
                       ? '已启用经过真机验证的私有协议操作。'
-                      : 'SPP/authkey 会话可验证；表盘、快应用与其他业务帧仍处于安全门控状态。',
+                      : 'SPP/authkey 会话已可验证；表盘、快应用数据通道仍处于安全门控状态。',
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
               ),
@@ -244,6 +264,203 @@ class HomePage extends StatelessWidget {
           ],
           const SizedBox(height: 12),
           _LogPanel(logs: controller.logs, onClear: controller.clearLogs),
+        ],
+      ),
+    );
+  }
+}
+
+/// 把“GATT 已连接”“authkey 会话已就绪”“安装传输已验证”分开显示，避免把
+/// 蓝牙连接成功误解为已经能安全安装文件。
+class _SessionStatusCard extends StatelessWidget {
+  const _SessionStatusCard({
+    required this.sessionReady,
+    required this.installTransportVerified,
+  });
+
+  final bool sessionReady;
+  final bool installTransportVerified;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = Theme.of(context).colorScheme;
+    final title = installTransportVerified
+        ? '安装数据通道已验证'
+        : sessionReady
+            ? 'authkey 会话已验证'
+            : '等待 authkey 会话验证';
+    final detail = installTransportVerified
+        ? '可使用已验证的安装流程。'
+        : sessionReady
+            ? '已建立身份会话。Mass 数据通道与业务加密帧仍需真机抓包核验，安装发送已锁定。'
+            : '请点击“通过 SPP 验证 authkey”。GATT 连接本身不代表可安装。';
+    final icon = installTransportVerified
+        ? Icons.verified
+        : sessionReady
+            ? Icons.verified_user_outlined
+            : Icons.lock_outline;
+    return Card(
+      color: installTransportVerified
+          ? color.primaryContainer
+          : sessionReady
+              ? color.secondaryContainer
+              : color.surfaceContainerHighest,
+      child: ListTile(
+        leading: Icon(icon),
+        title: Text(title),
+        subtitle: Text(detail),
+      ),
+    );
+  }
+}
+
+/// 仅本地分析用户自行导出的 Android btsnoop 文件。
+/// authkey 只在点击“开始解码”时读取，随后立即清空输入框，不写入磁盘。
+class _HciDecoderPage extends StatefulWidget {
+  const _HciDecoderPage();
+
+  @override
+  State<_HciDecoderPage> createState() => _HciDecoderPageState();
+}
+
+class _HciDecoderPageState extends State<_HciDecoderPage> {
+  final _authKey = TextEditingController();
+  final _counterStart = TextEditingController(text: '0');
+  final _counterWindow = TextEditingController(text: '4096');
+  String? _filePath;
+  HciDecodeReport? _report;
+  String? _error;
+  bool _running = false;
+
+  @override
+  void dispose() {
+    _authKey.dispose();
+    _counterStart.dispose();
+    _counterWindow.dispose();
+    super.dispose();
+  }
+
+  Future<void> _pickFile() async {
+    final selected = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: const ['log'],
+    );
+    final path = selected?.files.single.path;
+    if (path != null && mounted) {
+      setState(() {
+        _filePath = path;
+        _report = null;
+        _error = null;
+      });
+    }
+  }
+
+  Future<void> _decode() async {
+    final path = _filePath;
+    final authKey = _authKey.text.trim();
+    final start = int.tryParse(_counterStart.text.trim());
+    final window = int.tryParse(_counterWindow.text.trim());
+    if (path == null || !RegExp(r'^[0-9a-fA-F]{32}$').hasMatch(authKey)) {
+      setState(() => _error = '请选择 .log，并输入 32 位十六进制 authkey。');
+      return;
+    }
+    if (start == null || window == null || start < 0 || window < 1 || window > 65536) {
+      setState(() => _error = '计数器起点应为非负整数，窗口范围为 1 到 65536。');
+      return;
+    }
+    setState(() {
+      _running = true;
+      _error = null;
+      _report = null;
+    });
+    try {
+      final bytes = Uint8List.fromList(await File(path).readAsBytes());
+      final report = await Future<HciDecodeReport>(() => const HciDecoder().decode(
+            hciBytes: bytes,
+            authKeyHex: authKey,
+            inboundCounterStart: start,
+            inboundCounterWindow: window,
+          ));
+      if (mounted) setState(() => _report = report);
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = '解码失败：$error');
+    } finally {
+      // 密钥不保存在 State、文件或运行日志中。
+      _authKey.clear();
+      if (mounted) setState(() => _running = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final report = _report;
+    return Scaffold(
+      appBar: AppBar(title: const Text('离线 HCI 解码')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          const Text('只读取本地 btsnoop HCI 文件；不会连接设备、上传文件或保存 authkey。'),
+          const SizedBox(height: 16),
+          OutlinedButton.icon(
+            onPressed: _running ? null : _pickFile,
+            icon: const Icon(Icons.folder_open_outlined),
+            label: Text(_filePath == null ? '选择 btsnoop_hci.log' : '已选：${_filePath!.split(RegExp(r'[/\\]')).last}'),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _authKey,
+            obscureText: true,
+            enableSuggestions: false,
+            autocorrect: false,
+            maxLength: 32,
+            decoration: const InputDecoration(
+              labelText: '该抓包会话的 authkey',
+              helperText: '仅在内存中用于本次解码，完成后自动清空。',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(children: [
+            Expanded(
+              child: TextField(
+                controller: _counterStart,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(labelText: 'deviceCounter 起点', border: OutlineInputBorder()),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: TextField(
+                controller: _counterWindow,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(labelText: '尝试窗口', border: OutlineInputBorder()),
+              ),
+            ),
+          ]),
+          const SizedBox(height: 12),
+          FilledButton.icon(
+            onPressed: _running ? null : _decode,
+            icon: _running
+                ? const SizedBox.square(dimension: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.play_arrow),
+            label: Text(_running ? '正在本地解码…' : '开始解码'),
+          ),
+          if (_error case final error?) ...[
+            const SizedBox(height: 12),
+            Text(error, style: TextStyle(color: Theme.of(context).colorScheme.error)),
+          ],
+          if (report != null) ...[
+            const SizedBox(height: 16),
+            Text('结果：${report.l1Frames} 个 L1 帧，${report.sessions} 个已确认会话，${report.encryptedFrames} 个 WRITE_ENC 帧。',
+                style: Theme.of(context).textTheme.titleSmall),
+            const SizedBox(height: 8),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: SelectionArea(child: Text(report.lines.join('\n'))),
+              ),
+            ),
+          ],
         ],
       ),
     );

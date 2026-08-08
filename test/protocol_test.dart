@@ -2,8 +2,10 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:miwearable_install_tool/domain/protocol/auth_handshake.dart';
+import 'package:miwearable_install_tool/domain/protocol/hci_decoder.dart';
 import 'package:miwearable_install_tool/domain/protocol/l1_l2_frame.dart';
 import 'package:miwearable_install_tool/domain/protocol/mass_transfer.dart';
+import 'package:miwearable_install_tool/domain/protocol/session_cipher.dart';
 import 'package:pointycastle/api.dart';
 import 'package:pointycastle/block/aes.dart';
 import 'package:pointycastle/block/modes/ccm.dart';
@@ -91,6 +93,17 @@ void main() {
       expect(parsed.payload!.$1, 24); // o1h 是 zau 的 oneof field 24
     });
 
+    test('MassPrepare 响应读取状态、断点与协商分片长度', () {
+      final response = ProtoWriter()
+        ..writeInt(2, 0)
+        ..writeInt(4, 123)
+        ..writeInt(5, 4096);
+      final parsed = O1h.parsePrepareResponse(response.bytes);
+      expect(parsed.prepareStatus, 0);
+      expect(parsed.remainLength, 123);
+      expect(parsed.expectedSliceLength, 4096);
+    });
+
     test('表盘安装结果解析', () {
       // 构造 x8u: field1=id(f1), field2=code(2)
       final w = ProtoWriter();
@@ -140,7 +153,7 @@ void main() {
   });
 
   group('Mass 分片', () {
-    test('首片头 22B + 尾 CRC 4B', () {
+    test('首片头、尾 CRC 与每片 4B 序号头', () {
       final file = Uint8List.fromList(List<int>.generate(100, (i) => i));
       final md5 = List<int>.generate(16, (i) => 0x10 + i);
       final segs = splitMassFile(
@@ -149,26 +162,37 @@ void main() {
         fileMd5: md5,
         segmentLength: 64,
       );
-      expect(segs.length, 2);
+      expect(segs.length, 3);
       expect(segs.first.isFirst, isTrue);
       expect(segs.last.isLast, isTrue);
-      // 首片：22B 头 + 64B 数据（数据段长=segmentLength，头附加在外）
-      expect(segs.first.data.length, 22 + 64);
-      expect(segs.first.data[0], 0x00);
-      expect(segs.first.data[1], 0x10); // dataType
+      expect(segs.first.total, 3);
+      expect(segs.first.index, 1);
+      expect(segs.first.data.length, 64);
+      expect(segs.first.data.sublist(0, 4), [3, 0, 1, 0]);
+      // 分片头之后才是 22B Mass 头。
+      expect(segs.first.data[4], 0x00);
+      expect(segs.first.data[5], 0x10); // dataType
       // MD5 位置 2..17
       for (var i = 0; i < 16; i++) {
-        expect(segs.first.data[2 + i], 0x10 + i);
+        expect(segs.first.data[6 + i], 0x10 + i);
       }
       // 长度 LE（100 - 0）
-      expect(segs.first.data[18], 100);
-      expect(segs.first.data[19], 0);
-      expect(segs.first.data[20], 0);
-      expect(segs.first.data[21], 0);
-      // 尾片：36B 数据 + 4B CRC（首段已带走 64B）
-      expect(segs.last.data.length, 36 + 4);
-      final expectedCrc = crc32(List<int>.generate(100, (i) => i));
-      final tail = segs.last.data.sublist(36);
+      expect(segs.first.data[22], 100);
+      expect(segs.first.data[23], 0);
+      expect(segs.first.data[24], 0);
+      expect(segs.first.data[25], 0);
+      // 最后一片为 2B 文件尾 + 4B CRC，另有 4B 分片头。
+      expect(segs.last.data.length, 10);
+      final expectedCrc = crc32([
+        ...buildMassHeader(
+          dataType: 0x10,
+          fileMd5: md5,
+          fileLength: 100,
+          sentLength: 0,
+        ),
+        ...file,
+      ]);
+      final tail = segs.last.data.sublist(6);
       expect(tail, [
         expectedCrc & 0xFF,
         (expectedCrc >> 8) & 0xFF,
@@ -187,7 +211,7 @@ void main() {
         segmentLength: 100,
       );
       expect(segs.length, 1);
-      expect(segs.single.data.length, 22 + 10 + 4); // 头+数据+CRC
+      expect(segs.single.data.length, 4 + 22 + 10 + 4); // 分片头+数据头+数据+CRC
       expect(segs.single.isFirst, isTrue);
       expect(segs.single.isLast, isTrue);
     });
@@ -201,10 +225,54 @@ void main() {
         fileMd5: md5,
         segmentLength: 1024,
       );
-      // 10MB/1024 = 10240 段 + 第二块 1 段
-      expect(segs.length, 10241);
+      // 每片可容纳 1020B 正文；首块含 22B 头、末块含 4B CRC。
+      expect(segs.length, 10282);
       expect(segs.where((s) => s.isFirst).length, 1);
       expect(segs.where((s) => s.isLast).length, 1);
+    });
+
+    test('断点续传的首头长度与 CRC 都从断点开始计算', () {
+      final file = Uint8List.fromList(List<int>.generate(10, (i) => i));
+      final md5 = List<int>.filled(16, 0x22);
+      final segs = splitMassFile(
+        fileBytes: file,
+        dataType: 0x40,
+        fileMd5: md5,
+        segmentLength: 64,
+        sentLength: 4,
+      );
+      expect(segs, hasLength(1));
+      expect(segs.single.data[22], 6); // 4B 分片头后的剩余长度
+      final expectedCrc = crc32([
+        ...buildMassHeader(
+          dataType: 0x40,
+          fileMd5: md5,
+          fileLength: 10,
+          sentLength: 4,
+        ),
+        ...file.sublist(4),
+      ]);
+      expect(segs.single.data.sublist(segs.single.data.length - 4), [
+        expectedCrc & 0xFF,
+        (expectedCrc >> 8) & 0xFF,
+        (expectedCrc >> 16) & 0xFF,
+        (expectedCrc >> 24) & 0xFF,
+      ]);
+    });
+
+    test('官方 RPK 日志中的 16384B 协商长度产生 40 片', () {
+      // 官方 3.57.0 日志：652002B RPK、type=4/detail=0、切片长度 16384。
+      final rpk = Uint8List(652002);
+      final segs = splitMassFile(
+        fileBytes: rpk,
+        dataType: MassDataType.quickAppRpk,
+        fileMd5: List<int>.filled(16, 0),
+        segmentLength: 16384,
+      );
+      expect(segs, hasLength(40));
+      expect(segs.first.data, hasLength(16384));
+      expect(segs.last.data, hasLength(13212));
+      expect(segs.last.data.sublist(0, 4), [40, 0, 40, 0]);
     });
   });
 
@@ -244,6 +312,78 @@ void main() {
       expect(parsed, isNotNull);
       expect(parsed!.payload.length, 22);
       expect(parsed.payload.first, L1Cmd.startReq);
+    });
+  });
+
+  group('会话 AES-CTR', () {
+    test('计数块采用 IV + LE32 counter + 8B 零', () {
+      expect(
+        buildSessionCounterBlock([1, 2, 3, 4], 0x78563412),
+        [1, 2, 3, 4, 0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0, 0, 0, 0, 0],
+      );
+    });
+
+    test('AES-CTR 使用正确方向的密钥且可逆', () {
+      final keys = SessionKeys(
+        deviceKey: List<int>.filled(16, 0x11),
+        appKey: List<int>.filled(16, 0x22),
+        deviceIv: [1, 2, 3, 4],
+        appIv: [5, 6, 7, 8],
+      );
+      final cipher = SessionCipher(keys);
+      final message = List<int>.generate(37, (index) => index);
+      final encoded = cipher.encryptOutbound(message, counter: 1);
+      expect(encoded, isNot(message));
+
+      // CTR 同一 key/IV/counter 变换两次即可恢复明文。
+      final appSide = SessionKeys(
+        deviceKey: keys.appKey,
+        appKey: keys.deviceKey,
+        deviceIv: keys.appIv,
+        appIv: keys.deviceIv,
+      );
+      expect(
+        SessionCipher(appSide).decryptInbound(encoded, counter: 1),
+        message,
+      );
+    });
+
+    test('HKDF 输出可拆分为会话材料', () {
+      final keys = SessionKeys.fromHkdf(List<int>.generate(64, (i) => i));
+      expect(keys.deviceKey, List<int>.generate(16, (i) => i));
+      expect(keys.appKey, List<int>.generate(16, (i) => 16 + i));
+      expect(keys.deviceIv, [32, 33, 34, 35]);
+      expect(keys.appIv, [36, 37, 38, 39]);
+    });
+  });
+
+  group('离线 HCI 解码', () {
+    test('重组 btsnoop 的 RFCOMM/L1 帧并识别 f=26 请求', () {
+      final nonce = List<int>.generate(16, (i) => i);
+      final l1 = SppProtocol.buildDataFrame(0, XiaomiAuth.buildNonceCommand(nonce));
+      final rfcomm = <int>[0x2b, 0xff, (l1.length << 1) | 1, 1, ...l1, 0];
+      final l2 = <int>[rfcomm.length, 0, 0x49, 0, ...rfcomm];
+      final hci = <int>[2, 2, 0, l2.length, 0, ...l2];
+      final record = <int>[
+        0, 0, 0, hci.length, // original length, BE
+        0, 0, 0, hci.length, // included length, BE
+        0, 0, 0, 0, // outbound flag
+        0, 0, 0, 0, // drops
+        0, 0, 0, 0, 0, 0, 0, 0, // timestamp
+        ...hci,
+      ];
+      final hciLike = Uint8List.fromList([
+        ...'btsnoop\x00'.codeUnits,
+        0, 0, 0, 1, 0, 0, 3, 0xea,
+        ...record,
+      ]);
+      final report = const HciDecoder().decode(
+        hciBytes: hciLike,
+        authKeyHex: '00112233445566778899aabbccddeeff',
+      );
+      expect(report.l1Frames, 1);
+      expect(report.sessions, 0);
+      expect(report.lines, contains('发现 f=26 请求：等待同会话设备随机数。'));
     });
   });
 

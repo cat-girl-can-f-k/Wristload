@@ -8,6 +8,7 @@ import '../domain/device_profile.dart';
 import '../domain/install_task.dart';
 import '../domain/protocol/auth_handshake.dart';
 import '../domain/protocol/l1_l2_frame.dart';
+import '../domain/protocol/session_cipher.dart';
 import '../domain/protocol/spp_protocol.dart';
 import '../domain/wear_protocol.dart';
 import '../platform/ble_transport.dart';
@@ -416,6 +417,10 @@ class DeviceController extends ChangeNotifier {
     _sppAcc = Accumulator();
     _sppSeq = 0;
     _sppL1FallbackStarted = false;
+    _sppAwaitingAuthConfirm = false;
+    _pendingSessionKeys = null;
+    _sessionCipher = null;
+    _lastInboundCryptoCounter = null;
     try {
       _transport.listenRfcommData();
       _sppSub ??= _transport.rfcommData.listen(_handleSppData);
@@ -450,7 +455,11 @@ class DeviceController extends ChangeNotifier {
   int _sppVersionSeq = 1;
   bool _sppAwaitingVersion = false;
   bool _sppL1FallbackStarted = false;
+  bool _sppAwaitingAuthConfirm = false;
   Timer? _sppWatchdog;
+  SessionKeys? _pendingSessionKeys;
+  SessionCipher? _sessionCipher;
+  int? _lastInboundCryptoCounter;
 
   /// 处理 RFCOMM 收到的字节：先试 SppPacket（版本回包），再增量解析 L1 帧。
   void _handleSppData(Uint8List data) {
@@ -533,6 +542,11 @@ class DeviceController extends ChangeNotifier {
     final opCode = packet.payload[1];
     final data = packet.payload.sublist(2);
     _log('  DATA channel=$channel opCode=$opCode data=${_hex(data)}');
+    if (channel == SppProtocol.channelPb &&
+        opCode == SppProtocol.opCodeWriteEnc) {
+      _inspectEncryptedBusinessFrame(data);
+      return;
+    }
     final parsed = XiaomiAuth.parse(data);
     if (parsed != null) {
       _log('  Command：type=${parsed.type} subtype=${parsed.subtype} '
@@ -546,9 +560,16 @@ class DeviceController extends ChangeNotifier {
         ));
       } else if (parsed.subtype == 27) {
         // f=27 响应：设备确认（kc0{success, capability}）→ device ready。
+        _sppAwaitingAuthConfirm = false;
         final confirmed = parsed.authStatus == 1;
         if (confirmed) {
           sessionReady = true;
+          final keys = _pendingSessionKeys;
+          if (keys != null) {
+            _sessionCipher = SessionCipher(keys);
+            _pendingSessionKeys = null;
+            _log('  已启用只读 WRITE_ENC 解密诊断；业务发送仍受安装门控保护。');
+          }
           _sppWatchdog?.cancel();
           _sppWatchdog = null;
         }
@@ -560,6 +581,30 @@ class DeviceController extends ChangeNotifier {
     } else {
       _log('  无法按 Xiaomi Command 解析');
     }
+  }
+
+  /// 只分析设备入站加密帧，绝不为了探测计数器向设备发送数据。
+  void _inspectEncryptedBusinessFrame(List<int> ciphertext) {
+    final cipher = _sessionCipher;
+    if (cipher == null) {
+      _log('  WRITE_ENC 已收到，但本次会话尚无可用密钥（只记录）。');
+      return;
+    }
+    final firstCounter = (_lastInboundCryptoCounter ?? -1) + 1;
+    const window = 32;
+    for (var counter = firstCounter; counter < firstCounter + window; counter++) {
+      final plaintext = cipher.decryptInbound(ciphertext, counter: counter);
+      final parsed = XiaomiAuth.parse(plaintext);
+      if (parsed?.type != null && parsed?.subtype != null) {
+        _lastInboundCryptoCounter = counter;
+        _log('  WRITE_ENC 解密命中：deviceCounter=$counter '
+            'type=${parsed!.type} subtype=${parsed.subtype} '
+            'plain=${_hex(plaintext)}');
+        return;
+      }
+    }
+    _log('  WRITE_ENC 未在 counter=$firstCounter..${firstCounter + window - 1} '
+        '解析为已知 Command；不推进计数器。');
   }
 
   Future<void> _sppSendAuthConfirm({
@@ -584,16 +629,29 @@ class DeviceController extends ChangeNotifier {
       _log('  ✗ 设备签名校验失败（HMAC 不匹配——authkey 与设备不匹配？）');
       return;
     }
+    _pendingSessionKeys = SessionKeys.fromHkdf(
+      XiaomiAuth.computeStep3Hmac(secretKey, phoneNonce, watchNonce),
+    );
     final frame = SppProtocol.buildDataFrame(_sppSeq++, cmd);
     _log('发送 f=27（seq=${_sppSeq - 1}，${frame.length}B）：${_hex(frame)}');
     try {
+      // 设备可能在 Windows 写入 Future 完成前回包，先置状态以避免随后误挂超时。
+      _sppAwaitingAuthConfirm = true;
       await _transport.rfcommWrite(device.uuid, frame);
+      if (!_sppAwaitingAuthConfirm) {
+        _log('f=27 已在写入完成前收到设备确认。');
+        return;
+      }
       _log('f=27 已写入，等待设备确认（device ready）…');
       _sppWatchdog?.cancel();
       _sppWatchdog = Timer(const Duration(seconds: 15), () {
-        _log('SPP 超时：15 秒内无 f=27 响应');
+        if (_sppAwaitingAuthConfirm) {
+          _sppAwaitingAuthConfirm = false;
+          _log('SPP 超时：15 秒内无 f=27 响应');
+        }
       });
     } catch (exception) {
+      _sppAwaitingAuthConfirm = false;
       _log('f=27 发送失败：$exception');
     }
   }
@@ -806,6 +864,10 @@ class DeviceController extends ChangeNotifier {
     }
     connectedDevice = null;
     sessionReady = false;
+    _sppAwaitingAuthConfirm = false;
+    _pendingSessionKeys = null;
+    _sessionCipher = null;
+    _lastInboundCryptoCounter = null;
     _isScanning = false;
     services = const [];
     capabilities = const DeviceCapabilities();
