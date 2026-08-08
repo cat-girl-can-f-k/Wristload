@@ -1,0 +1,31 @@
+name: miwearable_install_tool
+description: Experimental cross-platform installer for selected Xiaomi Vela wearables.
+publish_to: none
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  file_picker: ^8.1.2
+  # Windows-first BLE central API. It also has Android and Linux backends.
+  bluetooth_low_energy: ^6.2.1
+  path_provider: ^2.1.4
+  crypto: ^3.0.3
+  pointycastle: ^3.9.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+# Forked Windows backend: tolerates GattCommunicationStatus.InvalidState (status 3)
+# on included-services enumeration, which some Vela wearables (Mi Band 9) trigger.
+dependency_overrides:
+  bluetooth_low_energy_windows:
+    path: plugins/bluetooth_low_energy_windows
+
+flutter:
+  uses-material-design: true
