@@ -33,6 +33,30 @@ migrate_working_dir/
 /build/
 /coverage/
 /windows/flutter/ephemeral/
+.flutter-plugins
+
+# Windows and CMake build output
+/windows/**/CMakeFiles/
+/windows/**/x64/
+/windows/**/.plugin_symlinks/
+/cmake-build-*/
+*.pdb
+
+# Android/Gradle build output
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/app/.cxx/
+
+# Installable packages and local release archives
+*.apk
+*.aab
+*.msix
+*.msixbundle
+*.rpk
+*.bin
+*.zip
+*.7z
 
 # Local diagnostic output
 *_out.txt
