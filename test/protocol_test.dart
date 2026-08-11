@@ -213,52 +213,6 @@ void main() {
   });
 
   group('zau', () {
-    test('官方 V2 存储空间查询命令字节与逆向结果一致', () {
-      final encoded = Zau(
-        command: ZauCommand.queryStorageSpace,
-        sub: ZauModule.storageManager,
-      ).encode();
-
-      expect(encoded, [0x08, 0x02, 0x10, 0x3e]);
-    });
-
-    test('存储响应按 ysr.field44 解析已用与总字节数', () {
-      final storage = ProtoWriter()
-        ..writeInt(1, 1280 * 1024 * 1024)
-        ..writeInt(2, 4 * 1024 * 1024 * 1024);
-      final ysr = ProtoWriter()..writeMessage(44, storage.bytes);
-
-      final result = StorageStatusPayload.parse(ysr.bytes);
-
-      expect(result.usedBytes, 1280 * 1024 * 1024);
-      expect(result.totalBytes, 4 * 1024 * 1024 * 1024);
-    });
-
-    test('存储响应拒绝缺失、零容量和 used 大于 total', () {
-      expect(
-        () => StorageStatusPayload.parse(const []),
-        throwsA(isA<FormatException>()),
-      );
-
-      final zeroTotal = ProtoWriter()
-        ..writeInt(1, 0)
-        ..writeInt(2, 0);
-      final zeroYsr = ProtoWriter()..writeMessage(44, zeroTotal.bytes);
-      expect(
-        () => StorageStatusPayload.parse(zeroYsr.bytes),
-        throwsA(isA<FormatException>()),
-      );
-
-      final impossible = ProtoWriter()
-        ..writeInt(1, 101)
-        ..writeInt(2, 100);
-      final impossibleYsr = ProtoWriter()..writeMessage(44, impossible.bytes);
-      expect(
-        () => StorageStatusPayload.parse(impossibleYsr.bytes),
-        throwsA(isA<FormatException>()),
-      );
-    });
-
     test('官方 V2 时间同步命令与 protobuf 字节向量一致', () {
       final payload = TimeSyncPayload.encode(
         localTime: DateTime(2026, 8, 11, 18, 30, 45, 123),

@@ -191,4 +191,33 @@ void main() {
     await pump(InstallKind.quickApp);
     expect(find.text('安装快应用 .rpk'), findsOneWidget);
   });
+
+  testWidgets('Split Button 菜单打开时切换页面不会触发生命周期断言', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: InstallSplitButton(
+            preferredTarget: InstallPreference.watchface,
+            enabled: true,
+            onInstall: (_) async {},
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.byKey(const ValueKey('install-menu-button')));
+    await tester.pump();
+    expect(find.byKey(const ValueKey('alternate-install-menu-item')),
+        findsOneWidget);
+
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(body: Center(child: Text('队列页面'))),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('队列页面'), findsOneWidget);
+  });
 }

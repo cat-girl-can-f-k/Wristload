@@ -25,65 +25,9 @@ abstract final class ZauCommand {
   /// Official Vela system-time sync request (TimeSyncer): command=2, sub=3.
   static const int setSystemTime = 2;
 
-  /// Official V2 storage-space query. The command is shared with other
-  /// system requests; [ZauModule.storageManager] selects storage manager.
-  static const int queryStorageSpace = 2;
   static const int setFace = 4; // 表盘：预装(f=4) / setFace(f=1)
   static const int prepareInstallApp = 20; // RPK 预装
   static const int massTransfer = 22; // Mass 文件传输（MassPrepare/MassData 控制）
-}
-
-/// Module identifiers used as `zau.field2` by V2 system requests.
-abstract final class ZauModule {
-  /// `StorageManagerModule.MODULE` in the official client.
-  static const int storageManager = 62;
-}
-
-/// Storage usage returned by the official V2 storage-space query.
-///
-/// The response payload is `zau.field4 = ysr`; `ysr.field44 = xsr`, where
-/// `xsr.field1` is used bytes and `xsr.field2` is total bytes. Invalid or
-/// incomplete values are rejected so the UI never renders a fabricated zero.
-abstract final class StorageStatusPayload {
-  static ({int usedBytes, int totalBytes}) parse(List<int> ysrBytes) {
-    final ysr = ProtoReader(ysrBytes);
-    List<int>? storageBytes;
-    while (!ysr.isAtEnd) {
-      final (field, wire) = ysr.readFieldHeader();
-      if (field == 44 && wire == 2) {
-        storageBytes = ysr.readBytes();
-      } else {
-        ysr.skipField(wire);
-      }
-    }
-    if (storageBytes == null) {
-      throw const FormatException('存储响应缺少 ysr.field44');
-    }
-
-    final storage = ProtoReader(storageBytes);
-    int? usedBytes;
-    int? totalBytes;
-    while (!storage.isAtEnd) {
-      final (field, wire) = storage.readFieldHeader();
-      switch ((field, wire)) {
-        case (1, 0):
-          usedBytes = storage.readVarint();
-        case (2, 0):
-          totalBytes = storage.readVarint();
-        default:
-          storage.skipField(wire);
-      }
-    }
-    if (usedBytes == null || totalBytes == null) {
-      throw const FormatException('存储响应缺少已用或总容量');
-    }
-    if (totalBytes <= 0 || usedBytes < 0 || usedBytes > totalBytes) {
-      throw FormatException(
-        '存储响应容量无效：used=$usedBytes, total=$totalBytes',
-      );
-    }
-    return (usedBytes: usedBytes, totalBytes: totalBytes);
-  }
 }
 
 /// Payload used by the official V2/Vela TimeSyncer.

@@ -1725,31 +1725,17 @@ class DeviceController extends ChangeNotifier {
           !identical(_sessionCipher, session)) {
         return;
       }
-      final response = await _requestBusiness(
-        Zau(
-            command: ZauCommand.queryStorageSpace,
-            sub: ZauModule.storageManager),
-        ZauCommand.queryStorageSpace,
-        ZauModule.storageManager,
-        responseCommand: 4,
-        responseSub: ZauModule.storageManager,
-      );
-      if (refreshEpoch != _sessionEpoch ||
-          !sessionReady ||
-          !identical(_sessionCipher, session)) {
-        return;
-      }
-      final payload = response.payload;
-      if (payload == null || payload.$1 != 4) {
-        throw const FormatException('存储响应缺少 ysr 载荷');
-      }
-      final status = StorageStatusPayload.parse(payload.$2);
-      storageUsedBytes = status.usedBytes;
-      storageTotalBytes = status.totalBytes;
-      _log('设备存储：${status.usedBytes}/${status.totalBytes} B');
-      notifyListeners();
+      // StorageManager uses the official Profile Channel API (module 62,
+      // request command 3 / response command 4), not a ZAU 2/62 message.
+      // RFCOMM currently implements PB WRITE_ENC and Mass only, so leave the
+      // values unknown instead of sending an invalid request that blocks for
+      // twelve seconds or interpreting unrelated business notifications.
+      storageUsedBytes = null;
+      storageTotalBytes = null;
+      _log(
+          '设备存储暂不可用：StorageManager module=62、cmd=3/4 使用独立 Profile Channel，当前 RFCOMM 尚未实现该封装');
     } on Object catch (exception) {
-      _log('读取设备存储失败，保持未知状态：$exception');
+      _log('设备状态刷新失败：$exception');
     } finally {
       if (_statusRefreshEpoch == refreshEpoch) {
         _statusRefreshEpoch = null;

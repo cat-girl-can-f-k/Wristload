@@ -75,29 +75,50 @@ class _InstallSplitButtonState extends State<InstallSplitButton> {
         SizedBox(
           width: 64,
           height: 56,
-          child: MenuAnchor(
-            onOpen: () => setState(() => _menuOpen = true),
-            onClose: () => setState(() => _menuOpen = false),
-            style: MenuStyle(
-              shape: WidgetStatePropertyAll(
-                RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(28),
+          child: PopupMenuButton<InstallKind>(
+            tooltip: '选择另一种安装文件',
+            padding: EdgeInsets.zero,
+            offset: const Offset(0, 8),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16),
+            ),
+            onOpened: () {
+              if (mounted) {
+                setState(() => _menuOpen = true);
+              }
+            },
+            onCanceled: () {
+              if (mounted) {
+                setState(() => _menuOpen = false);
+              }
+            },
+            onSelected: (target) async {
+              if (mounted) {
+                setState(() => _menuOpen = false);
+              }
+              await widget.onInstall(target);
+            },
+            itemBuilder: (context) => [
+              PopupMenuItem(
+                key: const ValueKey('alternate-install-menu-item'),
+                value: alternate.target,
+                child: Row(
+                  children: [
+                    Icon(alternate.icon),
+                    const SizedBox(width: 12),
+                    Text(alternate.installLabel),
+                  ],
                 ),
               ),
-            ),
-            menuChildren: [
-              MenuItemButton(
-                key: const ValueKey('alternate-install-menu-item'),
-                leadingIcon: Icon(alternate.icon),
-                onPressed: () => widget.onInstall(alternate.target),
-                child: Text(alternate.installLabel),
-              ),
             ],
-            builder: (context, controller, child) => FilledButton(
+            child: FilledButton(
               key: const ValueKey('install-menu-button'),
               // Selecting an alternate file type is useful before authentication.
-              onPressed: controller.open,
+              onPressed: null,
               style: FilledButton.styleFrom(
+                disabledBackgroundColor: Theme.of(context).colorScheme.primary,
+                disabledForegroundColor:
+                    Theme.of(context).colorScheme.onPrimary,
                 padding: EdgeInsets.zero,
                 shape: const RoundedRectangleBorder(
                   borderRadius: BorderRadius.horizontal(
