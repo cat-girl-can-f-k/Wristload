@@ -47,11 +47,14 @@ class DeviceProfile {
   final List<String> adNameHints;
 
   WatchfaceResolution? get watchfaceResolution => switch (family) {
-        DeviceFamily.band9Pro || DeviceFamily.band10Pro =>
+        DeviceFamily.band9Pro ||
+        DeviceFamily.band10Pro =>
           const WatchfaceResolution(336, 480),
-        DeviceFamily.redmiWatch5 || DeviceFamily.redmiWatch6 =>
+        DeviceFamily.redmiWatch5 ||
+        DeviceFamily.redmiWatch6 =>
           const WatchfaceResolution(432, 514),
-        DeviceFamily.watchS4 || DeviceFamily.watchS5 =>
+        DeviceFamily.watchS4 ||
+        DeviceFamily.watchS5 =>
           const WatchfaceResolution(464, 464),
         _ => null,
       };
@@ -67,8 +70,7 @@ class DeviceProfile {
         DeviceFamily.redmiWatch5 ||
         DeviceFamily.redmiWatch6 =>
           ProtocolGeneration.v2Vela,
-        DeviceFamily.band8Pro =>
-          ProtocolGeneration.v1Vela,
+        DeviceFamily.band8Pro => ProtocolGeneration.v1Vela,
         DeviceFamily.band7Pro => ProtocolGeneration.huamiZepp,
         // REDMI Watch 4 的工具侧入口虽为经典蓝牙，但运动健康的实际
         // 队列/鉴权分支仍需真机帧确认，暂不把它冒充 Vela V1。
@@ -117,47 +119,47 @@ class DeviceProfile {
     adNameHints: ['smart band 8 pro', 'band 8 pro'],
   );
   static const band9 = DeviceProfile(
-      family: DeviceFamily.band9,
-      displayName: '小米手环 9 系列',
-      modelHints: {'miwear.watch.n66', 'miwear.watch.n66cn'},
-      adNameHints: ['smart band 9', 'band 9'],
-    );
+    family: DeviceFamily.band9,
+    displayName: '小米手环 9 系列',
+    modelHints: {'miwear.watch.n66', 'miwear.watch.n66cn'},
+    adNameHints: ['smart band 9', 'band 9'],
+  );
   static const band9Pro = DeviceProfile(
-      family: DeviceFamily.band9Pro,
-      displayName: '小米手环 9 Pro',
-      modelHints: {'miwear.watch.n67', 'miwear.watch.n67cn'},
-      adNameHints: ['smart band 9 pro', 'band 9 pro'],
-    );
+    family: DeviceFamily.band9Pro,
+    displayName: '小米手环 9 Pro',
+    modelHints: {'miwear.watch.n67', 'miwear.watch.n67cn'},
+    adNameHints: ['smart band 9 pro', 'band 9 pro'],
+  );
   static const band10 = DeviceProfile(
-      family: DeviceFamily.band10,
-      displayName: '小米手环 10',
-      modelHints: {'miwear.watch.o66', 'miwear.watch.o66cn'},
-      adNameHints: ['smart band 10', 'band 10'],
-    );
+    family: DeviceFamily.band10,
+    displayName: '小米手环 10',
+    modelHints: {'miwear.watch.o66', 'miwear.watch.o66cn'},
+    adNameHints: ['smart band 10', 'band 10'],
+  );
   static const band10Pro = DeviceProfile(
-      family: DeviceFamily.band10Pro,
-      displayName: '小米手环 10 Pro',
-      modelHints: {'miwear.watch.p67cn'},
-      adNameHints: ['smart band 10 pro', 'band 10 pro'],
-    );
+    family: DeviceFamily.band10Pro,
+    displayName: '小米手环 10 Pro',
+    modelHints: {'miwear.watch.p67cn'},
+    adNameHints: ['smart band 10 pro', 'band 10 pro'],
+  );
   static const watchS4 = DeviceProfile(
-      family: DeviceFamily.watchS4,
-      displayName: '小米 Watch S4 系列',
-      modelHints: {'miwear.watch.o63', 'miwear.watch.o62'},
-      adNameHints: ['watch s4'],
-    );
+    family: DeviceFamily.watchS4,
+    displayName: '小米 Watch S4 系列',
+    modelHints: {'miwear.watch.o63', 'miwear.watch.o62'},
+    adNameHints: ['watch s4'],
+  );
   static const watchS5 = DeviceProfile(
-      family: DeviceFamily.watchS5,
-      displayName: '小米 Watch S5 系列',
-      modelHints: {'miwear.watch.s5'},
-      adNameHints: ['watch s5'],
-    );
+    family: DeviceFamily.watchS5,
+    displayName: '小米 Watch S5 系列',
+    modelHints: {'miwear.watch.s5'},
+    adNameHints: ['watch s5'],
+  );
   static const redmiWatch5 = DeviceProfile(
-      family: DeviceFamily.redmiWatch5,
-      displayName: 'REDMI Watch 5',
-      modelHints: {'miwear.watch.o65'},
-      adNameHints: ['redmi watch 5'],
-    );
+    family: DeviceFamily.redmiWatch5,
+    displayName: 'REDMI Watch 5',
+    modelHints: {'miwear.watch.o65'},
+    adNameHints: ['redmi watch 5'],
+  );
   static const redmiWatch4 = DeviceProfile(
     family: DeviceFamily.redmiWatch4,
     displayName: 'REDMI Watch 4（经典实验）',
@@ -165,11 +167,11 @@ class DeviceProfile {
     adNameHints: ['redmi watch 4'],
   );
   static const redmiWatch6 = DeviceProfile(
-      family: DeviceFamily.redmiWatch6,
-      displayName: 'REDMI Watch 6',
-      modelHints: {'miwear.watch.p65'},
-      adNameHints: ['redmi watch 6'],
-    );
+    family: DeviceFamily.redmiWatch6,
+    displayName: 'REDMI Watch 6',
+    modelHints: {'miwear.watch.p65'},
+    adNameHints: ['redmi watch 6'],
+  );
 
   /// 可从广播名识别的型号；其中仅 V2 型号代表已支持安装。
   static const recognized = <DeviceProfile>[

@@ -1,4 +1,5 @@
 enum InstallKind { watchface, quickApp }
+
 enum InstallStage {
   idle,
   validating,

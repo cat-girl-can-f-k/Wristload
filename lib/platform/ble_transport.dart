@@ -297,5 +297,4 @@ class BleTransport {
     GATTCharacteristic characteristic,
   ) =>
       _central.readCharacteristic(peripheral, characteristic);
-
 }

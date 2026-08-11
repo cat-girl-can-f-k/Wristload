@@ -1,4 +1,4 @@
-﻿import 'package:flutter/material.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:miwearable_install_tool/domain/device_profile.dart';
@@ -159,7 +159,7 @@ void main() {
     expect(windowSize, isNull);
   });
 
-    testWidgets('Split Button 主区跟随偏好并复用安装回调', (tester) async {
+  testWidgets('Split Button 主区跟随偏好并复用安装回调', (tester) async {
     InstallKind? installed;
 
     Future<void> pump(InstallKind target) => tester.pumpWidget(

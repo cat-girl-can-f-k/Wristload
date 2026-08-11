@@ -17,6 +17,7 @@ import '../domain/protocol/session_cipher.dart';
 import '../domain/protocol/spp_protocol.dart';
 import '../domain/protocol/mass_transfer.dart';
 import '../domain/protocol/zau.dart';
+import '../domain/protocol/transport_constants.dart';
 import '../domain/verification_gate.dart';
 import '../platform/ble_transport.dart';
 import '../platform/auth_key_store.dart';
@@ -49,9 +50,11 @@ class DeviceController extends ChangeNotifier {
 
   /// 设备电量（%），连接后随状态查询获取；null 表示未取到（UI 不渲染）。
   int? batteryPercent;
+
   /// 设备存储（字节），null 表示未取到。
   int? storageUsedBytes;
   int? storageTotalBytes;
+  bool _statusRefreshInProgress = false;
 
   /// 安装队列（串行执行）。
   final List<QueueEntry> installQueue = [];
@@ -62,10 +65,21 @@ class DeviceController extends ChangeNotifier {
   int get installingCount =>
       installQueue.where((e) => e.stage == QueueStage.installing).length;
 
-  /// 把安装请求加入队列并启动串行执行。
+  /// 把安装请求加入队列，等待用户从队列页开始串行安装。
   void enqueue(InstallRequest request) {
     installQueue.add(QueueEntry(request: request));
     _log('已加入安装队列（当前待安装 $pendingCount 项）');
+    notifyListeners();
+  }
+
+  /// 将失败、取消或状态未知的条目重新放回串行队列。
+  void retryQueueEntry(QueueEntry entry) {
+    if (!installQueue.contains(entry) || entry.stage == QueueStage.installing) {
+      return;
+    }
+    entry
+      ..stage = QueueStage.waiting
+      ..message = null;
     notifyListeners();
     unawaited(runQueue());
   }
@@ -91,8 +105,8 @@ class DeviceController extends ChangeNotifier {
 
   /// 清空已完成/失败/取消的条目。
   void clearCompletedQueue() {
-    installQueue.removeWhere(
-        (e) => e.stage != QueueStage.waiting && e.stage != QueueStage.installing);
+    installQueue.removeWhere((e) =>
+        e.stage != QueueStage.waiting && e.stage != QueueStage.installing);
     notifyListeners();
   }
 
@@ -106,18 +120,43 @@ class DeviceController extends ChangeNotifier {
             .where((e) => e.stage == QueueStage.waiting)
             .firstOrNull;
         if (next == null) break;
+        final taskBeforeInstall = latestTask;
         next.stage = QueueStage.installing;
         next.message = null;
         notifyListeners();
         await startInstall(next.request);
-        next.stage = switch (latestTask?.stage) {
+        final task = latestTask;
+        final producedTask = task != null &&
+            !identical(task, taskBeforeInstall) &&
+            task.kind == next.request.kind &&
+            task.fileName == next.request.metadata.fileName &&
+            task.md5Hex == next.request.metadata.md5Hex;
+        if (!producedTask || task == null) {
+          next
+            ..stage = QueueStage.waiting
+            ..message = task?.message;
+          notifyListeners();
+          break;
+        }
+        if (task.stage == InstallStage.waitingForProtocol ||
+            task.stage == InstallStage.idle ||
+            task.stage == InstallStage.validating ||
+            task.stage == InstallStage.transferring ||
+            task.stage == InstallStage.awaitingDevice) {
+          next
+            ..stage = QueueStage.waiting
+            ..message = task.message;
+          notifyListeners();
+          break;
+        }
+        next.stage = switch (task.stage) {
           InstallStage.succeeded => QueueStage.done,
           InstallStage.cancelled => QueueStage.cancelled,
           InstallStage.failed => QueueStage.failed,
           InstallStage.stateUnknown => QueueStage.stateUnknown,
           _ => QueueStage.failed,
         };
-        next.message = latestTask?.message;
+        next.message = task.message;
         notifyListeners();
       }
     } finally {
@@ -125,6 +164,7 @@ class DeviceController extends ChangeNotifier {
       notifyListeners();
     }
   }
+
   String? error;
   bool sessionReady = false;
   bool sppConnecting = false;
@@ -427,6 +467,11 @@ class DeviceController extends ChangeNotifier {
       Peripheral peripheral, DeviceProfile profile) async {
     error = null;
     sessionReady = false;
+    connectedFirmwareVersion = null;
+    lastTimeSyncSummary = null;
+    batteryPercent = null;
+    storageUsedBytes = null;
+    storageTotalBytes = null;
     // Some V2 devices close the first RFCOMM socket immediately after f=27.
     // Allow one transport-only reconnect while retaining the confirmed keys.
     _postAuthReconnectAttempts = 0;
@@ -457,6 +502,11 @@ class DeviceController extends ChangeNotifier {
   }) async {
     error = null;
     sessionReady = false;
+    connectedFirmwareVersion = null;
+    lastTimeSyncSummary = null;
+    batteryPercent = null;
+    storageUsedBytes = null;
+    storageTotalBytes = null;
     _postAuthReconnectAttempts = 0;
     _authenticatedAt = null;
     _log('正在连接 ${peripheral.uuid}（authkey 已就绪，等待应用层身份校验）…');
@@ -482,6 +532,7 @@ class DeviceController extends ChangeNotifier {
         _log('  服务 ${service.uuid}');
       }
       await _inspectMiWearService();
+      await _readStandardBatteryLevel();
       if (connectedProfile?.generation != ProtocolGeneration.v2Vela) {
         final transport = switch (connectedProfile?.generation) {
           ProtocolGeneration.v1Vela => '旧 Vela V1',
@@ -518,6 +569,51 @@ class DeviceController extends ChangeNotifier {
       _log('不会在 GATT 失败后回退发送 RFCOMM 协议帧；请先完成 HCI 验证。');
     }
     notifyListeners();
+  }
+
+  /// Reads the standard Bluetooth Battery Service when the temporary GATT
+  /// link is available. V2 Windows fast-connect intentionally has no GATT
+  /// link, so its battery value remains unknown instead of using a guessed
+  /// private RFCOMM command.
+  Future<void> _readStandardBatteryLevel() async {
+    final device = connectedDevice;
+    if (device == null) return;
+
+    GATTCharacteristic? levelCharacteristic;
+    for (final service in services) {
+      if (service.uuid.toString().toLowerCase() != BatteryGatt.serviceUuid) {
+        continue;
+      }
+      for (final characteristic in service.characteristics) {
+        if (characteristic.uuid.toString().toLowerCase() ==
+            BatteryGatt.levelUuid) {
+          levelCharacteristic = characteristic;
+          break;
+        }
+      }
+      break;
+    }
+
+    if (levelCharacteristic == null) {
+      _log(
+          'Standard Battery Service (180F/2A19) not available; battery unknown.');
+      return;
+    }
+    try {
+      final data =
+          await _transport.readCharacteristic(device, levelCharacteristic);
+      final level = parseBatteryLevel(data);
+      if (level == null) {
+        _log(
+            'Battery Level characteristic returned an invalid value; battery unknown.');
+        return;
+      }
+      batteryPercent = level;
+      _log('Battery Level (2A19) = $level%');
+    } catch (exception) {
+      _log(
+          'Battery Level characteristic read failed; battery unknown: $exception');
+    }
   }
 
   /// 检查 MI Wear 服务（0000fe95）的特征明细，并尝试读取版本特征
@@ -810,7 +906,7 @@ class DeviceController extends ChangeNotifier {
             _sppWatchdog?.cancel();
             _sppWatchdog = null;
             _log('L1START_RSP 收到——传输层已恢复；复用已确认的会话密钥，不重复 f=26/f=27。');
-            unawaited(syncSystemTime(automatic: true));
+            unawaited(_refreshAuthenticatedDeviceStatus());
             notifyListeners();
           } else {
             _log('L1START_RSP 收到——L1 会话建立！发送官方鉴权 f=26（DATA 明文帧）…');
@@ -921,7 +1017,7 @@ class DeviceController extends ChangeNotifier {
             ? '  ★ 鉴权完成（device ready）——会话密钥已建立；可使用已验证的安装流程'
             : '  ✕ 设备未确认鉴权，未将连接标记为就绪');
         if (confirmed && _sessionCipher != null) {
-          unawaited(syncSystemTime(automatic: true));
+          unawaited(_refreshAuthenticatedDeviceStatus());
         }
       }
     } else {
@@ -1087,12 +1183,21 @@ class DeviceController extends ChangeNotifier {
     _sessionCipher = null;
     _isScanning = false;
     services = const [];
+    connectedFirmwareVersion = null;
+    lastTimeSyncSummary = null;
+    batteryPercent = null;
+    storageUsedBytes = null;
+    storageTotalBytes = null;
     notifyListeners();
   }
 
   Future<void> startInstall(InstallRequest request) async {
     if (_timeSyncInProgress) {
       _log('安装被拒绝：系统时间同步正在进行，请等待同步完成。');
+      return;
+    }
+    if (_statusRefreshInProgress) {
+      _log('安装被拒绝：正在读取设备状态，请等待完成。');
       return;
     }
     if (_installInProgress) {
@@ -1502,9 +1607,17 @@ class DeviceController extends ChangeNotifier {
       connectedProfile?.family == DeviceFamily.redmiWatch5 &&
       metadata.containsLua;
 
-  Future<Zau> _requestBusiness(Zau message, int command, int sub) async {
+  Future<Zau> _requestBusiness(
+    Zau message,
+    int command,
+    int sub, {
+    int? responseCommand,
+    int? responseSub,
+  }) async {
+    final expectedCommand = responseCommand ?? command;
+    final expectedSub = responseSub ?? sub;
     final waiter = _BusinessWaiter(_businessResponses.stream,
-        (item) => item.command == command && item.sub == sub);
+        (item) => item.command == expectedCommand && item.sub == expectedSub);
     final plaintext = message.encode();
     final encrypted = _sessionCipher!.encryptOutbound(plaintext);
     _log('发送业务命令 $command/$sub：PB=${_hex(plaintext)}');
@@ -1580,6 +1693,39 @@ class DeviceController extends ChangeNotifier {
     } finally {
       _timeSyncInProgress = false;
       notifyListeners();
+    }
+  }
+
+  Future<void> _refreshAuthenticatedDeviceStatus() async {
+    if (_statusRefreshInProgress || !sessionReady || _sessionCipher == null) {
+      return;
+    }
+    _statusRefreshInProgress = true;
+    try {
+      await syncSystemTime(automatic: true);
+      if (!sessionReady || _sessionCipher == null) return;
+      final response = await _requestBusiness(
+        Zau(
+            command: ZauCommand.queryStorageSpace,
+            sub: ZauModule.storageManager),
+        ZauCommand.queryStorageSpace,
+        ZauModule.storageManager,
+        responseCommand: 4,
+        responseSub: ZauModule.storageManager,
+      );
+      final payload = response.payload;
+      if (payload == null || payload.$1 != 4) {
+        throw const FormatException('存储响应缺少 ysr 载荷');
+      }
+      final status = StorageStatusPayload.parse(payload.$2);
+      storageUsedBytes = status.usedBytes;
+      storageTotalBytes = status.totalBytes;
+      _log('设备存储：${status.usedBytes}/${status.totalBytes} B');
+      notifyListeners();
+    } on Object catch (exception) {
+      _log('读取设备存储失败，保持未知状态：$exception');
+    } finally {
+      _statusRefreshInProgress = false;
     }
   }
 

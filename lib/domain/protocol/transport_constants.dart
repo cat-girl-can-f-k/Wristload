@@ -9,6 +9,23 @@ abstract final class SarGatt {
   static const String notifyUuid = '0000005e-0000-1000-8000-00805f9b34fb';
 }
 
+/// Standard Bluetooth Battery Service UUIDs.
+abstract final class BatteryGatt {
+  static const String serviceUuid = '0000180f-0000-1000-8000-00805f9b34fb';
+  static const String levelUuid = '00002a19-0000-1000-8000-00805f9b34fb';
+}
+
+/// Decodes the standard Battery Level characteristic (0x2A19).
+///
+/// Devices occasionally return an empty or malformed value while the GATT
+/// connection is settling. Invalid values remain unknown instead of being
+/// presented as a real battery percentage.
+int? parseBatteryLevel(List<int> value) {
+  if (value.isEmpty) return null;
+  final level = value.first;
+  return level >= 0 && level <= 100 ? level : null;
+}
+
 /// CRC-16/IBM (reflected polynomial 0xA001, initial value 0).
 int computeCrc16(List<int> data, {int? length}) {
   final len = length ?? data.length;

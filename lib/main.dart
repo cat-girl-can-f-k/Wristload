@@ -14,6 +14,7 @@ import 'presentation/install_split_button.dart';
 import 'presentation/install_task_card.dart';
 import 'presentation/queue_page.dart';
 import 'presentation/settings_page.dart';
+import 'presentation/tools_page.dart';
 
 void main() => runApp(const MiWearableApp());
 
@@ -52,8 +53,9 @@ class _MiWearableAppState extends State<MiWearableApp> {
           builder: (context, _) => AppShell(controller: controller),
         ),
         routes: {
-          '/device-info': (context) =>
-              DeviceInfoPage(controller: controller),
+          '/device-info': (context) => DeviceInfoPage(controller: controller),
+          '/queue': (context) => QueuePage(controller: controller),
+          '/tools': (context) => ToolsPage(controller: controller),
         },
       );
 }
@@ -125,6 +127,11 @@ class _AppShellState extends State<AppShell> {
                     label: const Text('队列'),
                   ),
                   const NavigationRailDestination(
+                    icon: Icon(Icons.build_outlined),
+                    selectedIcon: Icon(Icons.build),
+                    label: Text('工具'),
+                  ),
+                  const NavigationRailDestination(
                     icon: Icon(Icons.settings_outlined),
                     selectedIcon: Icon(Icons.settings),
                     label: Text('设置'),
@@ -141,6 +148,7 @@ class _AppShellState extends State<AppShell> {
                           _setPreferredInstallTarget,
                     ),
                   1 => QueuePage(controller: widget.controller),
+                  2 => ToolsPage(controller: widget.controller),
                   _ => TransferSettingsPage(
                       preferredInstallTarget: _preferredInstallTarget,
                       connectionMode: widget.controller.connectionMode,
@@ -460,7 +468,8 @@ class HomePage extends StatelessWidget {
                                   device == null
                                       ? '尚未连接设备'
                                       : '已连接：${controller.connectedDeviceName ?? controller.connectedProfile?.displayName ?? '未知设备'}',
-                                  style: Theme.of(context).textTheme.titleLarge),
+                                  style:
+                                      Theme.of(context).textTheme.titleLarge),
                             ),
                             if (device != null)
                               IconButton(
@@ -480,7 +489,11 @@ class HomePage extends StatelessWidget {
                         ),
                         if (device != null &&
                             (controller.batteryPercent != null ||
-                                controller.storageTotalBytes != null)) ...[
+                                (controller.storageUsedBytes != null &&
+                                    controller.storageTotalBytes != null &&
+                                    controller.storageTotalBytes! > 0 &&
+                                    controller.storageUsedBytes! <=
+                                        controller.storageTotalBytes!))) ...[
                           const SizedBox(height: 12),
                           Row(
                             children: [
@@ -501,19 +514,25 @@ class HomePage extends StatelessWidget {
                                   ),
                                 ),
                               if (controller.batteryPercent != null &&
-                                  controller.storageTotalBytes != null)
+                                  controller.storageUsedBytes != null &&
+                                  controller.storageTotalBytes != null &&
+                                  controller.storageTotalBytes! > 0 &&
+                                  controller.storageUsedBytes! <=
+                                      controller.storageTotalBytes!)
                                 const SizedBox(width: 12),
-                              if (controller.storageTotalBytes != null)
+                              if (controller.storageUsedBytes != null &&
+                                  controller.storageTotalBytes != null &&
+                                  controller.storageTotalBytes! > 0 &&
+                                  controller.storageUsedBytes! <=
+                                      controller.storageTotalBytes!)
                                 Expanded(
                                   child: _DeviceStat(
                                     icon: Icons.sd_storage,
                                     value:
-                                        '${_formatBytes(controller.storageUsedBytes ?? 0)} / ${_formatBytes(controller.storageTotalBytes!)}',
+                                        '${_formatBytes(controller.storageUsedBytes!)} / ${_formatBytes(controller.storageTotalBytes!)}',
                                     detail: '存储',
-                                    progress: controller.storageTotalBytes! <= 0
-                                        ? 0
-                                        : ((controller.storageUsedBytes ?? 0) /
-                                            controller.storageTotalBytes!),
+                                    progress: controller.storageUsedBytes! /
+                                        controller.storageTotalBytes!,
                                   ),
                                 ),
                             ],

@@ -41,7 +41,8 @@ class _InstallSplitButtonState extends State<InstallSplitButton> {
         ],
       );
     }
-    final preferred = _InstallTargetPresentation(widget.preferredTarget.toKind());
+    final preferred =
+        _InstallTargetPresentation(widget.preferredTarget.toKind());
     final alternate = _InstallTargetPresentation(preferred.alternate);
 
     return Row(
@@ -88,16 +89,14 @@ class _InstallSplitButtonState extends State<InstallSplitButton> {
               MenuItemButton(
                 key: const ValueKey('alternate-install-menu-item'),
                 leadingIcon: Icon(alternate.icon),
-                onPressed: widget.enabled
-                    ? () => widget.onInstall(alternate.target)
-                    : null,
+                onPressed: () => widget.onInstall(alternate.target),
                 child: Text(alternate.installLabel),
               ),
             ],
             builder: (context, controller, child) => FilledButton(
               key: const ValueKey('install-menu-button'),
-              // Preference selection remains available even when no session is ready.
-              onPressed: widget.enabled ? controller.open : null,
+              // Selecting an alternate file type is useful before authentication.
+              onPressed: controller.open,
               style: FilledButton.styleFrom(
                 padding: EdgeInsets.zero,
                 shape: const RoundedRectangleBorder(

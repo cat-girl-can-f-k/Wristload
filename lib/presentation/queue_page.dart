@@ -21,11 +21,13 @@ class QueuePage extends StatelessWidget {
             listenable: controller,
             builder: (context, _) {
               final queue = controller.installQueue;
-              if (queue.isEmpty) {
-                return const _EmptyQueue();
-              }
               final total = queue.length;
               final installing = controller.installingCount;
+              final hasCompleted = queue.any((entry) =>
+                  entry.stage != QueueStage.waiting &&
+                  entry.stage != QueueStage.installing);
+              final hasStarted =
+                  queue.any((entry) => entry.stage != QueueStage.waiting);
               final installingLabel =
                   installing > 0 ? ' · $installing 项安装中' : '';
               return Column(
@@ -43,7 +45,9 @@ class QueuePage extends StatelessWidget {
                             style: Theme.of(context).textTheme.bodyMedium),
                         const SizedBox(width: 12),
                         TextButton(
-                          onPressed: controller.clearCompletedQueue,
+                          onPressed: hasCompleted
+                              ? controller.clearCompletedQueue
+                              : null,
                           child: const Text('清空已完成'),
                         ),
                         const SizedBox(width: 4),
@@ -52,28 +56,28 @@ class QueuePage extends StatelessWidget {
                               ? controller.runQueue
                               : null,
                           icon: const Icon(Icons.play_arrow),
-                          label: Text(controller.pendingCount > 0
-                              ? '继续安装'
-                              : '开始安装'),
+                          label: Text(hasStarted ? '继续安装' : '开始安装'),
                         ),
                       ],
                     ),
                   ),
                   Expanded(
-                    child: ReorderableListView.builder(
-                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-                      onReorderItem: controller.reorderQueue,
-                      itemCount: queue.length,
-                      itemBuilder: (context, index) {
-                        final entry = queue[index];
-                        return _QueueTile(
-                          key: ValueKey('queue-${entry.request.path}-$index'),
-                          controller: controller,
-                          entry: entry,
-                          index: index,
-                        );
-                      },
-                    ),
+                    child: queue.isEmpty
+                        ? const _EmptyQueue()
+                        : ReorderableListView.builder(
+                            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                            onReorderItem: controller.reorderQueue,
+                            itemCount: queue.length,
+                            itemBuilder: (context, index) {
+                              final entry = queue[index];
+                              return _QueueTile(
+                                key: ObjectKey(entry),
+                                controller: controller,
+                                entry: entry,
+                                index: index,
+                              );
+                            },
+                          ),
                   ),
                 ],
               );
@@ -104,9 +108,8 @@ class _QueueTile extends StatelessWidget {
     final isInstalling = entry.stage == QueueStage.installing;
     final canDrag = !isInstalling;
 
-    final typeIcon = request.kind == InstallKind.watchface
-        ? Icons.watch
-        : Icons.apps;
+    final typeIcon =
+        request.kind == InstallKind.watchface ? Icons.watch : Icons.apps;
     final typeLabel = request.kind == InstallKind.watchface ? '表盘' : '快应用';
     final sizeLabel = _formatSize(request.metadata.fileSize);
 
@@ -151,8 +154,7 @@ class _QueueTile extends StatelessWidget {
         ),
         title: Text(request.metadata.fileName,
             maxLines: 1, overflow: TextOverflow.ellipsis),
-        subtitle: Text(subtitle,
-            maxLines: 2, overflow: TextOverflow.ellipsis),
+        subtitle: Text(subtitle, maxLines: 2, overflow: TextOverflow.ellipsis),
         trailing: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -160,7 +162,9 @@ class _QueueTile extends StatelessWidget {
             const SizedBox(width: 4),
             IconButton(
               tooltip: '从队列移除',
-              onPressed: isInstalling ? null : () => controller.removeQueueEntry(index),
+              onPressed: isInstalling
+                  ? null
+                  : () => controller.removeQueueEntry(index),
               icon: const Icon(Icons.delete_outline),
             ),
           ],
@@ -202,7 +206,7 @@ class _QueueStatusIndicator extends StatelessWidget {
           label: '失败 · 重试',
           backgroundColor: theme.colorScheme.errorContainer,
           foregroundColor: theme.colorScheme.onErrorContainer,
-          onTap: () => controller.startInstall(entry.request),
+          onTap: () => controller.retryQueueEntry(entry),
         );
       case QueueStage.cancelled:
         return const _StatusChip(label: '已取消');
@@ -211,7 +215,7 @@ class _QueueStatusIndicator extends StatelessWidget {
           label: '状态未知 · 重试',
           backgroundColor: theme.colorScheme.errorContainer,
           foregroundColor: theme.colorScheme.onErrorContainer,
-          onTap: () => controller.startInstall(entry.request),
+          onTap: () => controller.retryQueueEntry(entry),
         );
     }
   }
@@ -262,10 +266,13 @@ class _StatusChip extends StatelessWidget {
       label: Text(label),
       labelStyle: TextStyle(
         fontSize: 12,
-        color: foregroundColor ?? Theme.of(context).colorScheme.onSurfaceVariant,
+        color:
+            foregroundColor ?? Theme.of(context).colorScheme.onSurfaceVariant,
       ),
-      backgroundColor: backgroundColor ?? Theme.of(context).colorScheme.surfaceContainerHigh,
-      side: BorderSide.none,
+      backgroundColor: backgroundColor ?? Colors.transparent,
+      side: backgroundColor == null
+          ? BorderSide(color: Theme.of(context).colorScheme.outline)
+          : BorderSide.none,
       visualDensity: VisualDensity.compact,
       padding: EdgeInsets.zero,
       onPressed: onTap,

@@ -17,9 +17,8 @@ class DeviceInfoPage extends StatelessWidget {
       body: ListenableBuilder(
         listenable: controller,
         builder: (context, _) {
-          final mac = device == null
-              ? null
-              : _formatMac(device.uuid.toString());
+          final mac =
+              device == null ? null : _formatMac(device.uuid.toString());
           final firmware = controller.connectedFirmwareVersion;
           final model = controller.connectedDeviceName ??
               controller.connectedProfile?.displayName;
@@ -73,12 +72,15 @@ class DeviceInfoPage extends StatelessWidget {
                   title: const Text('电量'),
                   subtitle: Text('$battery%'),
                 ),
-              if (storageTotal != null)
+              if (storageUsed != null &&
+                  storageTotal != null &&
+                  storageTotal > 0 &&
+                  storageUsed <= storageTotal)
                 ListTile(
                   leading: const Icon(Icons.sd_storage),
                   title: const Text('存储'),
                   subtitle: Text(
-                      '${_formatBytes(storageUsed ?? 0)} / ${_formatBytes(storageTotal)}'),
+                      '${_formatBytes(storageUsed)} / ${_formatBytes(storageTotal)}'),
                 ),
               ListTile(
                 leading: const Icon(Icons.sync),
