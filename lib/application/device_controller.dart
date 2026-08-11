@@ -27,10 +27,11 @@ class DeviceController extends ChangeNotifier {
   DeviceController({BleTransport? transport})
       : _transport = transport ?? BleTransport() {
     unawaited(_restoreAuthKey());
-    unawaited(_restoreTransferSettings());
+    _transferSettingsReady = _restoreTransferSettings();
   }
 
   final BleTransport _transport;
+  late final Future<void> _transferSettingsReady;
   bool _disposed = false;
   StreamSubscription<DiscoveredEventArgs>? _scanSubscription;
   bool _isScanning = false;
@@ -193,12 +194,27 @@ class DeviceController extends ChangeNotifier {
   /// control or ACK validation.
   int segmentIntervalMs = 5;
   int massWindowSize = 3;
+  bool autoTimeSync = false;
+  bool _autoTimeSyncChangedByUser = false;
 
   void _persistTransferSettings() {
     unawaited(_transferSettings.write(
       segmentIntervalMs: segmentIntervalMs,
       massWindowSize: massWindowSize,
+      autoTimeSync: autoTimeSync,
     ));
+  }
+
+  void setAutoTimeSync(bool value) {
+    if (autoTimeSync == value) return;
+    _autoTimeSyncChangedByUser = true;
+    autoTimeSync = value;
+    _persistTransferSettings();
+    _log('自动同步时间与时区已${value ? '开启' : '关闭'}。');
+    notifyListeners();
+    if (value && sessionReady && !installInProgress && !timeSyncInProgress) {
+      unawaited(syncSystemTime(automatic: true));
+    }
   }
 
   void setSegmentIntervalMs(int value) {
@@ -225,6 +241,9 @@ class DeviceController extends ChangeNotifier {
     final saved = await _transferSettings.read();
     final interval = saved.segmentIntervalMs;
     final window = saved.massWindowSize;
+    if (!_autoTimeSyncChangedByUser) {
+      autoTimeSync = saved.autoTimeSync ?? false;
+    }
     if (interval != null && interval >= 1 && interval <= 20) {
       segmentIntervalMs = interval;
     }
@@ -1556,7 +1575,7 @@ class DeviceController extends ChangeNotifier {
           1);
       await _clearCheckpointBestEffort();
       _publishTask(request, InstallStage.succeeded,
-          '表盘已安装并已请求切换 faceId=${metadata.faceId}。');
+          '表盘已安装并已请求切换 faceId=${metadata.faceId}');
       return;
     }
     late final Zau appResultMessage;
@@ -1578,7 +1597,7 @@ class DeviceController extends ChangeNotifier {
     }
     await _clearCheckpointBestEffort();
     _publishTask(
-        request, InstallStage.succeeded, '快应用已安装：${appResult.packageName}。');
+        request, InstallStage.succeeded, '快应用已安装：${appResult.packageName}');
   }
 
   void _validateInstallRequest(InstallRequest request) {
@@ -1718,9 +1737,17 @@ class DeviceController extends ChangeNotifier {
     _statusRefreshEpoch = refreshEpoch;
     notifyListeners();
     try {
-      final synced = await syncSystemTime(automatic: true);
-      if (!synced ||
-          refreshEpoch != _sessionEpoch ||
+      await _transferSettingsReady;
+      if (refreshEpoch != _sessionEpoch ||
+          !sessionReady ||
+          !identical(_sessionCipher, session)) {
+        return;
+      }
+      if (autoTimeSync) {
+        final synced = await syncSystemTime(automatic: true);
+        if (!synced) return;
+      }
+      if (refreshEpoch != _sessionEpoch ||
           !sessionReady ||
           !identical(_sessionCipher, session)) {
         return;

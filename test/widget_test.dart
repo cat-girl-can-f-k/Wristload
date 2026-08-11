@@ -1,12 +1,15 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:miwearable_install_tool/application/device_controller.dart';
 import 'package:miwearable_install_tool/domain/device_profile.dart';
+import 'package:miwearable_install_tool/domain/install_models.dart';
 import 'package:miwearable_install_tool/domain/install_task.dart';
 import 'package:miwearable_install_tool/domain/install_preference_store.dart';
 import 'package:miwearable_install_tool/presentation/install_task_card.dart';
 import 'package:miwearable_install_tool/presentation/home_widgets.dart';
 import 'package:miwearable_install_tool/presentation/install_split_button.dart';
+import 'package:miwearable_install_tool/presentation/queue_page.dart';
 import 'package:miwearable_install_tool/presentation/settings_page.dart';
 
 void main() {
@@ -147,16 +150,43 @@ void main() {
 
     expect(find.text('发送窗口间隔'), findsOneWidget);
     expect(find.text('5 ms'), findsOneWidget);
-    expect(find.text('每窗口分片数（实验）'), findsOneWidget);
+    expect(find.text('每窗口分片数'), findsOneWidget);
     expect(find.text('50 片'), findsOneWidget);
     await tester.scrollUntilVisible(
-      find.textContaining('已超过设备协商值 3'),
+      find.text('值越小传输速度越慢'),
       250,
       scrollable: find.byType(Scrollable),
     );
-    expect(find.textContaining('已超过设备协商值 3'), findsOneWidget);
+    expect(find.text('值越小传输速度越慢'), findsOneWidget);
     expect(interval, isNull);
     expect(windowSize, isNull);
+  });
+
+  testWidgets('自动同步时间与时区默认关闭并可开启', (tester) async {
+    bool? changedTo;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: TransferSettingsPage(
+            connectionMode: ConnectionMode.modern,
+            preferredInstallTarget: InstallPreference.watchface,
+            connectionModeEnabled: true,
+            segmentIntervalMs: 5,
+            massWindowSize: 3,
+            onConnectionModeChanged: (_) {},
+            onSegmentIntervalChanged: (_) {},
+            onMassWindowSizeChanged: (_) {},
+            onAutoTimeSyncChanged: (value) => changedTo = value,
+            onPreferredInstallTargetChanged: (_) {},
+          ),
+        ),
+      ),
+    );
+
+    final tile = tester.widget<SwitchListTile>(find.byType(SwitchListTile));
+    expect(tile.value, isFalse);
+    await tester.tap(find.text('自动同步时间与时区'));
+    expect(changedTo, isTrue);
   });
 
   testWidgets('Split Button 主区跟随偏好并复用安装回调', (tester) async {
@@ -177,11 +207,11 @@ void main() {
         );
 
     await pump(InstallKind.watchface);
-    expect(find.text('安装表盘 .bin'), findsOneWidget);
+    expect(find.text('安装表盘 .bin / .face'), findsOneWidget);
     await tester.tap(find.byKey(const ValueKey('preferred-install-button')));
     expect(installed, InstallKind.watchface);
 
-    await tester.tap(find.byKey(const ValueKey('install-menu-button')));
+    await tester.tap(find.byKey(const ValueKey('install-menu-popup')));
     await tester.pumpAndSettle();
     expect(find.text('安装快应用 .rpk'), findsOneWidget);
     await tester.tap(find.byKey(const ValueKey('alternate-install-menu-item')));
@@ -190,6 +220,62 @@ void main() {
 
     await pump(InstallKind.quickApp);
     expect(find.text('安装快应用 .rpk'), findsOneWidget);
+  });
+
+  testWidgets('Split Button 未鉴权时两侧均禁用且副菜单不可打开', (tester) async {
+    var installCalls = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: InstallSplitButton(
+            preferredTarget: InstallPreference.watchface,
+            enabled: false,
+            onInstall: (_) async => installCalls++,
+          ),
+        ),
+      ),
+    );
+
+    final preferredSegment = find.descendant(
+      of: find.byKey(const ValueKey('preferred-install-button')),
+      matching: find.byKey(const ValueKey('install-segment-material')),
+    );
+    final alternateSegment = find.descendant(
+      of: find.byKey(const ValueKey('install-menu-button')),
+      matching: find.byKey(const ValueKey('install-segment-material')),
+    );
+    final preferredMaterial = tester.widget<Material>(preferredSegment);
+    final alternateMaterial = tester.widget<Material>(alternateSegment);
+    final colors = Theme.of(
+      tester.element(find.byKey(const ValueKey('preferred-install-button'))),
+    ).colorScheme;
+    final expectedBackground = colors.onSurface.withValues(alpha: 0.12);
+    final expectedForeground = colors.onSurface.withValues(alpha: 0.38);
+    expect(preferredMaterial.color, expectedBackground);
+    expect(alternateMaterial.color, expectedBackground);
+
+    final preferredIcon = tester.widget<Icon>(find.byIcon(Icons.watch));
+    final alternateIcon = tester.widget<Icon>(
+      find.descendant(
+        of: find.byKey(const ValueKey('install-menu-chevron')),
+        matching: find.byType(Icon),
+      ),
+    );
+    expect(preferredIcon.color, expectedForeground);
+    expect(alternateIcon.color, expectedForeground);
+
+    await tester.tap(
+      find.byKey(const ValueKey('preferred-install-button')),
+      warnIfMissed: false,
+    );
+
+    await tester.tap(find.byKey(const ValueKey('install-menu-popup')));
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('alternate-install-menu-item')),
+      findsNothing,
+    );
+    expect(installCalls, 0);
   });
 
   testWidgets('Split Button 菜单打开时切换页面不会触发生命周期断言', (tester) async {
@@ -205,7 +291,7 @@ void main() {
       ),
     );
 
-    await tester.tap(find.byKey(const ValueKey('install-menu-button')));
+    await tester.tap(find.byKey(const ValueKey('install-menu-popup')));
     await tester.pump();
     expect(find.byKey(const ValueKey('alternate-install-menu-item')),
         findsOneWidget);
@@ -219,5 +305,69 @@ void main() {
 
     expect(tester.takeException(), isNull);
     expect(find.text('队列页面'), findsOneWidget);
+  });
+
+  testWidgets('队列空态隐藏头部操作并显示文件投放入口', (tester) async {
+    final controller = DeviceController();
+    addTearDown(controller.dispose);
+
+    await tester.pumpWidget(
+      MaterialApp(home: Scaffold(body: QueuePage(controller: controller))),
+    );
+
+    expect(find.text('安装队列 · 0 项'), findsOneWidget);
+    expect(find.text('队列为空'), findsOneWidget);
+    expect(find.text('选择文件'), findsOneWidget);
+    expect(find.text('添加文件'), findsNothing);
+    expect(find.byKey(const ValueKey('queue-add-more')), findsNothing);
+  });
+
+  testWidgets('队列有项目时显示两个添加入口并用勾表示完成', (tester) async {
+    final controller = DeviceController();
+    addTearDown(controller.dispose);
+    final metadata = InstallMetadata(
+      fileName: 'demo.face',
+      fileSize: 1024,
+      md5Hex: '0123456789abcdef0123456789abcdef',
+      sha256Hex: '0' * 64,
+    );
+    controller.enqueue(
+      InstallRequest(
+        kind: InstallKind.watchface,
+        path: r'C:\packages\demo.face',
+        metadata: metadata,
+      ),
+    );
+    controller.installQueue.single.stage = QueueStage.done;
+
+    await tester.pumpWidget(
+      MaterialApp(home: Scaffold(body: QueuePage(controller: controller))),
+    );
+
+    expect(find.text('添加文件'), findsOneWidget);
+    expect(find.byKey(const ValueKey('queue-add-more')), findsOneWidget);
+    expect(find.byIcon(Icons.check_circle), findsOneWidget);
+    expect(find.text('已完成'), findsNothing);
+  });
+
+  test('从队列页加入请求保持等待，直到显式开始安装', () {
+    final controller = DeviceController();
+    addTearDown(controller.dispose);
+    controller.enqueue(
+      InstallRequest(
+        kind: InstallKind.quickApp,
+        path: r'C:\packages\demo.rpk',
+        metadata: InstallMetadata(
+          fileName: 'demo.rpk',
+          fileSize: 2048,
+          md5Hex: '0123456789abcdef0123456789abcdef',
+          sha256Hex: '0' * 64,
+        ),
+      ),
+    );
+
+    expect(controller.installQueue, hasLength(1));
+    expect(controller.installQueue.single.stage, QueueStage.waiting);
+    expect(controller.latestTask, isNull);
   });
 }

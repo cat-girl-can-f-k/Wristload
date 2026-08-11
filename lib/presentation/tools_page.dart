@@ -23,6 +23,7 @@ class _ToolsPageState extends State<ToolsPage> {
   final _macController = TextEditingController();
   PlatformFile? _zipFile;
   String? _authKey;
+  bool _authKeyRevealed = false;
   String? _authError;
   String? _unlockCode;
   UnlockAlgorithm _unlockAlgorithm = UnlockAlgorithm.old;
@@ -45,6 +46,7 @@ class _ToolsPageState extends State<ToolsPage> {
     setState(() {
       _zipFile = result.files.single;
       _authKey = null;
+      _authKeyRevealed = false;
       _authError = null;
     });
   }
@@ -71,7 +73,12 @@ class _ToolsPageState extends State<ToolsPage> {
       if (candidates.isEmpty) {
         throw const FormatException('未找到 32 位 authkey');
       }
-      if (mounted) setState(() => _authKey = candidates.first.key);
+      if (mounted) {
+        setState(() {
+          _authKey = candidates.first.key;
+          _authKeyRevealed = false;
+        });
+      }
     } on Object catch (error) {
       if (mounted) setState(() => _authError = '文件无效或未找到 authkey：$error');
     } finally {
@@ -80,6 +87,9 @@ class _ToolsPageState extends State<ToolsPage> {
   }
 
   Future<void> _copy(String value) async {
+    if (_authKey == value && mounted) {
+      setState(() => _authKeyRevealed = true);
+    }
     await Clipboard.setData(ClipboardData(text: value));
     if (!mounted) return;
     ScaffoldMessenger.of(context)
@@ -127,7 +137,7 @@ class _ToolsPageState extends State<ToolsPage> {
             _ToolCard(
               icon: Icons.vpn_key,
               title: 'authkey 提取',
-              description: '从小米运动健康 / Zepp Life 导出的日志 .zip 中解析设备 authkey',
+              description: '从小米运动健康导出的日志 .zip 中解析设备 authkey',
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -195,9 +205,15 @@ class _ToolsPageState extends State<ToolsPage> {
                       child: Row(
                         children: [
                           Expanded(
-                            child: SelectableText(
-                              key,
-                              style: const TextStyle(fontFamily: 'monospace'),
+                            child: GestureDetector(
+                              onTap: () =>
+                                  setState(() => _authKeyRevealed = true),
+                              child: SelectableText(
+                                _authKeyRevealed
+                                    ? key
+                                    : '${key.substring(0, 4)}******${key.substring(key.length - 4)}',
+                                style: const TextStyle(fontFamily: 'monospace'),
+                              ),
                             ),
                           ),
                           IconButton(
@@ -299,7 +315,7 @@ class _ToolsPageState extends State<ToolsPage> {
                     Row(
                       children: [
                         SelectableText(
-                          '${code.substring(0, 5)} ${code.substring(5)}',
+                          '${code.substring(0, 4)} ${code.substring(4)}',
                           style: theme.textTheme.headlineMedium
                               ?.copyWith(fontFamily: 'monospace'),
                         ),

@@ -155,12 +155,14 @@ class _AppShellState extends State<AppShell> {
                       connectionModeEnabled: !widget.controller.isConnected,
                       segmentIntervalMs: widget.controller.segmentIntervalMs,
                       massWindowSize: widget.controller.massWindowSize,
+                      autoTimeSync: widget.controller.autoTimeSync,
                       onConnectionModeChanged:
                           widget.controller.setConnectionMode,
                       onSegmentIntervalChanged:
                           widget.controller.setSegmentIntervalMs,
                       onMassWindowSizeChanged:
                           widget.controller.setMassWindowSize,
+                      onAutoTimeSyncChanged: widget.controller.setAutoTimeSync,
                       onPreferredInstallTargetChanged:
                           _setPreferredInstallTarget,
                     ),
@@ -185,10 +187,11 @@ class HomePage extends StatelessWidget {
   final ValueChanged<InstallPreference> onPreferredInstallTargetChanged;
 
   Future<void> _pickAndTry(BuildContext context, InstallKind kind) async {
-    final extension = kind == InstallKind.watchface ? 'bin' : 'rpk';
+    final extensions =
+        kind == InstallKind.watchface ? const ['bin', 'face'] : const ['rpk'];
     final selected = await FilePicker.platform.pickFiles(
       type: FileType.custom,
-      allowedExtensions: [extension],
+      allowedExtensions: extensions,
     );
     final path = selected?.files.single.path;
     if (path == null) return;
@@ -238,6 +241,7 @@ class HomePage extends StatelessWidget {
         unsupportedLuaConfirmed: unsupportedLuaConfirmed,
         watchfaceResolutionConfirmed: watchfaceResolutionConfirmed,
       ));
+      await controller.runQueue();
     } on Object catch (error) {
       controller.reportError('无法创建安装计划：$error');
     }
@@ -567,40 +571,6 @@ class HomePage extends StatelessWidget {
                   ),
               ] else ...[
                 const SizedBox(height: 12),
-                if (controller.sessionReady) ...[
-                  Row(
-                    children: [
-                      OutlinedButton.icon(
-                        onPressed: !controller.installInProgress &&
-                                !controller.timeSyncInProgress &&
-                                !controller.statusRefreshInProgress
-                            ? controller.syncSystemTime
-                            : null,
-                        icon: controller.timeSyncInProgress
-                            ? const SizedBox.square(
-                                dimension: 18,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                ),
-                              )
-                            : const Icon(Icons.sync),
-                        label: Text(controller.timeSyncInProgress
-                            ? '正在同步时间'
-                            : '同步时间与时区'),
-                      ),
-                      if (controller.lastTimeSyncSummary
-                          case final summary?) ...[
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Text(
-                            summary,
-                            style: Theme.of(context).textTheme.bodySmall,
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                ],
                 if (!controller.sessionReady && !controller.sppConnecting) ...[
                   const SizedBox(height: 8),
                   OutlinedButton.icon(

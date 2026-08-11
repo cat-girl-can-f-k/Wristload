@@ -18,6 +18,7 @@ class TransferSettingsStore {
       return TransferSettings(
         segmentIntervalMs: value['segmentIntervalMs'] as int?,
         massWindowSize: value['massWindowSize'] as int?,
+        autoTimeSync: value['autoTimeSync'] as bool?,
       );
     } on Object {
       return const TransferSettings();
@@ -27,19 +28,25 @@ class TransferSettingsStore {
   Future<void> write({
     required int segmentIntervalMs,
     required int massWindowSize,
+    bool autoTimeSync = false,
   }) {
     // Sliders can submit several changes before the previous rename finishes.
     // Serialize delete/rename pairs so one write cannot remove another write's
     // temporary file or leave the queue permanently failed.
     final next = _writeQueue.then<void>(
-      (_) => _writeNow(segmentIntervalMs, massWindowSize),
-      onError: (_) => _writeNow(segmentIntervalMs, massWindowSize),
+      (_) => _writeNow(segmentIntervalMs, massWindowSize, autoTimeSync),
+      onError: (_) =>
+          _writeNow(segmentIntervalMs, massWindowSize, autoTimeSync),
     );
     _writeQueue = next;
     return next;
   }
 
-  Future<void> _writeNow(int segmentIntervalMs, int massWindowSize) async {
+  Future<void> _writeNow(
+    int segmentIntervalMs,
+    int massWindowSize,
+    bool autoTimeSync,
+  ) async {
     final file = await _file();
     await file.parent.create(recursive: true);
     final temporary = File('${file.path}.tmp');
@@ -47,6 +54,7 @@ class TransferSettingsStore {
       jsonEncode({
         'segmentIntervalMs': segmentIntervalMs,
         'massWindowSize': massWindowSize,
+        'autoTimeSync': autoTimeSync,
       }),
       flush: true,
     );
@@ -61,8 +69,13 @@ class TransferSettingsStore {
 }
 
 class TransferSettings {
-  const TransferSettings({this.segmentIntervalMs, this.massWindowSize});
+  const TransferSettings({
+    this.segmentIntervalMs,
+    this.massWindowSize,
+    this.autoTimeSync,
+  });
 
   final int? segmentIntervalMs;
   final int? massWindowSize;
+  final bool? autoTimeSync;
 }

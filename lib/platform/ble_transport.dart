@@ -9,9 +9,11 @@ import '../domain/protocol/transport_constants.dart';
 /// Windows-first BLE central wrapper. The plugin maps to native Windows BLE;
 /// its Android and Linux backends keep this boundary portable.
 class BleTransport {
-  BleTransport() : _central = CentralManager();
+  BleTransport();
 
-  final CentralManager _central;
+  // Creating the platform channel is deferred until a BLE operation is used.
+  // This keeps presentation-only consumers independent from native Bluetooth.
+  late final CentralManager _central = CentralManager();
 
   /// 服务发现重试次数（Windows BLE 首次连接后 GATT 事务可能未就绪，
   /// 且手环 9 的特征枚举偶发失败/为空——实测需多次重连才成功）。

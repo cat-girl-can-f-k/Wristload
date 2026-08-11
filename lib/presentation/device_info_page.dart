@@ -48,24 +48,7 @@ class DeviceInfoPage extends StatelessWidget {
                 title: Text('连接方式'),
                 subtitle: Text('经典蓝牙 RFCOMM（SPP）'),
               ),
-              ListTile(
-                leading: const Icon(Icons.key),
-                title: const Text('authkey'),
-                subtitle: Text(controller.authKey ?? '未设置'),
-                trailing: controller.authKey == null
-                    ? null
-                    : IconButton(
-                        tooltip: '复制 authkey',
-                        icon: const Icon(Icons.copy),
-                        onPressed: () {
-                          Clipboard.setData(
-                              ClipboardData(text: controller.authKey!));
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text('authkey 已复制')),
-                          );
-                        },
-                      ),
-              ),
+              _AuthKeyTile(value: controller.authKey),
               if (battery != null && battery >= 0 && battery <= 100)
                 ListTile(
                   leading: const Icon(Icons.battery_std),
@@ -113,5 +96,59 @@ class DeviceInfoPage extends StatelessWidget {
       return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
     }
     return '${(bytes / 1024).toStringAsFixed(1)} KB';
+  }
+}
+
+class _AuthKeyTile extends StatefulWidget {
+  const _AuthKeyTile({required this.value});
+  final String? value;
+  @override
+  State<_AuthKeyTile> createState() => _AuthKeyTileState();
+}
+
+class _AuthKeyTileState extends State<_AuthKeyTile> {
+  bool _revealed = false;
+
+  @override
+  void didUpdateWidget(covariant _AuthKeyTile oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.value != widget.value) _revealed = false;
+  }
+
+  Future<void> _copy() async {
+    final value = widget.value;
+    if (value == null) return;
+    setState(() => _revealed = true);
+    await Clipboard.setData(ClipboardData(text: value));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('authkey 已复制')),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final value = widget.value;
+    final shown = value == null
+        ? '未设置'
+        : _revealed || value.length <= 8
+            ? value
+            : '${value.substring(0, 4)}******${value.substring(value.length - 4)}';
+    return ListTile(
+      onTap: value == null ? null : () => setState(() => _revealed = true),
+      leading: const Icon(Icons.key),
+      title: const Text('authkey'),
+      subtitle: SelectableText(
+        shown,
+        style: const TextStyle(fontFamily: 'monospace'),
+      ),
+      trailing: value == null
+          ? null
+          : IconButton(
+              tooltip: '复制 authkey',
+              icon: const Icon(Icons.copy),
+              onPressed: _copy,
+            ),
+    );
   }
 }

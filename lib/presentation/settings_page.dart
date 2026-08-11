@@ -10,9 +10,11 @@ class TransferSettingsPage extends StatelessWidget {
     required this.connectionModeEnabled,
     required this.segmentIntervalMs,
     required this.massWindowSize,
+    this.autoTimeSync = false,
     required this.onConnectionModeChanged,
     required this.onSegmentIntervalChanged,
     required this.onMassWindowSizeChanged,
+    this.onAutoTimeSyncChanged,
     required this.onPreferredInstallTargetChanged,
     super.key,
   });
@@ -22,9 +24,11 @@ class TransferSettingsPage extends StatelessWidget {
   final bool connectionModeEnabled;
   final int segmentIntervalMs;
   final int massWindowSize;
+  final bool autoTimeSync;
   final ValueChanged<ConnectionMode> onConnectionModeChanged;
   final ValueChanged<int> onSegmentIntervalChanged;
   final ValueChanged<int> onMassWindowSizeChanged;
+  final ValueChanged<bool>? onAutoTimeSyncChanged;
   final ValueChanged<InstallPreference> onPreferredInstallTargetChanged;
 
   @override
@@ -71,32 +75,13 @@ class TransferSettingsPage extends StatelessWidget {
               style: theme.textTheme.bodySmall,
             ),
             const Divider(height: 40),
-            Text('设备', style: theme.textTheme.titleMedium),
-            const SizedBox(height: 12),
-            SegmentedButton<ConnectionMode>(
-              segments: const [
-                ButtonSegment(
-                  value: ConnectionMode.modern,
-                  icon: Icon(Icons.bluetooth_connected),
-                  label: Text('现代设备'),
-                ),
-                ButtonSegment(
-                  value: ConnectionMode.classicExperimental,
-                  icon: Icon(Icons.science_outlined),
-                  label: Text('经典设备（实验）'),
-                ),
-              ],
-              selected: {connectionMode},
-              onSelectionChanged: connectionModeEnabled
-                  ? (selection) => onConnectionModeChanged(selection.single)
-                  : null,
-            ),
-            const SizedBox(height: 8),
-            Text(
-              connectionMode == ConnectionMode.modern
-                  ? '适用于手环 9 及后续 V2 设备。'
-                  : '适用于旧款设备的实验连接；安装功能不可用。',
-              style: theme.textTheme.bodySmall,
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              secondary: const Icon(Icons.sync),
+              title: const Text('自动同步时间与时区'),
+              subtitle: const Text('鉴权成功后使用电脑当前的时间、时区和小时制同步设备'),
+              value: autoTimeSync,
+              onChanged: onAutoTimeSyncChanged,
             ),
             const Divider(height: 40),
             Text('传输', style: theme.textTheme.titleMedium),
@@ -126,7 +111,7 @@ class TransferSettingsPage extends StatelessWidget {
               children: [
                 const Icon(Icons.view_stream_outlined),
                 const SizedBox(width: 12),
-                const Expanded(child: Text('每窗口分片数（实验）')),
+                const Expanded(child: Text('每窗口分片数')),
                 Text('$massWindowSize 片'),
               ],
             ),
@@ -138,14 +123,7 @@ class TransferSettingsPage extends StatelessWidget {
               label: '$massWindowSize 片',
               onChanged: (value) => onMassWindowSizeChanged(value.round()),
             ),
-            Text(
-              massWindowSize <= 3
-                  ? '设备当前协商值为 3；可逐级提高并观察 ACK、超时与稳定性。'
-                  : '已超过设备协商值 3：仅用于测速，超时后会停止且不会盲目重发。',
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: massWindowSize <= 3 ? null : theme.colorScheme.error,
-              ),
-            ),
+            Text('值越小传输速度越慢', style: theme.textTheme.bodySmall),
           ],
         ),
       ),
