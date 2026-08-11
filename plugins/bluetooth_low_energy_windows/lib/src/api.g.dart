@@ -1091,22 +1091,24 @@ class CentralManagerHostApi {
     ;
   }
 
-  Future<void> showToast(String titleArgs, String bodyArgs) async {
-    final pigeonVar_channelName = 'dev.flutter.pigeon.bluetooth_low_energy_windows.CentralManagerHostApi.showToast$pigeonVar_messageChannelSuffix';
+  /// Returns true only when Windows had a pairing record and removed it.
+  Future<bool> unpairIfPaired(int addressArgs) async {
+    final pigeonVar_channelName = 'dev.flutter.pigeon.bluetooth_low_energy_windows.CentralManagerHostApi.unpairIfPaired$pigeonVar_messageChannelSuffix';
     final pigeonVar_channel = BasicMessageChannel<Object?>(
       pigeonVar_channelName,
       pigeonChannelCodec,
       binaryMessenger: pigeonVar_binaryMessenger,
     );
-    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(<Object?>[titleArgs, bodyArgs]);
+    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(<Object?>[addressArgs]);
     final pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
 
-    _extractReplyValueOrThrow(
+    final Object? pigeonVar_replyValue = _extractReplyValueOrThrow(
         pigeonVar_replyList,
         pigeonVar_channelName,
-        isNullValid: true,
+        isNullValid: false,
     )
     ;
+    return pigeonVar_replyValue! as bool;
   }
 
   Future<Uint8List> connectRfcomm(int addressArgs, String serviceUuidArgs) async {

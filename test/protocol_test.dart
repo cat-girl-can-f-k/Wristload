@@ -1,9 +1,12 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:archive/archive.dart';
 import 'package:miwearable_install_tool/domain/protocol/auth_handshake.dart';
 import 'package:miwearable_install_tool/domain/protocol/hci_decoder.dart';
-import 'package:miwearable_install_tool/domain/protocol/l1_l2_frame.dart';
 import 'package:miwearable_install_tool/domain/protocol/mass_transfer.dart';
 import 'package:miwearable_install_tool/domain/protocol/session_cipher.dart';
 import 'package:pointycastle/api.dart';
@@ -11,13 +14,159 @@ import 'package:pointycastle/block/aes.dart';
 import 'package:pointycastle/block/modes/ccm.dart';
 import 'package:miwearable_install_tool/domain/protocol/proto_wire.dart';
 import 'package:miwearable_install_tool/domain/protocol/spp_protocol.dart';
+import 'package:miwearable_install_tool/domain/protocol/transport_constants.dart';
 import 'package:miwearable_install_tool/domain/protocol/zau.dart';
-import 'package:miwearable_install_tool/domain/wear_protocol.dart';
+import 'package:miwearable_install_tool/domain/verification_gate.dart';
+import 'package:miwearable_install_tool/domain/device_profile.dart';
+import 'package:miwearable_install_tool/domain/install_metadata_reader.dart';
+import 'package:miwearable_install_tool/domain/install_models.dart';
+import 'package:miwearable_install_tool/domain/install_task.dart';
+import 'package:miwearable_install_tool/domain/mass_ack_idle_timeout.dart';
 
 void main() {
-  test('private protocol remains disabled until real-device verification', () {
-    expect(kProtocolVerified, isFalse);
-    expect(() => const VerificationGate().ensureCanSend(), throwsStateError);
+  group('Mass ACK 空闲超时', () {
+    test('每次确认进度都会续期，而不是限制整个窗口总时长', () async {
+      final first = Completer<void>();
+      final second = Completer<void>();
+      final third = Completer<void>();
+      final waiting = waitForMassAcknowledgements(
+        [first.future, second.future, third.future],
+        idleTimeout: const Duration(milliseconds: 500),
+        timeoutMessage: (acknowledged, total) => '$acknowledged/$total',
+      );
+
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      first.complete();
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      second.complete();
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      third.complete();
+
+      await expectLater(waiting, completes);
+    });
+
+    test('连续无进度才超时，并报告确认数量', () async {
+      final first = Completer<void>()..complete();
+      final pending = Completer<void>();
+      final waiting = waitForMassAcknowledgements(
+        [first.future, pending.future],
+        idleTimeout: const Duration(milliseconds: 50),
+        timeoutMessage: (acknowledged, total) => '已确认 $acknowledged/$total',
+      );
+
+      await expectLater(
+        waiting,
+        throwsA(isA<TimeoutException>().having(
+          (error) => error.message,
+          'message',
+          '已确认 1/2',
+        )),
+      );
+    });
+  });
+
+  test('表盘元数据识别 Lua 与二进制分辨率', () async {
+    final bytes = Uint8List(128);
+    bytes[0] = 0x5a;
+    bytes[1] = 0xa5;
+    bytes.setRange(40, 49, ascii.encode('367310001'));
+    bytes.setRange(64, 68, [0x50, 0x01, 0xe0, 0x01]); // 336×480 U16LE
+    bytes.setRange(80, 92, ascii.encode('main.Lua.bin'));
+    final directory = await Directory.systemTemp.createTemp('miwear-test-');
+    final file = File('${directory.path}${Platform.pathSeparator}face.bin');
+    try {
+      await file.writeAsBytes(bytes);
+      final metadata =
+          await InstallMetadataReader().read(InstallKind.watchface, file.path);
+      expect(metadata.faceId, '367310001');
+      expect(metadata.containsLua, isTrue);
+      expect(metadata.watchfaceResolutions,
+          contains(const WatchfaceResolution(336, 480)));
+      expect(metadata.md5Hex, hasLength(32));
+      expect(metadata.sha256Hex, hasLength(64));
+    } finally {
+      await directory.delete(recursive: true);
+    }
+  });
+
+  test('RPK 拒绝超过安全上限的清单条目', () async {
+    final manifest =
+        List<int>.filled(InstallMetadataReader.maxManifestBytes + 1, 0x20);
+    final archive = Archive()
+      ..addFile(ArchiveFile('manifest.json', manifest.length, manifest));
+    final encoded = Uint8List.fromList(ZipEncoder().encode(archive)!);
+    final directory = await Directory.systemTemp.createTemp('miwear-rpk-');
+    final file = File('${directory.path}${Platform.pathSeparator}large.rpk');
+    try {
+      await file.writeAsBytes(encoded);
+      await expectLater(
+        InstallMetadataReader().read(InstallKind.quickApp, file.path),
+        throwsA(isA<FormatException>()),
+      );
+    } finally {
+      await directory.delete(recursive: true);
+    }
+  });
+
+  test('RPK 跳过无包名清单并读取唯一有效包名', () async {
+    final archive = Archive()
+      ..addFile(ArchiveFile.string('manifest.json', '{"name":"demo"}'))
+      ..addFile(ArchiveFile.string('src/manifest.json',
+          '{"package":"com.example.valid","versionCode":7}'));
+    final encoded = Uint8List.fromList(ZipEncoder().encode(archive)!);
+    final directory = await Directory.systemTemp.createTemp('miwear-rpk-');
+    final file = File('${directory.path}${Platform.pathSeparator}valid.rpk');
+    try {
+      await file.writeAsBytes(encoded);
+      final metadata =
+          await InstallMetadataReader().read(InstallKind.quickApp, file.path);
+      expect(metadata.packageName, 'com.example.valid');
+      expect(metadata.versionCode, 7);
+    } finally {
+      await directory.delete(recursive: true);
+    }
+  });
+
+  test('RPK 拒绝多个互相冲突的有效包名', () async {
+    final archive = Archive()
+      ..addFile(ArchiveFile.string(
+          'manifest.json', '{"package":"com.example.first","versionCode":1}'))
+      ..addFile(ArchiveFile.string('src/manifest.json',
+          '{"package":"com.example.second","versionCode":1}'));
+    final encoded = Uint8List.fromList(ZipEncoder().encode(archive)!);
+    final directory = await Directory.systemTemp.createTemp('miwear-rpk-');
+    final file = File('${directory.path}${Platform.pathSeparator}conflict.rpk');
+    try {
+      await file.writeAsBytes(encoded);
+      await expectLater(
+        InstallMetadataReader().read(InstallKind.quickApp, file.path),
+        throwsA(isA<FormatException>()),
+      );
+    } finally {
+      await directory.delete(recursive: true);
+    }
+  });
+
+  test('private protocol is enabled after frame-level verification', () {
+    expect(kProtocolVerified, isTrue);
+    expect(() => const VerificationGate().ensureCanSend(), returnsNormally);
+  });
+
+  test('安装检查点拒绝缺失 SHA-256 或越界字段', () {
+    final valid = <String, Object?>{
+      'kind': 'quickApp',
+      'path': r'D:\demo.rpk',
+      'fileSize': 1024,
+      'md5Hex': List.filled(32, '0').join(),
+      'sha256Hex': List.filled(64, '1').join(),
+      'dataType': 0x40,
+      'lastAcknowledgedSegment': 3,
+      'phase': 'transferring',
+    };
+    expect(InstallCheckpoint.fromJson(valid), isNotNull);
+    expect(InstallCheckpoint.fromJson({...valid}..remove('sha256Hex')), isNull);
+    expect(InstallCheckpoint.fromJson({...valid, 'dataType': 0x7f}), isNull);
+    expect(InstallCheckpoint.fromJson({...valid, 'fileSize': -1}), isNull);
   });
 
   group('proto wire', () {
@@ -43,17 +192,137 @@ void main() {
       expect(r.readBytes(), [1, 2, 3]);
       expect(r.isAtEnd, isTrue);
     });
+
+    test('malformed payloads fail with FormatException instead of RangeError',
+        () {
+      expect(() => ProtoReader([0x80]).readVarint(),
+          throwsA(isA<FormatException>()));
+      expect(() => ProtoReader([0x0a, 0x04, 0x01]).readFieldHeader(),
+          returnsNormally);
+      final truncated = ProtoReader([0x0a, 0x04, 0x01]);
+      truncated.readFieldHeader();
+      expect(() => truncated.readBytes(), throwsA(isA<FormatException>()));
+      expect(() => ProtoReader([0x00]).readFieldHeader(),
+          throwsA(isA<FormatException>()));
+      final fixed32 = ProtoReader([0x0d, 0x01]);
+      final header = fixed32.readFieldHeader();
+      expect(header, (1, 5));
+      expect(
+          () => fixed32.skipField(header.$2), throwsA(isA<FormatException>()));
+    });
   });
 
   group('zau', () {
+    test('官方 V2 时间同步命令与 protobuf 字节向量一致', () {
+      final payload = TimeSyncPayload.encode(
+        localTime: DateTime(2026, 8, 11, 18, 30, 45, 123),
+        standardOffsetMinutes: 480,
+        daylightOffsetMinutes: 0,
+        timezoneId: 'Asia/Shanghai',
+        use24Hour: true,
+      );
+      final encoded = Zau(
+        command: ZauCommand.setSystemTime,
+        sub: 3,
+        payload: payload,
+      ).encode();
+
+      expect(encoded, [
+        0x08, 0x02, 0x10, 0x03, // zau command=2/sub=3
+        0x22, 0x28, // zau.field4 = ysr
+        0x22, 0x26, // ysr.field4 = btr
+        0x0a, 0x07, 0x08, 0xea, 0x0f, 0x10, 0x08, 0x18, 0x0b,
+        0x12, 0x08, 0x08, 0x12, 0x10, 0x1e, 0x18, 0x2d, 0x20, 0x7b,
+        0x1a, 0x11, 0x08, 0x40, 0x1a, 0x0d,
+        ...'Asia/Shanghai'.codeUnits,
+      ]);
+      final parsed = Zau.parse(encoded);
+      expect(parsed.command, 2);
+      expect(parsed.sub, 3);
+      expect(parsed.payload!.$1, 4);
+    });
+
+    test('时间同步使用 zigzag 编码负 UTC 偏移并携带夏令时与 12 小时制', () {
+      final payload = TimeSyncPayload.encode(
+        localTime: DateTime(2026, 1, 2, 3, 4),
+        standardOffsetMinutes: -480,
+        daylightOffsetMinutes: 60,
+        timezoneId: 'America/Los_Angeles',
+        use24Hour: false,
+      );
+      final ysr = ProtoReader(payload.$2);
+      expect(ysr.readFieldHeader(), (4, 2));
+      final btr = ProtoReader(ysr.readBytes());
+      expect(btr.readFieldHeader(), (1, 2));
+      btr.readBytes();
+      expect(btr.readFieldHeader(), (2, 2));
+      final time = ProtoReader(btr.readBytes());
+      expect(time.readFieldHeader(), (1, 0));
+      expect(time.readVarint(), 3);
+      expect(time.readFieldHeader(), (2, 0));
+      expect(time.readVarint(), 4);
+      expect(time.isAtEnd, isTrue); // 官方 nano 编码会省略为 0 的秒和毫秒
+      expect(btr.readFieldHeader(), (3, 2));
+      final timezone = ProtoReader(btr.readBytes());
+      expect(timezone.readFieldHeader(), (1, 0));
+      expect(timezone.readVarint(), 63); // zigzag(-32)
+      expect(timezone.readFieldHeader(), (2, 0));
+      expect(timezone.readVarint(), 8); // zigzag(+4)
+      expect(timezone.readFieldHeader(), (3, 2));
+      expect(timezone.readString(), 'America/Los_Angeles');
+      expect(btr.readFieldHeader(), (4, 0));
+      expect(btr.readVarint(), 1);
+      expect(btr.isAtEnd, isTrue);
+    });
+
+    test('时间同步拒绝协议无法表示的非 15 分钟时区偏移', () {
+      expect(
+        () => TimeSyncPayload.encode(
+          localTime: DateTime(2026, 8, 11),
+          standardOffsetMinutes: 17,
+          daylightOffsetMinutes: 0,
+          timezoneId: 'Invalid/Offset',
+          use24Hour: true,
+        ),
+        throwsArgumentError,
+      );
+    });
+
     test('表盘预装请求字段', () {
-      final payload = A9u.withFileInfo(faceId: 'f1', fileSize: 4096);
+      final payload = A9u.withFileInfo(faceId: '120917350569', fileSize: 4096);
       expect(payload.$1, 6); // a9u 是 zau 的 oneof field 6
       final zau = Zau(command: 4, sub: 4, payload: payload).encode();
       final parsed = Zau.parse(zau);
       expect(parsed.command, 4);
       expect(parsed.sub, 4);
       expect(parsed.payload!.$1, 6);
+      final a9u = ProtoReader(parsed.payload!.$2);
+      expect(a9u.readFieldHeader(), (6, 2));
+      final y8u = ProtoReader(a9u.readBytes());
+      expect(y8u.readFieldHeader(), (1, 2));
+      expect(y8u.readString(), '120917350569');
+      expect(y8u.readFieldHeader(), (2, 0));
+      expect(y8u.readVarint(), 4096);
+      expect(y8u.isAtEnd, isTrue);
+      expect(
+        zau,
+        [
+          0x08,
+          0x04,
+          0x10,
+          0x04,
+          0x32,
+          0x13,
+          0x32,
+          0x11,
+          0x0a,
+          0x0c,
+          ...'120917350569'.codeUnits,
+          0x10,
+          0x80,
+          0x20,
+        ],
+      );
     });
 
     test('setFace', () {
@@ -79,6 +348,49 @@ void main() {
       expect(parsed.command, 20);
       expect(parsed.sub, 1);
       expect(parsed.payload!.$1, 22); // v8s 是 zau 的 oneof field 22
+      final v8s = ProtoReader(parsed.payload!.$2);
+      expect(v8s.readFieldHeader(), (2, 2));
+      final j8s = ProtoReader(v8s.readBytes());
+      expect(j8s.readFieldHeader(), (1, 2));
+      expect(j8s.readString(), 'com.example.app');
+    });
+
+    test('RPK 安装成功结果从应用信息读取包名', () {
+      final appItem = ProtoWriter()
+        ..writeString(1, 'com.example.app')
+        ..writeInt(3, 7);
+      final result = ProtoWriter()
+        ..writeInt(1, 0)
+        ..writeMessage(3, appItem.bytes);
+      final v8s = ProtoWriter()..writeMessage(4, result.bytes);
+
+      final parsed = V8s.parseInstallResult(v8s.bytes);
+      expect(parsed.code, 0);
+      expect(parsed.packageName, 'com.example.app');
+    });
+
+    test('RPK 安装失败结果直接读取包名和状态', () {
+      final result = ProtoWriter()
+        ..writeInt(1, 2)
+        ..writeString(2, 'com.example.failed');
+      final v8s = ProtoWriter()..writeMessage(4, result.bytes);
+
+      final parsed = V8s.parseInstallResult(v8s.bytes);
+      expect(parsed.code, 2);
+      expect(parsed.packageName, 'com.example.failed');
+    });
+
+    test('RPK 畸形安装结果不会被误判为设备明确失败', () {
+      expect(
+        () => V8s.parseInstallResult(const []),
+        throwsA(isA<FormatException>()),
+      );
+      final withoutPackage = ProtoWriter()
+        ..writeMessage(4, (ProtoWriter()..writeInt(1, 0)).bytes);
+      expect(
+        () => V8s.parseInstallResult(withoutPackage.bytes),
+        throwsA(isA<FormatException>()),
+      );
     });
 
     test('MassPrepare 请求', () {
@@ -86,11 +398,17 @@ void main() {
       final zau = Zau(
         command: 22,
         sub: 0,
-        payload: O1h.prepareRequest(dataType: 0x40, fileMd5: md5, fileLength: 1000),
+        payload:
+            O1h.prepareRequest(dataType: 0x40, fileMd5: md5, fileLength: 1000),
       ).encode();
       final parsed = Zau.parse(zau);
       expect(parsed.command, 22);
       expect(parsed.payload!.$1, 24); // o1h 是 zau 的 oneof field 24
+      final o1h = ProtoReader(parsed.payload!.$2);
+      expect(o1h.readFieldHeader(), (1, 2));
+      final s1h = ProtoReader(o1h.readBytes());
+      expect(s1h.readFieldHeader(), (1, 0));
+      expect(s1h.readVarint(), 0x40);
     });
 
     test('MassPrepare 响应读取状态、断点与协商分片长度', () {
@@ -118,40 +436,6 @@ void main() {
     });
   });
 
-  group('L1/L2 帧', () {
-    test('L1 编码/解析', () {
-      final frame = L1Frame(type: L1Type.data, seqNum: 5, payload: [1, 2, 3]);
-      final bytes = frame.encode();
-      expect(bytes.length, L1Frame.headerSize + 3);
-      expect(bytes[0], 0x25); // magic 0xA525 LE
-      expect(bytes[1], 0xA5);
-      expect(bytes[2], L1Type.data); // type
-      expect(bytes[3], 5); // seq
-      expect(bytes[4], 3); // dataLength LE
-      expect(bytes[5], 0);
-      final parsed = L1Frame.parse(bytes)!;
-      expect(parsed.type, L1Type.data);
-      expect(parsed.seqNum, 5);
-      expect(parsed.payload, [1, 2, 3]);
-    });
-
-    test('L1 坏 magic 返回 null', () {
-      final bytes = L1Frame(type: L1Type.data, seqNum: 0, payload: []).encode();
-      bytes[0] = 0x00;
-      expect(L1Frame.parse(bytes), isNull);
-    });
-
-    test('L2 编码/解析', () {
-      final bytes =
-          L2Frame(channel: L2Channel.mass, opCode: L2OpCode.writeEnc, payload: [9]).encode();
-      expect(bytes, [L2Channel.mass, L2OpCode.writeEnc, 9]);
-      final parsed = L2Frame.parse(bytes);
-      expect(parsed.channel, L2Channel.mass);
-      expect(parsed.opCode, L2OpCode.writeEnc);
-      expect(parsed.payload, [9]);
-    });
-  });
-
   group('Mass 分片', () {
     test('首片头、尾 CRC 与每片 4B 序号头', () {
       final file = Uint8List.fromList(List<int>.generate(100, (i) => i));
@@ -168,6 +452,11 @@ void main() {
       expect(segs.first.total, 3);
       expect(segs.first.index, 1);
       expect(segs.first.data.length, 64);
+      expect(
+          segs.map((segment) => segment.fileByteCount).reduce((a, b) => a + b),
+          file.length);
+      expect(segs.first.fileByteCount, 38); // 60B 正文减去 22B Mass 头
+      expect(segs.last.fileByteCount, 2); // 不把末尾 CRC32 计入文件进度
       expect(segs.first.data.sublist(0, 4), [3, 0, 1, 0]);
       // 分片头之后才是 22B Mass 头。
       expect(segs.first.data[4], 0x00);
@@ -212,6 +501,7 @@ void main() {
       );
       expect(segs.length, 1);
       expect(segs.single.data.length, 4 + 22 + 10 + 4); // 分片头+数据头+数据+CRC
+      expect(segs.single.fileByteCount, 10);
       expect(segs.single.isFirst, isTrue);
       expect(segs.single.isLast, isTrue);
     });
@@ -242,6 +532,7 @@ void main() {
         sentLength: 4,
       );
       expect(segs, hasLength(1));
+      expect(segs.single.fileByteCount, 6);
       expect(segs.single.data[22], 6); // 4B 分片头后的剩余长度
       final expectedCrc = crc32([
         ...buildMassHeader(
@@ -276,54 +567,17 @@ void main() {
     });
   });
 
-  group('L1 帧与 CRC16', () {
+  group('CRC16', () {
     test('CRC-16/IBM 标准向量 123456789 → 0xBB3D', () {
       final data = '123456789'.codeUnits;
       expect(computeCrc16(data), 0xBB3D);
       // 空数据 CRC=0
       expect(computeCrc16(const []), 0);
     });
-
-    test('L1START 请求帧结构与载荷', () {
-      final frame = L1StartRequest.build();
-      final bytes = frame.encode();
-      // 8B 头 + 22B payload
-      expect(bytes.length, 30);
-      // magic 0xA525 LE
-      expect(bytes[0], 0x25);
-      expect(bytes[1], 0xA5);
-      // type=CMD(2)
-      expect(bytes[2] & 0x0F, L1Type.cmd);
-      // dataLength=22 LE
-      expect(bytes[4], 22);
-      expect(bytes[5], 0);
-      // payload[0] = CMD_L1START_REQ
-      expect(bytes[8], L1Cmd.startReq);
-      // payload 21B 配置：VERSION(1) 3B [1,0,0]
-      expect(bytes[9], 0x01);
-      expect(bytes[12], 1);
-      expect(bytes[13], 0);
-      expect(bytes[14], 0);
-      // MPS(2) 2B LE = 64512 (0xFC00)，位于 config[9..10] → bytes[18..19]
-      expect(bytes[18], 0x00);
-      expect(bytes[19], 0xFC);
-      // 帧可回读
-      final parsed = L1Frame.parse(bytes);
-      expect(parsed, isNotNull);
-      expect(parsed!.payload.length, 22);
-      expect(parsed.payload.first, L1Cmd.startReq);
-    });
   });
 
   group('会话 AES-CTR', () {
-    test('计数块采用 IV + LE32 counter + 8B 零', () {
-      expect(
-        buildSessionCounterBlock([1, 2, 3, 4], 0x78563412),
-        [1, 2, 3, 4, 0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0, 0, 0, 0, 0],
-      );
-    });
-
-    test('AES-CTR 使用正确方向的密钥且可逆', () {
+    test('V2 AES-CTR 使用同方向密钥作为 key 和 IV，且可逆', () {
       final keys = SessionKeys(
         deviceKey: List<int>.filled(16, 0x11),
         appKey: List<int>.filled(16, 0x22),
@@ -332,10 +586,10 @@ void main() {
       );
       final cipher = SessionCipher(keys);
       final message = List<int>.generate(37, (index) => index);
-      final encoded = cipher.encryptOutbound(message, counter: 1);
+      final encoded = cipher.encryptOutbound(message);
       expect(encoded, isNot(message));
 
-      // CTR 同一 key/IV/counter 变换两次即可恢复明文。
+      // CTR 同一方向密钥变换两次即可恢复明文。
       final appSide = SessionKeys(
         deviceKey: keys.appKey,
         appKey: keys.deviceKey,
@@ -343,7 +597,7 @@ void main() {
         appIv: keys.deviceIv,
       );
       expect(
-        SessionCipher(appSide).decryptInbound(encoded, counter: 1),
+        SessionCipher(appSide).decryptInbound(encoded),
         message,
       );
     });
@@ -360,7 +614,8 @@ void main() {
   group('离线 HCI 解码', () {
     test('重组 btsnoop 的 RFCOMM/L1 帧并识别 f=26 请求', () {
       final nonce = List<int>.generate(16, (i) => i);
-      final l1 = SppProtocol.buildDataFrame(0, XiaomiAuth.buildNonceCommand(nonce));
+      final l1 =
+          SppProtocol.buildDataFrame(0, XiaomiAuth.buildNonceCommand(nonce));
       final rfcomm = <int>[0x2b, 0xff, (l1.length << 1) | 1, 1, ...l1, 0];
       final l2 = <int>[rfcomm.length, 0, 0x49, 0, ...rfcomm];
       final hci = <int>[2, 2, 0, l2.length, 0, ...l2];
@@ -374,7 +629,14 @@ void main() {
       ];
       final hciLike = Uint8List.fromList([
         ...'btsnoop\x00'.codeUnits,
-        0, 0, 0, 1, 0, 0, 3, 0xea,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        3,
+        0xea,
         ...record,
       ]);
       final report = const HciDecoder().decode(
@@ -462,9 +724,11 @@ void main() {
       final phoneNonce = List<int>.generate(16, (i) => 0x10 + i);
       final watchNonce = List<int>.generate(16, (i) => 0x20 + i);
       // 设备签名 = HMAC(DeviceKey, watchNonce‖phoneNonce)
-      final okm = XiaomiAuth.computeStep3Hmac(secretKey, phoneNonce, watchNonce);
+      final okm =
+          XiaomiAuth.computeStep3Hmac(secretKey, phoneNonce, watchNonce);
       final deviceKey = okm.sublist(0, 16);
-      final watchHmac = XiaomiAuth.hmacSha256(deviceKey, [...watchNonce, ...phoneNonce]);
+      final watchHmac =
+          XiaomiAuth.hmacSha256(deviceKey, [...watchNonce, ...phoneNonce]);
       final cmd = XiaomiAuth.buildAuthStep3Command(
         secretKey: secretKey,
         phoneNonce: phoneNonce,
@@ -487,7 +751,8 @@ void main() {
       final enc = XiaomiAuth.ccmEncrypt(key, nonce, plain);
       expect(enc.length, greaterThanOrEqualTo(plain.length + 4));
       // 解密验证（用同一个 CCM 解密）
-      final engine = AESEngine()..init(false, KeyParameter(Uint8List.fromList(key)));
+      final engine = AESEngine()
+        ..init(false, KeyParameter(Uint8List.fromList(key)));
       final cipher = CCMBlockCipher(engine)
         ..init(
           false,
@@ -499,7 +764,8 @@ void main() {
           ),
         );
       final out = Uint8List(cipher.getOutputSize(enc.length));
-      final len = cipher.processBytes(Uint8List.fromList(enc), 0, enc.length, out, 0);
+      final len =
+          cipher.processBytes(Uint8List.fromList(enc), 0, enc.length, out, 0);
       cipher.doFinal(out, len);
       final dec = out.take(plain.length).toList();
       expect(dec, plain);
@@ -561,12 +827,40 @@ void main() {
   group('SPP 版本查询（SppPacket）', () {
     test('版本查询帧结构', () {
       final frame = SppProtocol.buildVersionQuery(1);
-      expect(frame, [0xba, 0xdc, 0xfe, 0x00, 0xc0, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01, 0xef]);
+      expect(frame, [
+        0xba,
+        0xdc,
+        0xfe,
+        0x00,
+        0xc0,
+        0x04,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x01,
+        0xef
+      ]);
     });
 
     test('解析设备版本回包 type=106', () {
       // 14 字节：3 magic + 2 header + 2 dataLen(6) + 3 type/c/d + 3 payload + 1 end
-      final resp = [0xba, 0xdc, 0xfe, 0x00, 0xc0, 0x06, 0x00, 0x6a, 0x00, 0x00, 0x01, 0x02, 0x03, 0xef];
+      final resp = [
+        0xba,
+        0xdc,
+        0xfe,
+        0x00,
+        0xc0,
+        0x06,
+        0x00,
+        0x6a,
+        0x00,
+        0x00,
+        0x01,
+        0x02,
+        0x03,
+        0xef
+      ];
       final packet = SppProtocol.parseSppPacket(resp);
       expect(packet, isNotNull);
       final (type, payload) = packet!;

@@ -170,9 +170,12 @@ abstract final class XiaomiAuth {
     required List<int> watchNonce,
     required List<int> watchHmac,
     int sdkInt = 34,
-    String phoneModel = 'Windows',
+    String phoneModel = 'XiaoMi',
     String region = 'CN',
-    int appCapability = 25237220,
+    // 表盘自定义工具在 SPP 模式只声明 0xE0。此前沿用官方完整 App 的
+    // 25237220 会向设备宣称本工具并未实现的大量常驻能力；设备确认鉴权后
+    // 会立即终止该不完整客户端。跨平台安装器应只声明实际支持的最小集合。
+    int appCapability = 224,
   }) {
     final okm = computeStep3Hmac(secretKey, phoneNonce, watchNonce);
     final deviceKey = okm.sublist(0, 16);

@@ -222,8 +222,9 @@ abstract class CentralManagerHostApi {
   void disconnect(int addressArgs);
   @async
   void pair(int addressArgs);
+  /// Returns true only when Windows had a pairing record and removed it.
   @async
-  void showToast(String titleArgs, String bodyArgs);
+  bool unpairIfPaired(int addressArgs);
   @async
   Uint8List connectRfcomm(int addressArgs, String serviceUuidArgs);
   void disconnectRfcomm(int addressArgs);

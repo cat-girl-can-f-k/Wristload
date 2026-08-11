@@ -4,6 +4,10 @@
 #include <iomanip>
 #include <sstream>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <mutex>
 
 #include "winrt/Windows.Devices.Bluetooth.h"
 #include "winrt/Windows.Devices.Bluetooth.Advertisement.h"
@@ -11,8 +15,6 @@
 #include "winrt/Windows.Devices.Bluetooth.Rfcomm.h"
 #include "winrt/Windows.Networking.Sockets.h"
 #include "winrt/Windows.Storage.Streams.h"
-#include "winrt/Windows.Data.Xml.Dom.h"
-#include "winrt/Windows.UI.Notifications.h"
 #include "winrt/Windows.Devices.Bluetooth.GenericAttributeProfile.h"
 #include "winrt/Windows.Devices.Radios.h"
 #include "winrt/Windows.Foundation.h"
@@ -28,7 +30,9 @@ namespace bluetooth_low_energy_windows
 	class CentralManagerImpl : public CentralManagerHostApi
 	{
 	public:
-		CentralManagerImpl(flutter::BinaryMessenger *messenger);
+		using PlatformTaskPoster = std::function<bool(std::function<void()>)>;
+
+		CentralManagerImpl(flutter::BinaryMessenger *messenger, PlatformTaskPoster post_to_platform);
 		virtual ~CentralManagerImpl();
 
 		// Disallow copy and assign.
@@ -41,7 +45,7 @@ namespace bluetooth_low_energy_windows
 		std::optional<FlutterError> StopDiscovery() override;
 		void Connect(int64_t address_args, std::function<void(std::optional<FlutterError> reply)> result) override;
 		void Pair(int64_t address_args, std::function<void(std::optional<FlutterError> reply)> result) override;
-		void ShowToast(const std::string &title_args, const std::string &body_args, std::function<void(std::optional<FlutterError> reply)> result) override;
+		void UnpairIfPaired(int64_t address_args, std::function<void(ErrorOr<bool> reply)> result) override;
 		void ConnectRfcomm(int64_t address_args, const std::string &service_uuid_args, std::function<void(ErrorOr<std::vector<uint8_t>> reply)> result) override;
 		std::optional<FlutterError> DisconnectRfcomm(int64_t address_args) override;
 		void RfcommWrite(int64_t address_args, const std::vector<uint8_t> &data_args, std::function<void(std::optional<FlutterError> reply)> result) override;
@@ -59,12 +63,27 @@ namespace bluetooth_low_energy_windows
 
 	private:
 		std::optional<CentralManagerFlutterApi> m_api;
+		PlatformTaskPoster m_post_to_platform;
 		std::optional<winrt::Windows::Devices::Bluetooth::Advertisement::BluetoothLEAdvertisementWatcher> m_watcher;
+		std::atomic_uint64_t m_discovery_generation = 0;
 		std::optional<winrt::Windows::Devices::Bluetooth::BluetoothAdapter> m_adapter;
 		std::optional<winrt::Windows::Devices::Radios::Radio> m_radio;
 		std::map<int64_t, std::optional<winrt::Windows::Devices::Bluetooth::BluetoothLEDevice>> m_devices;
 		std::map<int64_t, std::optional<winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattSession>> m_sessions;
 		std::map<int64_t, std::optional<winrt::Windows::Networking::Sockets::StreamSocket>> m_rfcomm_sockets;
+		// DataReader/DataWriter must live for the whole RFCOMM session. Recreating
+		// them per packet and detaching their streams is legal for generic streams,
+		// but WinRT RFCOMM can abort the underlying socket when the final temporary
+		// wrapper is released (WSAECONNABORTED/10053).
+		std::map<int64_t, std::optional<winrt::Windows::Storage::Streams::DataReader>> m_rfcomm_readers;
+		std::map<int64_t, std::optional<winrt::Windows::Storage::Streams::DataWriter>> m_rfcomm_writers;
+		// Keep the service alive for as long as its StreamSocket. The Microsoft
+		// RFCOMM sample stores both objects as connection state rather than letting
+		// RfcommDeviceService die when ConnectAsync returns.
+		std::map<int64_t, std::optional<winrt::Windows::Devices::Bluetooth::Rfcomm::RfcommDeviceService>> m_rfcomm_services;
+		// Guards a replacement socket against late bytes/EOF from an older read loop.
+		std::map<int64_t, uint64_t> m_rfcomm_generations;
+		std::mutex m_rfcomm_generation_mutex;
 		std::map<int64_t, std::map<int64_t, std::optional<winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattDeviceService>>> m_services;
 		std::map<int64_t, std::map<int64_t, std::optional<winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattCharacteristic>>> m_characteristics;
 		std::map<int64_t, std::map<int64_t, std::optional<winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattDescriptor>>> m_descriptors;
@@ -75,11 +94,13 @@ namespace bluetooth_low_energy_windows
 		std::map<int64_t, std::map<int64_t, std::optional<winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattCharacteristic::ValueChanged_revoker>>> m_characteristic_value_changed_revokers;
 
 		winrt::fire_and_forget InitializeAsync(std::function<void(std::optional<FlutterError> reply)> result);
+		winrt::fire_and_forget PublishKnownDevicesAsync(uint64_t generation);
 		winrt::fire_and_forget ConnectAsync(int64_t address_args, std::function<void(std::optional<FlutterError> reply)> result);
 		winrt::fire_and_forget PairAsync(int64_t address_args, std::function<void(std::optional<FlutterError> reply)> result);
+		winrt::fire_and_forget UnpairIfPairedAsync(int64_t address_args, std::function<void(ErrorOr<bool> reply)> result);
 		winrt::fire_and_forget ConnectRfcommAsync(int64_t address_args, const std::string &service_uuid_args, std::function<void(ErrorOr<std::vector<uint8_t>> reply)> result);
 		winrt::fire_and_forget RfcommWriteAsync(int64_t address_args, const std::vector<uint8_t> &data_args, std::function<void(std::optional<FlutterError> reply)> result);
-		winrt::fire_and_forget ReadRfcommLoop(int64_t address_args);
+		winrt::fire_and_forget ReadRfcommLoop(int64_t address_args, uint64_t generation);
 		winrt::fire_and_forget GetServicesAsync(int64_t address_args, const CacheModeArgs &mode_args, std::function<void(ErrorOr<flutter::EncodableList> reply)> result);
 		winrt::fire_and_forget GetIncludedServicesAsync(int64_t address_args, int64_t handle_args, const CacheModeArgs &mode_args, std::function<void(ErrorOr<flutter::EncodableList> reply)> result);
 		winrt::fire_and_forget GetCharacteristicsAsync(int64_t address_args, int64_t handle_args, const CacheModeArgs &mode_args, std::function<void(ErrorOr<flutter::EncodableList> reply)> result);
@@ -91,6 +112,7 @@ namespace bluetooth_low_energy_windows
 		winrt::fire_and_forget WriteDescriptorAsync(int64_t address_args, int64_t handle_args, const std::vector<uint8_t> &value_args, std::function<void(std::optional<FlutterError> reply)> result);
 
 		void OnDisconnected(int64_t address_args);
+		void PostToPlatform(std::function<void(CentralManagerFlutterApi &)> callback);
 
 		winrt::Windows::Devices::Bluetooth::BluetoothLEDevice &RetrieveDevice(int64_t address_args);
 		winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattDeviceService &RetrieveService(int64_t address_args, int64_t handle_args);

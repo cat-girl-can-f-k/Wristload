@@ -1684,30 +1684,24 @@ void CentralManagerHostApi::SetUp(
     }
   }
   {
-    BasicMessageChannel<> channel(binary_messenger, "dev.flutter.pigeon.bluetooth_low_energy_windows.CentralManagerHostApi.showToast" + prepended_suffix, &GetCodec());
+    BasicMessageChannel<> channel(binary_messenger, "dev.flutter.pigeon.bluetooth_low_energy_windows.CentralManagerHostApi.unpairIfPaired" + prepended_suffix, &GetCodec());
     if (api != nullptr) {
       channel.SetMessageHandler([api](const EncodableValue& message, const ::flutter::MessageReply<EncodableValue>& reply) {
         try {
           const auto& args = std::get<EncodableList>(message);
-          const auto& encodable_title_args_arg = args.at(0);
-          if (encodable_title_args_arg.IsNull()) {
-            reply(WrapError("title_args_arg unexpectedly null."));
+          const auto& encodable_address_args_arg = args.at(0);
+          if (encodable_address_args_arg.IsNull()) {
+            reply(WrapError("address_args_arg unexpectedly null."));
             return;
           }
-          const auto& title_args_arg = std::get<std::string>(encodable_title_args_arg);
-          const auto& encodable_body_args_arg = args.at(1);
-          if (encodable_body_args_arg.IsNull()) {
-            reply(WrapError("body_args_arg unexpectedly null."));
-            return;
-          }
-          const auto& body_args_arg = std::get<std::string>(encodable_body_args_arg);
-          api->ShowToast(title_args_arg, body_args_arg, [reply](std::optional<FlutterError>&& output) {
-            if (output.has_value()) {
-              reply(WrapError(output.value()));
+          const int64_t address_args_arg = encodable_address_args_arg.LongValue();
+          api->UnpairIfPaired(address_args_arg, [reply](ErrorOr<bool>&& output) {
+            if (output.has_error()) {
+              reply(WrapError(output.error()));
               return;
             }
             EncodableList wrapped;
-            wrapped.push_back(EncodableValue());
+            wrapped.push_back(EncodableValue(std::move(output).TakeValue()));
             reply(EncodableValue(std::move(wrapped)));
           });
         } catch (const std::exception& exception) {

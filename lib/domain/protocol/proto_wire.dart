@@ -99,10 +99,17 @@ class ProtoReader {
 
   bool get isAtEnd => _pos >= _data.length;
 
+  void _ensureRemaining(int count, String context) {
+    if (count < 0 || _pos + count > _data.length) {
+      throw FormatException('protobuf $context exceeds input');
+    }
+  }
+
   int readVarint() {
     var result = 0;
     var shift = 0;
     while (true) {
+      _ensureRemaining(1, 'varint');
       final b = _data[_pos++];
       result |= (b & 0x7F) << shift;
       if ((b & 0x80) == 0) break;
@@ -114,9 +121,7 @@ class ProtoReader {
 
   List<int> readBytes() {
     final len = readVarint();
-    if (_pos + len > _data.length) {
-      throw const FormatException('length-delimited overrun');
-    }
+    _ensureRemaining(len, 'length-delimited field');
     final out = _data.sublist(_pos, _pos + len);
     _pos += len;
     return out;
@@ -128,7 +133,11 @@ class ProtoReader {
   /// 遇到无法消费的 wireType 时跳过字段。
   (int, int) readFieldHeader() {
     final tag = readVarint();
-    return (tag >> 3, tag & 0x07);
+    final fieldNumber = tag >> 3;
+    if (fieldNumber == 0) {
+      throw const FormatException('protobuf field number must not be zero');
+    }
+    return (fieldNumber, tag & 0x07);
   }
 
   void skipField(int wireType) {
@@ -136,10 +145,12 @@ class ProtoReader {
       case 0:
         readVarint();
       case 1:
+        _ensureRemaining(8, 'fixed64 field');
         _pos += 8;
       case 2:
         readBytes();
       case 5:
+        _ensureRemaining(4, 'fixed32 field');
         _pos += 4;
       default:
         throw FormatException('unsupported wireType $wireType');

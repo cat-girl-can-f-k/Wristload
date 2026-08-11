@@ -313,6 +313,19 @@ final class CentralManagerImpl
         typeArgs,
         advertisementArgs,
       );
+      final directAdvertisement = advertisementArgs.toAdvertisement();
+      if (typeArgs == AdvertisementTypeArgs.connectableUndirected &&
+          directAdvertisement.name?.trim().isNotEmpty == true) {
+        // Some Windows adapters do not deliver a matching scan response in the
+        // original one-second window. Publish a named connectable advertisement
+        // immediately; a later merged scan response can update its metadata.
+        final eventArgs = DiscoveredEventArgs(
+          peripheralArgs.toPeripheral(),
+          rssiArgs,
+          directAdvertisement,
+        );
+        _discoveredController.add(eventArgs);
+      }
       // TODO: Should we ignore this?
       final ignored =
           oldDiscoveryArgs == null ||

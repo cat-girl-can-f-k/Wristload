@@ -1,22 +1,23 @@
 import 'dart:typed_data';
 
-import 'l1_l2_frame.dart' show computeCrc16;
+import 'transport_constants.dart' show computeCrc16;
 
 /// 手环 9 系 SPP（经典蓝牙 RFCOMM）协议——**App 版 L1 帧**（miwear-core
 /// `TransportL1`/`L1Packet`/`CMDPacket`/`DataPacket`/`ACKPacket` 逆向还原）。
 ///
 /// L1 帧（8 字节头 + payload，全部小端）：
 /// ```
-/// [25 A5][(frx<<4)|type][seq][len(LE)][crc16(LE)] [payload]
+/// [A5 A5][(frx<<4)|type][seq][len(LE)][crc16(LE)] [payload]
 /// type: 1=ACK, 2=CMD, 3=DATA
 /// crc16: CRC-16/ARC（TABLE_16 首值 0xC0C1，与 computeCrc16 一致）
 /// ```
 /// CMD 帧 payload：`[cmd][config data]`；cmd: 1=L1START_REQ, 2=L1START_RSP
 /// DATA 帧 payload：L2Packet = `[channel][opCode][protobuf]`
-/// channel: 1=PB（protobuf 命令）；opCode: 1=WRITE(明文), 2=WRITE_ENC(加密)
+/// channel: 1=PB（protobuf 命令）, 2=Mass（文件分片）；
+/// opCode: 1=WRITE(明文), 2=WRITE_ENC(加密)
 ///
-/// 注意：**Gadgetbridge 的 XiaomiSppPacketV2（A5 A5 头）不适用于手环 9 系**
-/// ——App 实际用 magic=0xA525（LE 字节 `25 A5`）。
+/// 帧结构与字段取自官方 App 的 `TransportL1`；不能只凭相同 magic 假定
+/// 其他项目的会话协商、加密和业务载荷也可直接互换。
 abstract final class SppProtocol {
   static const int typeAck = 1;
   static const int typeCmd = 2;
@@ -26,6 +27,7 @@ abstract final class SppProtocol {
   static const int cmdL1StartRsp = 2;
 
   static const int channelPb = 1;
+  static const int channelMass = 2;
   static const int opCodeWrite = 1;
   static const int opCodeWriteEnc = 2;
 
@@ -41,7 +43,8 @@ abstract final class SppProtocol {
   static const int sarDefaultMps = 0xFC00;
 
   /// 组 L1 帧。
-  static Uint8List encodeFrame(int type, int seq, List<int> payload, {int frx = 0}) {
+  static Uint8List encodeFrame(int type, int seq, List<int> payload,
+      {int frx = 0}) {
     final crc = computeCrc16(payload);
     final out = BytesBuilder()
       ..add(magic)
@@ -86,13 +89,18 @@ abstract final class SppProtocol {
     return encodeCmd(cmdL1StartReq, config.toBytes());
   }
 
-  /// DATA 帧（type=3）：L2Packet = `[channel=1][opCode][protobuf]`。
-  static Uint8List buildDataFrame(int seq, List<int> protobuf, {int opCode = opCodeWrite}) {
-    final payload = BytesBuilder()
-      ..addByte(channelPb)
+  /// DATA 帧（type=3）：L2Packet = `[channel][opCode][payload]`。
+  static Uint8List buildDataFrame(
+    int seq,
+    List<int> payload, {
+    int channel = channelPb,
+    int opCode = opCodeWrite,
+  }) {
+    final l2Payload = BytesBuilder()
+      ..addByte(channel)
       ..addByte(opCode)
-      ..add(protobuf);
-    return encodeFrame(typeData, seq, payload.toBytes());
+      ..add(payload);
+    return encodeFrame(typeData, seq, l2Payload.toBytes());
   }
 
   /// ACK 帧（type=1，无 payload；V2 固定使用 `A5 A5 01`）。

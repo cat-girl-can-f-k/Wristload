@@ -13,8 +13,8 @@
 /// - 协商的 `segmentLength` 包含这四字节，因此每片正文最多为
 ///   `segmentLength - 4` 字节。
 ///
-/// 外层 SPP/L2 的加密及 Mass channel 封装尚未由真机抓包确认，必须由调用方
-/// 在验证后单独实现。
+/// 外层 SPP/L2 与 Mass channel 已由真机抓包确认；调用方仍必须在已认证会话
+/// 和集中协议门控内使用。
 library;
 
 import 'dart:math' as math;
@@ -26,6 +26,7 @@ class MassSegment {
     required this.index,
     required this.total,
     required this.data,
+    required this.fileByteCount,
     required this.isFirst,
     required this.isLast,
   });
@@ -34,8 +35,11 @@ class MassSegment {
   final int index;
   final int total;
 
-  /// 包含 4B 分片头的数据，不含尚未验证的 L1/L2 外层。
+  /// 包含 4B 分片头的数据；L1/L2 外层由传输控制器统一封装。
   final List<int> data;
+
+  /// 本片实际承载的源文件字节数；不包含 Mass 分片头、22B 文件头和 CRC32。
+  final int fileByteCount;
   final bool isFirst;
   final bool isLast;
 }
@@ -82,11 +86,108 @@ int crc32(List<int> data) {
   return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
 }
 
-/// 生成由 `sendMassData` 接收的 payload 序列。
+int _crc32HeaderAndFile(
+  List<int> header,
+  Uint8List fileBytes,
+  int sentLength,
+) {
+  var crc = 0xFFFFFFFF;
+
+  void addByte(int byte) {
+    crc ^= byte;
+    for (var i = 0; i < 8; i++) {
+      crc = (crc & 1) != 0 ? (crc >>> 1) ^ 0xEDB88320 : crc >>> 1;
+    }
+  }
+
+  for (final byte in header) {
+    addByte(byte);
+  }
+  for (var i = sentLength; i < fileBytes.length; i++) {
+    addByte(fileBytes[i]);
+  }
+  return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+}
+
+/// 惰性 Mass 传输计划。
 ///
-/// [sentLength] 用于设备允许断点续传时，从该文件偏移继续构建。是否可以续传
-/// 必须以设备 `MassPrepare` 响应为准。
-List<MassSegment> splitMassFile({
+/// 计划只保留源文件引用和少量元数据；遍历 [segments] 时才构造当前分片，避免
+/// 为大文件同时创建 10 MiB pending 副本、CRC 拼接副本和全部分片副本。
+class MassTransferPlan {
+  MassTransferPlan._({
+    required this.fileBytes,
+    required this.sentLength,
+    required this.segmentLength,
+    required this.header,
+    required this.crcTail,
+    required this.totalSegments,
+  });
+
+  final Uint8List fileBytes;
+  final int sentLength;
+  final int segmentLength;
+  final List<int> header;
+  final List<int> crcTail;
+  final int totalSegments;
+
+  int get remainingFileBytes => fileBytes.length - sentLength;
+
+  Iterable<MassSegment> get segments sync* {
+    final bodyCapacity = segmentLength - 4;
+    final pendingCount = (remainingFileBytes / massChunkSize).ceil();
+    var sequence = 1;
+
+    for (var pendingIndex = 0; pendingIndex < pendingCount; pendingIndex++) {
+      final fileStart = sentLength + pendingIndex * massChunkSize;
+      final fileEnd = math.min(fileStart + massChunkSize, fileBytes.length);
+      final fileLength = fileEnd - fileStart;
+      final prefixLength = pendingIndex == 0 ? header.length : 0;
+      final suffixLength =
+          pendingIndex == pendingCount - 1 ? crcTail.length : 0;
+      final bodyLength = prefixLength + fileLength + suffixLength;
+
+      for (var bodyOffset = 0;
+          bodyOffset < bodyLength;
+          bodyOffset += bodyCapacity) {
+        final take = math.min(bodyCapacity, bodyLength - bodyOffset);
+        final packet = ByteData(4 + take)
+          ..setUint16(0, totalSegments, Endian.little)
+          ..setUint16(2, sequence, Endian.little);
+
+        for (var i = 0; i < take; i++) {
+          final bodyIndex = bodyOffset + i;
+          final int byte;
+          if (bodyIndex < prefixLength) {
+            byte = header[bodyIndex];
+          } else if (bodyIndex < prefixLength + fileLength) {
+            byte = fileBytes[fileStart + bodyIndex - prefixLength];
+          } else {
+            byte = crcTail[bodyIndex - prefixLength - fileLength];
+          }
+          packet.setUint8(4 + i, byte);
+        }
+
+        final overlapStart = math.max(bodyOffset, prefixLength);
+        final overlapEnd = math.min(
+          bodyOffset + take,
+          prefixLength + fileLength,
+        );
+        yield MassSegment(
+          index: sequence,
+          total: totalSegments,
+          data: packet.buffer.asUint8List(),
+          fileByteCount: math.max(0, overlapEnd - overlapStart),
+          isFirst: sequence == 1,
+          isLast: sequence == totalSegments,
+        );
+        sequence++;
+      }
+    }
+  }
+}
+
+/// 创建不复制文件正文的惰性传输计划。
+MassTransferPlan planMassFile({
   required Uint8List fileBytes,
   required int dataType,
   required List<int> fileMd5,
@@ -103,69 +204,58 @@ List<MassSegment> splitMassFile({
     throw ArgumentError('sentLength 必须位于可发送文件范围内');
   }
 
-  final bodyCapacity = segmentLength - 4;
-  final pendingBodies = <List<int>>[];
-  var offset = sentLength;
-  var pendingIndex = 0;
-
-  while (offset < fileBytes.length) {
-    final end = math.min(offset + massChunkSize, fileBytes.length);
-    final body = <int>[];
-    if (pendingIndex == 0) {
-      body.addAll(buildMassHeader(
-        dataType: dataType,
-        fileMd5: fileMd5,
-        fileLength: fileBytes.length,
-        sentLength: sentLength,
-      ));
-    }
-    body.addAll(fileBytes.sublist(offset, end));
-    if (end == fileBytes.length) {
-      // Java: CRCUtil.getFileCRC32(header, sentLength, filePath)
-      // 即 CRC(header + file[sentLength..end])，而不是只对文件本体做 CRC。
-      final header = buildMassHeader(
-        dataType: dataType,
-        fileMd5: fileMd5,
-        fileLength: fileBytes.length,
-        sentLength: sentLength,
-      );
-      final crc = crc32([...header, ...fileBytes.sublist(sentLength)]);
-      final tail = ByteData(4)..setUint32(0, crc, Endian.little);
-      body.addAll(tail.buffer.asUint8List());
-    }
-    pendingBodies.add(body);
-    offset = end;
-    pendingIndex++;
-  }
-
-  final total = pendingBodies.fold<int>(
-    0,
-    (count, body) => count + (body.length / bodyCapacity).ceil(),
+  final header = buildMassHeader(
+    dataType: dataType,
+    fileMd5: fileMd5,
+    fileLength: fileBytes.length,
+    sentLength: sentLength,
   );
-  if (total > 0xFFFF) {
-    throw ArgumentError('分片数量超过协议 uint16 上限：$total');
+  final crc = _crc32HeaderAndFile(header, fileBytes, sentLength);
+  final crcData = ByteData(4)..setUint32(0, crc, Endian.little);
+  final bodyCapacity = segmentLength - 4;
+  final remaining = fileBytes.length - sentLength;
+  final pendingCount = (remaining / massChunkSize).ceil();
+  var totalSegments = 0;
+  for (var pendingIndex = 0; pendingIndex < pendingCount; pendingIndex++) {
+    final chunkLength = math.min(
+      massChunkSize,
+      remaining - pendingIndex * massChunkSize,
+    );
+    final bodyLength = chunkLength +
+        (pendingIndex == 0 ? header.length : 0) +
+        (pendingIndex == pendingCount - 1 ? 4 : 0);
+    totalSegments += (bodyLength / bodyCapacity).ceil();
+  }
+  if (totalSegments > 0xFFFF) {
+    throw ArgumentError('分片数量超过协议 uint16 上限：$totalSegments');
   }
 
-  final result = <MassSegment>[];
-  var sequence = 1;
-  for (final body in pendingBodies) {
-    for (var offset = 0; offset < body.length; offset += bodyCapacity) {
-      final take = math.min(bodyCapacity, body.length - offset);
-      final packet = ByteData(4 + take)
-        ..setUint16(0, total, Endian.little)
-        ..setUint16(2, sequence, Endian.little);
-      for (var i = 0; i < take; i++) {
-        packet.setUint8(4 + i, body[offset + i]);
-      }
-      result.add(MassSegment(
-        index: sequence,
-        total: total,
-        data: packet.buffer.asUint8List(),
-        isFirst: sequence == 1,
-        isLast: sequence == total,
-      ));
-      sequence++;
-    }
-  }
-  return result;
+  return MassTransferPlan._(
+    fileBytes: fileBytes,
+    sentLength: sentLength,
+    segmentLength: segmentLength,
+    header: header,
+    crcTail: crcData.buffer.asUint8List(),
+    totalSegments: totalSegments,
+  );
+}
+
+/// 生成由 `sendMassData` 接收的 payload 序列。
+///
+/// [sentLength] 用于设备允许断点续传时，从该文件偏移继续构建。是否可以续传
+/// 必须以设备 `MassPrepare` 响应为准。
+List<MassSegment> splitMassFile({
+  required Uint8List fileBytes,
+  required int dataType,
+  required List<int> fileMd5,
+  required int segmentLength,
+  int sentLength = 0,
+}) {
+  return planMassFile(
+    fileBytes: fileBytes,
+    dataType: dataType,
+    fileMd5: fileMd5,
+    segmentLength: segmentLength,
+    sentLength: sentLength,
+  ).segments.toList(growable: false);
 }

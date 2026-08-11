@@ -8,8 +8,6 @@ topics:
   - bluetooth-low-energy
   - ble
 
-resolution: workspace
-
 environment:
   sdk: ^3.9.2
   flutter: '>=3.3.0'

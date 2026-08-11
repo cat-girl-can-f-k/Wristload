@@ -1,16 +1,19 @@
-import 'dart:io';
-import 'dart:typed_data';
-
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
 
 import 'application/device_controller.dart';
-import 'domain/device_profile.dart';
+import 'domain/install_metadata_reader.dart';
+import 'domain/install_models.dart';
+import 'domain/install_preference_store.dart';
 import 'domain/install_task.dart';
-import 'domain/protocol/hci_decoder.dart';
-import 'domain/wear_protocol.dart';
+import 'presentation/device_info_page.dart';
+import 'presentation/home_widgets.dart';
+import 'presentation/install_split_button.dart';
+import 'presentation/install_task_card.dart';
+import 'presentation/queue_page.dart';
+import 'presentation/settings_page.dart';
 
 void main() => runApp(const MiWearableApp());
 
@@ -33,18 +36,145 @@ class _MiWearableAppState extends State<MiWearableApp> {
   @override
   Widget build(BuildContext context) => MaterialApp(
         debugShowCheckedModeBanner: false,
-        theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo),
+        theme: ThemeData(
+          useMaterial3: true,
+          colorSchemeSeed: Colors.indigo,
+          brightness: Brightness.light,
+        ),
+        darkTheme: ThemeData(
+          useMaterial3: true,
+          colorSchemeSeed: Colors.indigo,
+          brightness: Brightness.dark,
+        ),
+        themeMode: ThemeMode.system,
         home: ListenableBuilder(
           listenable: controller,
-          builder: (context, _) => HomePage(controller: controller),
+          builder: (context, _) => AppShell(controller: controller),
+        ),
+        routes: {
+          '/device-info': (context) =>
+              DeviceInfoPage(controller: controller),
+        },
+      );
+}
+
+class AppShell extends StatefulWidget {
+  const AppShell({required this.controller, super.key});
+
+  final DeviceController controller;
+
+  @override
+  State<AppShell> createState() => _AppShellState();
+}
+
+class _AppShellState extends State<AppShell> {
+  int _selectedIndex = 0;
+  final _installPreferenceStore = InstallPreferenceStore();
+  InstallPreference _preferredInstallTarget = InstallPreference.watchface;
+  bool _installPreferenceChangedByUser = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadInstallPreference();
+  }
+
+  Future<void> _loadInstallPreference() async {
+    final target = await _installPreferenceStore.readPreference();
+    if (!mounted || _installPreferenceChangedByUser) return;
+    setState(() => _preferredInstallTarget = target);
+  }
+
+  void _setPreferredInstallTarget(InstallPreference target) {
+    if (target == _preferredInstallTarget) return;
+    _installPreferenceChangedByUser = true;
+    setState(() => _preferredInstallTarget = target);
+    _installPreferenceStore.writePreference(target);
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(
+          title: const Text('MiWearable 安装工具'),
+        ),
+        body: SafeArea(
+          child: Row(
+            children: [
+              NavigationRail(
+                selectedIndex: _selectedIndex,
+                labelType: NavigationRailLabelType.all,
+                onDestinationSelected: (index) =>
+                    setState(() => _selectedIndex = index),
+                destinations: [
+                  const NavigationRailDestination(
+                    icon: Icon(Icons.home_outlined),
+                    selectedIcon: Icon(Icons.home),
+                    label: Text('主页'),
+                  ),
+                  NavigationRailDestination(
+                    icon: Badge.count(
+                      count: widget.controller.pendingCount,
+                      isLabelVisible: widget.controller.pendingCount > 0,
+                      child: const Icon(Icons.queue_outlined),
+                    ),
+                    selectedIcon: Badge.count(
+                      count: widget.controller.pendingCount,
+                      isLabelVisible: widget.controller.pendingCount > 0,
+                      child: const Icon(Icons.queue),
+                    ),
+                    label: const Text('队列'),
+                  ),
+                  const NavigationRailDestination(
+                    icon: Icon(Icons.settings_outlined),
+                    selectedIcon: Icon(Icons.settings),
+                    label: Text('设置'),
+                  ),
+                ],
+              ),
+              const VerticalDivider(width: 1),
+              Expanded(
+                child: switch (_selectedIndex) {
+                  0 => HomePage(
+                      controller: widget.controller,
+                      preferredInstallTarget: _preferredInstallTarget,
+                      onPreferredInstallTargetChanged:
+                          _setPreferredInstallTarget,
+                    ),
+                  1 => QueuePage(controller: widget.controller),
+                  _ => TransferSettingsPage(
+                      preferredInstallTarget: _preferredInstallTarget,
+                      connectionMode: widget.controller.connectionMode,
+                      connectionModeEnabled: !widget.controller.isConnected,
+                      segmentIntervalMs: widget.controller.segmentIntervalMs,
+                      massWindowSize: widget.controller.massWindowSize,
+                      onConnectionModeChanged:
+                          widget.controller.setConnectionMode,
+                      onSegmentIntervalChanged:
+                          widget.controller.setSegmentIntervalMs,
+                      onMassWindowSizeChanged:
+                          widget.controller.setMassWindowSize,
+                      onPreferredInstallTargetChanged:
+                          _setPreferredInstallTarget,
+                    ),
+                },
+              ),
+            ],
+          ),
         ),
       );
 }
 
 class HomePage extends StatelessWidget {
-  const HomePage({required this.controller, super.key});
+  const HomePage({
+    required this.controller,
+    required this.preferredInstallTarget,
+    required this.onPreferredInstallTargetChanged,
+    super.key,
+  });
 
   final DeviceController controller;
+  final InstallPreference preferredInstallTarget;
+  final ValueChanged<InstallPreference> onPreferredInstallTargetChanged;
 
   Future<void> _pickAndTry(BuildContext context, InstallKind kind) async {
     final extension = kind == InstallKind.watchface ? 'bin' : 'rpk';
@@ -53,62 +183,255 @@ class HomePage extends StatelessWidget {
       allowedExtensions: [extension],
     );
     final path = selected?.files.single.path;
-    if (path != null) await controller.startInstall(kind, path);
+    if (path == null) return;
+    try {
+      var metadata = await InstallMetadataReader().read(kind, path);
+      var unsupportedLuaConfirmed = false;
+      var watchfaceResolutionConfirmed = false;
+      if (!context.mounted) return;
+      if (kind == InstallKind.watchface) {
+        final compatibilityError =
+            controller.watchfaceCompatibilityError(metadata);
+        if (compatibilityError != null) {
+          watchfaceResolutionConfirmed =
+              await _confirmWatchfaceResolution(context);
+          if (!watchfaceResolutionConfirmed) return;
+          if (!context.mounted) return;
+        }
+        if (controller.requiresUnsupportedLuaConfirmation(metadata)) {
+          unsupportedLuaConfirmed =
+              await _confirmUnsupportedLuaWatchface(context);
+          if (!unsupportedLuaConfirmed) return;
+        }
+        if (!context.mounted) return;
+        final edited = await _editFaceId(context, metadata);
+        if (edited == null) return;
+        metadata = edited;
+      } else if (metadata.versionCode == null) {
+        if (!context.mounted) return;
+        final edited = await _editRpkVersion(context, metadata);
+        if (edited == null) return;
+        metadata = edited;
+      }
+      if (kind == InstallKind.watchface &&
+          !RegExp(r'^\d+$').hasMatch(metadata.faceId ?? '')) {
+        throw const FormatException('faceId 必须为数值型 ID');
+      }
+      if (kind == InstallKind.quickApp &&
+          (metadata.versionCode == null ||
+              metadata.versionCode! <= 0 ||
+              metadata.versionCode! > maxRpkVersionCode)) {
+        throw const FormatException('RPK 清单未提供版本号，请填写有效 32 位正整数版本号');
+      }
+      controller.enqueue(InstallRequest(
+        kind: kind,
+        path: path,
+        metadata: metadata,
+        unsupportedLuaConfirmed: unsupportedLuaConfirmed,
+        watchfaceResolutionConfirmed: watchfaceResolutionConfirmed,
+      ));
+    } on Object catch (error) {
+      controller.reportError('无法创建安装计划：$error');
+    }
+  }
+
+  Future<bool> _confirmWatchfaceResolution(BuildContext context) async =>
+      await showDialog<bool>(
+        context: context,
+        builder: (_) => const WatchfaceResolutionDialog(),
+      ) ??
+      false;
+
+  Future<bool> _confirmUnsupportedLuaWatchface(BuildContext context) async =>
+      await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('Lua 表盘兼容性提示'),
+          content: const Text('您似乎在安装一个您设备不支持的Lua表盘，请确定是否安装'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('仍然安装'),
+            ),
+          ],
+        ),
+      ) ??
+      false;
+
+  Future<InstallMetadata?> _editFaceId(
+      BuildContext context, InstallMetadata metadata) async {
+    final input = TextEditingController(text: metadata.faceId);
+    final formKey = GlobalKey<FormState>();
+    try {
+      return await showDialog<InstallMetadata>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('表盘 faceId'),
+          content: Form(
+            key: formKey,
+            child: TextFormField(
+              controller: input,
+              keyboardType: TextInputType.number,
+              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+              decoration: const InputDecoration(
+                labelText: '从表盘资源解析，可按需编辑',
+                border: OutlineInputBorder(),
+              ),
+              validator: (value) => RegExp(r'^\d+$').hasMatch(value ?? '')
+                  ? null
+                  : 'faceId 必须是非空数值',
+            ),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(dialogContext),
+                child: const Text('取消')),
+            FilledButton(
+              onPressed: () {
+                if (!formKey.currentState!.validate()) return;
+                Navigator.pop(
+                  dialogContext,
+                  metadata.copyWith(faceId: input.text.trim()),
+                );
+              },
+              child: const Text('继续'),
+            ),
+          ],
+        ),
+      );
+    } finally {
+      input.dispose();
+    }
+  }
+
+  Future<InstallMetadata?> _editRpkVersion(
+      BuildContext context, InstallMetadata metadata) async {
+    final input = TextEditingController();
+    final formKey = GlobalKey<FormState>();
+    try {
+      return await showDialog<InstallMetadata>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('RPK 版本号'),
+          content: Form(
+            key: formKey,
+            child: TextFormField(
+              controller: input,
+              keyboardType: TextInputType.number,
+              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+              decoration: InputDecoration(
+                labelText: '包名：${metadata.packageName}',
+                helperText: '包名必须来自 RPK 清单，不能手动修改。',
+                border: const OutlineInputBorder(),
+              ),
+              validator: (value) {
+                final version = int.tryParse(value?.trim() ?? '');
+                if (version == null ||
+                    version <= 0 ||
+                    version > maxRpkVersionCode) {
+                  return '请输入 1–$maxRpkVersionCode';
+                }
+                return null;
+              },
+              onFieldSubmitted: (_) {
+                if (!formKey.currentState!.validate()) return;
+                Navigator.pop(
+                  dialogContext,
+                  metadata.copyWith(versionCode: int.parse(input.text.trim())),
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(dialogContext),
+                child: const Text('取消')),
+            FilledButton(
+              onPressed: () {
+                if (!formKey.currentState!.validate()) return;
+                Navigator.pop(
+                  dialogContext,
+                  metadata.copyWith(versionCode: int.parse(input.text.trim())),
+                );
+              },
+              child: const Text('继续'),
+            ),
+          ],
+        ),
+      );
+    } finally {
+      input.dispose();
+    }
   }
 
   /// authkey 是正式会话身份校验的必填输入。
   Future<void> _connectWithAuthKey(
       BuildContext context, DiscoveredEventArgs result) async {
+    // 已从系统安全存储恢复的 authkey 可直接用于本次连接；弹窗仅用于首次
+    // 输入或用户主动更换 key，避免每次连接重复索取同一敏感值。
+    if (controller.hasAuthKey) {
+      await controller.connect(result);
+      return;
+    }
     final textController = TextEditingController();
     final formKey = GlobalKey<FormState>();
-    final input = await showDialog<String>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('输入 authkey'),
-        content: Form(
-          key: formKey,
-          child: TextFormField(
-            controller: textController,
-            autofocus: true,
-            maxLength: 32,
-            autocorrect: false,
-            enableSuggestions: false,
-            decoration: const InputDecoration(
-              hintText: '32 位十六进制（绑定 token，16 字节）',
-              counterText: '',
-              border: OutlineInputBorder(),
+    String? input;
+    try {
+      input = await showDialog<String>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('输入 authkey'),
+          content: Form(
+            key: formKey,
+            child: TextFormField(
+              controller: textController,
+              autofocus: true,
+              maxLength: 32,
+              autocorrect: false,
+              enableSuggestions: false,
+              decoration: const InputDecoration(
+                hintText: '32 位十六进制（绑定 token，16 字节）',
+                counterText: '',
+                border: OutlineInputBorder(),
+              ),
+              validator: (value) {
+                final v = value?.trim() ?? '';
+                if (!RegExp(r'^[0-9a-fA-F]{32}$').hasMatch(v)) {
+                  return '请输入 32 位十六进制字符';
+                }
+                return null;
+              },
+              onFieldSubmitted: (value) {
+                if (formKey.currentState!.validate()) {
+                  Navigator.pop(dialogContext, value.trim());
+                }
+              },
             ),
-            validator: (value) {
-              final v = value?.trim() ?? '';
-              if (!RegExp(r'^[0-9a-fA-F]{32}$').hasMatch(v)) {
-                return '请输入 32 位十六进制字符';
-              }
-              return null;
-            },
-            onFieldSubmitted: (value) {
-              if (formKey.currentState!.validate()) {
-                Navigator.pop(dialogContext, value.trim());
-              }
-            },
           ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () {
+                if (formKey.currentState!.validate()) {
+                  Navigator.pop(dialogContext, textController.text.trim());
+                }
+              },
+              child: const Text('连接'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () {
-              if (formKey.currentState!.validate()) {
-                Navigator.pop(dialogContext, textController.text.trim());
-              }
-            },
-            child: const Text('连接'),
-          ),
-        ],
-      ),
-    );
-    if (input != null && controller.setAuthKey(input)) {
+      );
+    } finally {
+      textController.dispose();
+    }
+    if (input != null && await controller.setAuthKey(input)) {
       await controller.connect(result);
     }
   }
@@ -116,480 +439,255 @@ class HomePage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final device = controller.connectedDevice;
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('MiWearable 安装工具'),
-        actions: [
-          IconButton(
-            tooltip: '离线 HCI 解码',
-            icon: const Icon(Icons.data_object_outlined),
-            onPressed: () => Navigator.of(context).push(
-              MaterialPageRoute<void>(builder: (_) => const _HciDecoderPage()),
-            ),
-          ),
-        ],
-      ),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(device == null ? '尚未连接设备' : '已连接：${device.uuid}',
-                        style: Theme.of(context).textTheme.titleLarge),
-                    const SizedBox(height: 8),
-                    Text(
-                      device == null
-                          ? '连接必须输入 authkey（32 位 hex）。私有鉴权和安装帧仅在真机验证后启用。'
-                          : '已发现 ${controller.services.length} 个 GATT 服务；能力需通过后续协议验证读取。',
-                    ),
-                    if (controller.authKey != null) ...[
-                      const SizedBox(height: 4),
-                      Text(
-                          'authkey 已保存：${controller.authKey!.substring(0, 4)}…'
-                          '${controller.authKey!.substring(28)}',
-                          style: Theme.of(context).textTheme.bodySmall),
-                    ],
-                    const SizedBox(height: 12),
-                    FilledButton.icon(
-                      onPressed: device == null
-                          ? controller.beginScan
-                          : controller.disconnect,
-                      icon: Icon(device == null
-                          ? Icons.bluetooth_searching
-                          : Icons.link_off),
-                      label: Text(device == null ? '扫描附近设备' : '断开连接'),
-                    ),
-                  ]),
-            ),
-          ),
-          if (controller.error case final error?)
-            Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: Text(error,
-                    style:
-                        TextStyle(color: Theme.of(context).colorScheme.error))),
-          if (device == null) ...[
-            const SizedBox(height: 12),
-            Text('发现的设备', style: Theme.of(context).textTheme.titleMedium),
-            for (final result in controller.scanResults)
-              _ScanTile(
-                result: result,
-                onConnect: () => _connectWithAuthKey(context, result),
-              ),
-          ] else ...[
-            const SizedBox(height: 12),
-            _SessionStatusCard(
-              sessionReady: controller.sessionReady,
-              installTransportVerified: kProtocolVerified,
-            ),
-            const SizedBox(height: 12),
-            Text('安装准备', style: Theme.of(context).textTheme.titleMedium),
-            const Text('可导入表盘或快应用以检查安装入口；未完成数据通道真机验证前，程序不会传输文件。'),
-            const SizedBox(height: 8),
-            FilledButton.tonalIcon(
-              onPressed: () => _pickAndTry(context, InstallKind.watchface),
-              icon: const Icon(Icons.watch),
-              label: const Text('选择表盘 .bin，生成安装计划'),
-            ),
-            const SizedBox(height: 8),
-            FilledButton.tonalIcon(
-              onPressed: () => _pickAndTry(context, InstallKind.quickApp),
-              icon: const Icon(Icons.apps),
-              label: const Text('选择快应用 .rpk，生成安装计划'),
-            ),
-            const SizedBox(height: 8),
-            if (controller.isConnected)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 4),
-                child: Text(
-                  kProtocolVerified
-                      ? '已启用经过真机验证的私有协议操作。'
-                      : 'SPP/authkey 会话已可验证；表盘、快应用数据通道仍处于安全门控状态。',
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-              ),
-            FilledButton.icon(
-              onPressed: controller.canStartSppAuth
-                  ? controller.connectSpp
-                  : null,
-              icon: const Icon(Icons.verified_user_outlined),
-              label: const Text('通过 SPP 验证 authkey'),
-            ),
-            const SizedBox(height: 4),
-            Row(
-              children: [
-                Expanded(
-                  child: DropdownButtonFormField<int>(
-                    initialValue: controller.l1StartVariant,
-                    decoration: const InputDecoration(
-                      labelText: 'L1START 变体（实验）',
-                      isDense: true,
-                      border: OutlineInputBorder(),
-                    ),
-                    items: [
-                      for (var variant = 0; variant <= 5; variant++)
-                        DropdownMenuItem(
-                          value: variant,
-                          child: Text(DeviceController.variantName(variant),
-                              overflow: TextOverflow.ellipsis),
+    return SafeArea(
+      child: Align(
+        alignment: Alignment.topCenter,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 1040),
+          child: ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                  device == null
+                                      ? '尚未连接设备'
+                                      : '已连接：${controller.connectedDeviceName ?? controller.connectedProfile?.displayName ?? '未知设备'}',
+                                  style: Theme.of(context).textTheme.titleLarge),
+                            ),
+                            if (device != null)
+                              IconButton(
+                                tooltip: '查看设备信息',
+                                style: IconButton.styleFrom(
+                                  side: BorderSide(
+                                    color: Theme.of(context)
+                                        .colorScheme
+                                        .outlineVariant,
+                                  ),
+                                ),
+                                icon: const Icon(Icons.chevron_right),
+                                onPressed: () => Navigator.pushNamed(
+                                    context, '/device-info'),
+                              ),
+                          ],
                         ),
-                    ],
-                    onChanged: (value) {
-                      if (value != null) controller.setL1StartVariant(value);
-                    },
-                  ),
-                ),
-                const SizedBox(width: 8),
-                OutlinedButton.icon(
-                  onPressed: kProtocolVerified
-                      ? () => controller.sendL1Start(
-                            variant: controller.l1StartVariant,
+                        if (device != null &&
+                            (controller.batteryPercent != null ||
+                                controller.storageTotalBytes != null)) ...[
+                          const SizedBox(height: 12),
+                          Row(
+                            children: [
+                              if (controller.batteryPercent != null)
+                                Expanded(
+                                  child: _DeviceStat(
+                                    icon: Icons.battery_std,
+                                    value: '${controller.batteryPercent}%',
+                                    detail: '电量',
+                                    progress:
+                                        (controller.batteryPercent ?? 0) / 100,
+                                    progressColor:
+                                        (controller.batteryPercent ?? 100) < 20
+                                            ? Theme.of(context)
+                                                .colorScheme
+                                                .error
+                                            : null,
+                                  ),
+                                ),
+                              if (controller.batteryPercent != null &&
+                                  controller.storageTotalBytes != null)
+                                const SizedBox(width: 12),
+                              if (controller.storageTotalBytes != null)
+                                Expanded(
+                                  child: _DeviceStat(
+                                    icon: Icons.sd_storage,
+                                    value:
+                                        '${_formatBytes(controller.storageUsedBytes ?? 0)} / ${_formatBytes(controller.storageTotalBytes!)}',
+                                    detail: '存储',
+                                    progress: controller.storageTotalBytes! <= 0
+                                        ? 0
+                                        : ((controller.storageUsedBytes ?? 0) /
+                                            controller.storageTotalBytes!),
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ],
+                        const SizedBox(height: 12),
+                        if (device == null)
+                          FilledButton.icon(
+                            onPressed: controller.isScanning
+                                ? controller.stopScan
+                                : controller.beginScan,
+                            icon: Icon(controller.isScanning
+                                ? Icons.stop_circle_outlined
+                                : Icons.bluetooth_searching),
+                            label: Text(
+                              controller.isScanning ? '停止扫描' : '扫描附近设备',
+                            ),
                           )
-                      : null,
-                  icon: const Icon(Icons.handshake_outlined),
-                  label: const Text('发 L1START'),
+                        else
+                          OutlinedButton.icon(
+                            onPressed: controller.disconnect,
+                            icon: const Icon(Icons.link_off),
+                            label: const Text('断开连接'),
+                          ),
+                      ]),
                 ),
+              ),
+              if (controller.error case final error?)
+                Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Text(error,
+                        style: TextStyle(
+                            color: Theme.of(context).colorScheme.error))),
+              if (device == null) ...[
+                const SizedBox(height: 12),
+                Text('发现的设备', style: Theme.of(context).textTheme.titleMedium),
+                for (final result in controller.scanResults)
+                  ExcludeSemantics(
+                    key: ValueKey(result.peripheral.uuid.toString()),
+                    child: ScanTile(
+                      result: result,
+                      onConnect: () => _connectWithAuthKey(context, result),
+                    ),
+                  ),
+              ] else ...[
+                const SizedBox(height: 12),
+                if (controller.sessionReady) ...[
+                  Row(
+                    children: [
+                      OutlinedButton.icon(
+                        onPressed: !controller.installInProgress &&
+                                !controller.timeSyncInProgress
+                            ? controller.syncSystemTime
+                            : null,
+                        icon: controller.timeSyncInProgress
+                            ? const SizedBox.square(
+                                dimension: 18,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.sync),
+                        label: Text(controller.timeSyncInProgress
+                            ? '正在同步时间'
+                            : '同步时间与时区'),
+                      ),
+                      if (controller.lastTimeSyncSummary
+                          case final summary?) ...[
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            summary,
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ],
+                if (!controller.sessionReady && !controller.sppConnecting) ...[
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: controller.connectSpp,
+                    icon: const Icon(Icons.refresh),
+                    label: const Text('重新建立 SPP 会话'),
+                  ),
+                ],
+                const SizedBox(height: 12),
+                Text('安装', style: Theme.of(context).textTheme.titleMedium),
+                const Text('连接与鉴权只执行一次；会话保持期间可连续安装多个文件。'),
+                const SizedBox(height: 8),
+                InstallSplitButton(
+                  preferredTarget: preferredInstallTarget,
+                  enabled: controller.sessionReady &&
+                      !controller.installInProgress &&
+                      !controller.timeSyncInProgress,
+                  onInstall: (target) => _pickAndTry(context, target),
+                ),
+                if (controller.latestTask case final task?)
+                  InstallTaskCard(
+                    task: task,
+                    onCancel: controller.cancelInstall,
+                    onCheck: controller.reconnectAndCheckInstall,
+                    onRetry: controller.retryInstallFromStart,
+                  ),
               ],
-            ),
-            const SizedBox(height: 8),
-            const Text(
-              'SPP 鉴权仅适用于已确认的 V2 设备；表盘、快应用与其他业务命令仍不会发送。',
-              style: TextStyle(fontSize: 12),
-            ),
-            if (controller.latestTask case final task?) _TaskCard(task: task),
-          ],
-          const SizedBox(height: 12),
-          _LogPanel(logs: controller.logs, onClear: controller.clearLogs),
-        ],
+              const SizedBox(height: 12),
+              LogPanel(logs: controller.logs, onClear: controller.clearLogs),
+            ],
+          ),
+        ),
       ),
     );
   }
 }
 
-/// 把“GATT 已连接”“authkey 会话已就绪”“安装传输已验证”分开显示，避免把
-/// 蓝牙连接成功误解为已经能安全安装文件。
-class _SessionStatusCard extends StatelessWidget {
-  const _SessionStatusCard({
-    required this.sessionReady,
-    required this.installTransportVerified,
+/// 设备卡片上的统计块（电量/存储）。
+class _DeviceStat extends StatelessWidget {
+  const _DeviceStat({
+    required this.icon,
+    required this.value,
+    required this.detail,
+    required this.progress,
+    this.progressColor,
   });
 
-  final bool sessionReady;
-  final bool installTransportVerified;
-
-  @override
-  Widget build(BuildContext context) {
-    final color = Theme.of(context).colorScheme;
-    final title = installTransportVerified
-        ? '安装数据通道已验证'
-        : sessionReady
-            ? 'authkey 会话已验证'
-            : '等待 authkey 会话验证';
-    final detail = installTransportVerified
-        ? '可使用已验证的安装流程。'
-        : sessionReady
-            ? '已建立身份会话。Mass 数据通道与业务加密帧仍需真机抓包核验，安装发送已锁定。'
-            : '请点击“通过 SPP 验证 authkey”。GATT 连接本身不代表可安装。';
-    final icon = installTransportVerified
-        ? Icons.verified
-        : sessionReady
-            ? Icons.verified_user_outlined
-            : Icons.lock_outline;
-    return Card(
-      color: installTransportVerified
-          ? color.primaryContainer
-          : sessionReady
-              ? color.secondaryContainer
-              : color.surfaceContainerHighest,
-      child: ListTile(
-        leading: Icon(icon),
-        title: Text(title),
-        subtitle: Text(detail),
-      ),
-    );
-  }
-}
-
-/// 仅本地分析用户自行导出的 Android btsnoop 文件。
-/// authkey 只在点击“开始解码”时读取，随后立即清空输入框，不写入磁盘。
-class _HciDecoderPage extends StatefulWidget {
-  const _HciDecoderPage();
-
-  @override
-  State<_HciDecoderPage> createState() => _HciDecoderPageState();
-}
-
-class _HciDecoderPageState extends State<_HciDecoderPage> {
-  final _authKey = TextEditingController();
-  final _counterStart = TextEditingController(text: '0');
-  final _counterWindow = TextEditingController(text: '4096');
-  String? _filePath;
-  HciDecodeReport? _report;
-  String? _error;
-  bool _running = false;
-
-  @override
-  void dispose() {
-    _authKey.dispose();
-    _counterStart.dispose();
-    _counterWindow.dispose();
-    super.dispose();
-  }
-
-  Future<void> _pickFile() async {
-    final selected = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: const ['log'],
-    );
-    final path = selected?.files.single.path;
-    if (path != null && mounted) {
-      setState(() {
-        _filePath = path;
-        _report = null;
-        _error = null;
-      });
-    }
-  }
-
-  Future<void> _decode() async {
-    final path = _filePath;
-    final authKey = _authKey.text.trim();
-    final start = int.tryParse(_counterStart.text.trim());
-    final window = int.tryParse(_counterWindow.text.trim());
-    if (path == null || !RegExp(r'^[0-9a-fA-F]{32}$').hasMatch(authKey)) {
-      setState(() => _error = '请选择 .log，并输入 32 位十六进制 authkey。');
-      return;
-    }
-    if (start == null || window == null || start < 0 || window < 1 || window > 65536) {
-      setState(() => _error = '计数器起点应为非负整数，窗口范围为 1 到 65536。');
-      return;
-    }
-    setState(() {
-      _running = true;
-      _error = null;
-      _report = null;
-    });
-    try {
-      final bytes = Uint8List.fromList(await File(path).readAsBytes());
-      final report = await Future<HciDecodeReport>(() => const HciDecoder().decode(
-            hciBytes: bytes,
-            authKeyHex: authKey,
-            inboundCounterStart: start,
-            inboundCounterWindow: window,
-          ));
-      if (mounted) setState(() => _report = report);
-    } on Object catch (error) {
-      if (mounted) setState(() => _error = '解码失败：$error');
-    } finally {
-      // 密钥不保存在 State、文件或运行日志中。
-      _authKey.clear();
-      if (mounted) setState(() => _running = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final report = _report;
-    return Scaffold(
-      appBar: AppBar(title: const Text('离线 HCI 解码')),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          const Text('只读取本地 btsnoop HCI 文件；不会连接设备、上传文件或保存 authkey。'),
-          const SizedBox(height: 16),
-          OutlinedButton.icon(
-            onPressed: _running ? null : _pickFile,
-            icon: const Icon(Icons.folder_open_outlined),
-            label: Text(_filePath == null ? '选择 btsnoop_hci.log' : '已选：${_filePath!.split(RegExp(r'[/\\]')).last}'),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _authKey,
-            obscureText: true,
-            enableSuggestions: false,
-            autocorrect: false,
-            maxLength: 32,
-            decoration: const InputDecoration(
-              labelText: '该抓包会话的 authkey',
-              helperText: '仅在内存中用于本次解码，完成后自动清空。',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 8),
-          Row(children: [
-            Expanded(
-              child: TextField(
-                controller: _counterStart,
-                keyboardType: TextInputType.number,
-                decoration: const InputDecoration(labelText: 'deviceCounter 起点', border: OutlineInputBorder()),
-              ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: TextField(
-                controller: _counterWindow,
-                keyboardType: TextInputType.number,
-                decoration: const InputDecoration(labelText: '尝试窗口', border: OutlineInputBorder()),
-              ),
-            ),
-          ]),
-          const SizedBox(height: 12),
-          FilledButton.icon(
-            onPressed: _running ? null : _decode,
-            icon: _running
-                ? const SizedBox.square(dimension: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                : const Icon(Icons.play_arrow),
-            label: Text(_running ? '正在本地解码…' : '开始解码'),
-          ),
-          if (_error case final error?) ...[
-            const SizedBox(height: 12),
-            Text(error, style: TextStyle(color: Theme.of(context).colorScheme.error)),
-          ],
-          if (report != null) ...[
-            const SizedBox(height: 16),
-            Text('结果：${report.l1Frames} 个 L1 帧，${report.sessions} 个已确认会话，${report.encryptedFrames} 个 WRITE_ENC 帧。',
-                style: Theme.of(context).textTheme.titleSmall),
-            const SizedBox(height: 8),
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: SelectionArea(child: Text(report.lines.join('\n'))),
-              ),
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-}
-
-class _LogPanel extends StatelessWidget {
-  const _LogPanel({required this.logs, required this.onClear});
-
-  final List<String> logs;
-  final VoidCallback onClear;
-
-  Future<void> _copyAll(BuildContext context) async {
-    await Clipboard.setData(ClipboardData(text: logs.join('\n')));
-    if (!context.mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(
-        content: Text('已复制全部日志（${logs.length} 行）'),
-        duration: const Duration(seconds: 2),
-      ));
-  }
+  final IconData icon;
+  final String value;
+  final String detail;
+  final double progress;
+  final Color? progressColor;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Text('运行日志（${logs.length}）',
-                    style: theme.textTheme.titleMedium),
-                const Spacer(),
-                IconButton(
-                  tooltip: '复制全部日志',
-                  icon: const Icon(Icons.copy, size: 20),
-                  onPressed: logs.isEmpty ? null : () => _copyAll(context),
-                ),
-                IconButton(
-                  tooltip: '清空日志',
-                  icon: const Icon(Icons.clear_all, size: 20),
-                  onPressed: onClear,
-                ),
-              ],
-            ),
-            const SizedBox(height: 4),
-            SelectionArea(
-              child: SizedBox(
-                height: 220,
-                child: logs.isEmpty
-                    ? Center(
-                        child: Text('暂无日志。扫描、连接、服务发现与鉴权状态都会显示在这里。',
-                            style: theme.textTheme.bodySmall),
-                      )
-                    : ListView.builder(
-                        reverse: true,
-                        itemCount: logs.length,
-                        itemBuilder: (context, index) {
-                          final line = logs[logs.length - 1 - index];
-                          return Padding(
-                            padding: const EdgeInsets.symmetric(vertical: 1),
-                            child: Text(
-                              line,
-                              style: theme.textTheme.bodySmall?.copyWith(
-                                fontFamily: 'monospace',
-                                fontSize: 12,
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-              ),
-            ),
-          ],
-        ),
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHigh,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icon, size: 18, color: theme.colorScheme.primary),
+              const SizedBox(width: 6),
+              Text(detail, style: theme.textTheme.bodySmall),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            value,
+            style: theme.textTheme.titleMedium
+                ?.copyWith(fontWeight: FontWeight.w500),
+          ),
+          const SizedBox(height: 6),
+          LinearProgressIndicator(
+            value: progress.clamp(0.0, 1.0),
+            color: progressColor ?? theme.colorScheme.primary,
+          ),
+        ],
       ),
     );
   }
 }
 
-class _ScanTile extends StatelessWidget {
-  const _ScanTile({required this.result, required this.onConnect});
-  final DiscoveredEventArgs result;
-  final VoidCallback onConnect;
-
-  @override
-  Widget build(BuildContext context) {
-    final name = result.advertisement.name ?? '';
-    final profile = DeviceProfile.matchAdvertisementName(name);
-    final subtitle =
-        StringBuffer('${result.peripheral.uuid} · RSSI ${result.rssi}');
-    if (profile != null) {
-      subtitle.write(
-          '\n识别：${profile.displayName}（${_generationLabel(profile.generation)}）');
-    }
-    return Card(
-      child: ListTile(
-        leading: const Icon(Icons.watch_outlined),
-        title: Text(name.isEmpty ? '未命名 BLE 设备' : name),
-        subtitle: Text(subtitle.toString()),
-        trailing: FilledButton(onPressed: onConnect, child: const Text('连接')),
-      ),
-    );
+String _formatBytes(int bytes) {
+  if (bytes >= 1024 * 1024 * 1024) {
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
   }
-
-  String _generationLabel(ProtocolGeneration generation) =>
-      switch (generation) {
-        ProtocolGeneration.v2Vela => 'V2 传输 · 目标支持',
-        ProtocolGeneration.v1Vela => 'V1 传输 · 暂不支持',
-        ProtocolGeneration.unknown => '未确认',
-      };
-}
-
-class _TaskCard extends StatelessWidget {
-  const _TaskCard({required this.task});
-  final InstallTask task;
-
-  @override
-  Widget build(BuildContext context) => Card(
-        margin: const EdgeInsets.only(top: 12),
-        child: ListTile(
-          leading: const Icon(Icons.info_outline),
-          title: Text(task.fileName),
-          subtitle: Text(task.message),
-          trailing: Text(task.stage.name),
-        ),
-      );
+  if (bytes >= 1024 * 1024) {
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+  return '${(bytes / 1024).toStringAsFixed(1)} KB';
 }

@@ -1,9 +1,10 @@
 import 'dart:async';
 
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
-import '../domain/protocol/l1_l2_frame.dart';
+import '../domain/protocol/transport_constants.dart';
 
 /// Windows-first BLE central wrapper. The plugin maps to native Windows BLE;
 /// its Android and Linux backends keep this boundary portable.
@@ -18,7 +19,12 @@ class BleTransport {
 
   Stream<DiscoveredEventArgs> get discoveries => _central.discovered;
 
-  Future<void> startScan() => _central.startDiscovery();
+  Future<void> startScan() async {
+    if (_isAndroid) {
+      await _androidMethods.invokeMethod<void>('ensurePermissions');
+    }
+    await _central.startDiscovery();
+  }
 
   Future<void> stopScan() => _central.stopDiscovery();
 
@@ -68,7 +74,8 @@ class BleTransport {
     return false;
   }
 
-  Future<void> disconnect(Peripheral peripheral) => _central.disconnect(peripheral);
+  Future<void> disconnect(Peripheral peripheral) =>
+      _central.disconnect(peripheral);
 
   /// 触发 Windows 系统配对（bonding）。手环 9 的写入特征要求加密连接：
   /// 未配对时直接写入会被设备静默丢弃（read 正常、write 无回包——正是
@@ -78,6 +85,12 @@ class BleTransport {
   /// pairing API，这里直连 Windows 实现的 pair 通道）。仅 Windows 可用。
   /// [uuid] 末 6 字节即 Windows 蓝牙地址（48-bit MAC）。
   Future<void> pairDevice(UUID uuid) async {
+    if (_isAndroid) {
+      await _androidMethods.invokeMethod<void>('ensurePermissions');
+      await _androidMethods.invokeMethod<void>('pair', _androidAddress(uuid));
+      return;
+    }
+    _requireWindowsOrAndroid();
     final hex = uuid.toString().replaceAll('-', '');
     final address = int.parse(hex.substring(hex.length - 12), radix: 16);
     // Pigeon 通道消息体直接是 args 列表（BasicMessageChannel，非 MethodChannel）。
@@ -85,13 +98,46 @@ class BleTransport {
       'dev.flutter.pigeon.bluetooth_low_energy_windows.CentralManagerHostApi.pair',
       StandardMessageCodec(),
     );
-    await channel.send(<Object?>[address]);
+    final reply = await channel.send(<Object?>[address]);
+    _throwIfPigeonError(reply, 'pair');
+  }
+
+  /// Windows 上若发现现存系统配对，则删除该配对记录并返回 true。
+  /// Android 的公开 SDK 不允许应用静默 removeBond，因此保持 false。
+  Future<bool> unpairIfPaired(UUID uuid) async {
+    if (_isAndroid) return false;
+    _requireWindowsOrAndroid();
+    final hex = uuid.toString().replaceAll('-', '');
+    final address = int.parse(hex.substring(hex.length - 12), radix: 16);
+    const channel = BasicMessageChannel<Object?>(
+      'dev.flutter.pigeon.bluetooth_low_energy_windows.CentralManagerHostApi.unpairIfPaired',
+      StandardMessageCodec(),
+    );
+    final reply = await channel.send(<Object?>[address]);
+    _throwIfPigeonError(reply, 'unpairIfPaired');
+    final value = (reply as List<Object?>).firstOrNull;
+    if (value is! bool) {
+      throw PlatformException(
+        code: 'pigeon_invalid_reply',
+        message: 'unpairIfPaired did not return a boolean result.',
+      );
+    }
+    return value;
   }
 
   /// 经典蓝牙（BR/EDR）RFCOMM 串口连接（手环 9 系主通道）。
   /// [serviceUuid] 为 RFCOMM 服务 UUID（默认 SPP `00001101-...`）。
   /// 返回后连接即建立，数据经 [rfcommData] 流推送。
   Future<void> connectRfcomm(UUID uuid, {String? serviceUuid}) async {
+    if (_isAndroid) {
+      await _androidMethods.invokeMethod<void>('ensurePermissions');
+      await _androidMethods.invokeMethod<void>('connect', {
+        'address': _androidAddress(uuid),
+        'serviceUuid': serviceUuid ?? '00001101-0000-1000-8000-00805f9b34fb',
+      });
+      return;
+    }
+    _requireWindowsOrAndroid();
     final hex = uuid.toString().replaceAll('-', '');
     final address = int.parse(hex.substring(hex.length - 12), radix: 16);
     const channel = BasicMessageChannel<Object?>(
@@ -105,20 +151,46 @@ class BleTransport {
     _throwIfPigeonError(reply, 'connectRfcomm');
   }
 
-  /// 写 RFCOMM 数据。
-  Future<void> rfcommWrite(UUID uuid, List<int> data) async {
+  // StreamSocket.OutputStream only supports one pending write. ACK and the
+  // following command can be scheduled from the same inbound callback, so all
+  // platforms share this small FIFO instead of racing two native DataWriters.
+  Future<void> _rfcommWriteTail = Future<void>.value();
+
+  /// 写 RFCOMM 数据（严格串行）。
+  Future<void> rfcommWrite(UUID uuid, List<int> data) {
+    final operation = _rfcommWriteTail.then(
+      (_) => _rfcommWriteDirect(uuid, List<int>.from(data)),
+    );
+    // A failed packet is reported to its caller but must not poison the queue.
+    _rfcommWriteTail = operation.then<void>((_) {}, onError: (_) {});
+    return operation;
+  }
+
+  Future<void> _rfcommWriteDirect(UUID uuid, List<int> data) async {
+    if (_isAndroid) {
+      await _androidMethods.invokeMethod<void>(
+          'write', Uint8List.fromList(data));
+      return;
+    }
+    _requireWindowsOrAndroid();
     final hex = uuid.toString().replaceAll('-', '');
     final address = int.parse(hex.substring(hex.length - 12), radix: 16);
     const channel = BasicMessageChannel<Object?>(
       'dev.flutter.pigeon.bluetooth_low_energy_windows.CentralManagerHostApi.rfcommWrite',
       StandardMessageCodec(),
     );
-    final reply = await channel.send(<Object?>[address, Uint8List.fromList(data)]);
+    final reply =
+        await channel.send(<Object?>[address, Uint8List.fromList(data)]);
     _throwIfPigeonError(reply, 'rfcommWrite');
   }
 
   /// 断开 RFCOMM。
   Future<void> disconnectRfcomm(UUID uuid) async {
+    if (_isAndroid) {
+      await _androidMethods.invokeMethod<void>('disconnect');
+      return;
+    }
+    _requireWindowsOrAndroid();
     final hex = uuid.toString().replaceAll('-', '');
     final address = int.parse(hex.substring(hex.length - 12), radix: 16);
     const channel = BasicMessageChannel<Object?>(
@@ -151,10 +223,44 @@ class BleTransport {
 
   final StreamController<Uint8List> _rfcommDataController =
       StreamController<Uint8List>.broadcast();
+  StreamSubscription<dynamic>? _androidRfcommSubscription;
   Stream<Uint8List> get rfcommData => _rfcommDataController.stream;
+
+  static const _androidMethods = MethodChannel('miwearable/rfcomm');
+  static const _androidEvents = EventChannel('miwearable/rfcomm/events');
+  bool get _isAndroid => defaultTargetPlatform == TargetPlatform.android;
+
+  void _requireWindowsOrAndroid() {
+    if (defaultTargetPlatform != TargetPlatform.windows) {
+      throw UnsupportedError('本版本 Linux 尚未实现 RFCOMM 真实安装传输。');
+    }
+  }
+
+  String _androidAddress(UUID uuid) {
+    final hex = uuid.toString().replaceAll('-', '');
+    final mac = hex.substring(hex.length - 12).toUpperCase();
+    return List.generate(6, (index) => mac.substring(index * 2, index * 2 + 2))
+        .join(':');
+  }
 
   /// 注册 RFCOMM 数据回调（监听 C++ 侧 Pigeon FlutterApi `onRfcommData`）。
   void listenRfcommData() {
+    if (_isAndroid) {
+      _androidRfcommSubscription ??=
+          _androidEvents.receiveBroadcastStream().listen(
+        (Object? value) {
+          if (value is Uint8List && !_rfcommDataController.isClosed) {
+            _rfcommDataController.add(value);
+          }
+        },
+        onError: (Object error, StackTrace stackTrace) {
+          if (!_rfcommDataController.isClosed) {
+            _rfcommDataController.addError(error, stackTrace);
+          }
+        },
+      );
+      return;
+    }
     const channel = BasicMessageChannel<Object?>(
       'dev.flutter.pigeon.bluetooth_low_energy_windows.CentralManagerFlutterApi.onRfcommData',
       StandardMessageCodec(),
@@ -163,73 +269,33 @@ class BleTransport {
       final args = message as List<Object?>?;
       if (args == null || args.length < 2) return null;
       final data = args[1];
-      if (data is Uint8List) {
+      if (data is Uint8List && !_rfcommDataController.isClosed) {
         _rfcommDataController.add(data);
       }
       return null;
     });
   }
 
-  void disposeRfcommStream() {
-    _rfcommDataController.close();
+  Future<void> disposeRfcommStream() async {
+    await _androidRfcommSubscription?.cancel();
+    _androidRfcommSubscription = null;
+    if (!_isAndroid) {
+      const channel = BasicMessageChannel<Object?>(
+        'dev.flutter.pigeon.bluetooth_low_energy_windows.CentralManagerFlutterApi.onRfcommData',
+        StandardMessageCodec(),
+      );
+      channel.setMessageHandler(null);
+    }
+    if (!_rfcommDataController.isClosed) {
+      await _rfcommDataController.close();
+    }
   }
 
   /// 读取特征值（只读操作，用于版本特征等被动读取，不发送任何写帧）。
   Future<Uint8List> readCharacteristic(
     Peripheral peripheral,
     GATTCharacteristic characteristic,
-  ) => _central.readCharacteristic(peripheral, characteristic);
+  ) =>
+      _central.readCharacteristic(peripheral, characteristic);
 
-  /// 写入特征值。优先 [withResponse]；若失败（手环 5f 特征可能只支持
-  /// write-without-response），自动切换另一 write type 重试一次。
-  Future<void> write(
-    Peripheral peripheral,
-    GATTCharacteristic characteristic,
-    List<int> value, {
-    bool withResponse = true,
-  }) async {
-    final valueBytes = Uint8List.fromList(value);
-    try {
-      await _central.writeCharacteristic(
-        peripheral,
-        characteristic,
-        value: valueBytes,
-        type: withResponse
-            ? GATTCharacteristicWriteType.withResponse
-            : GATTCharacteristicWriteType.withoutResponse,
-      );
-      return;
-    } on PlatformException {
-      final fallback = !withResponse;
-      try {
-        await _central.writeCharacteristic(
-          peripheral,
-          characteristic,
-          value: valueBytes,
-          type: fallback
-              ? GATTCharacteristicWriteType.withResponse
-              : GATTCharacteristicWriteType.withoutResponse,
-        );
-        return;
-      } on PlatformException {
-        // 两种 write type 都失败，抛出原始错误。
-        rethrow;
-      }
-    }
-  }
-
-  /// 开启/关闭特征通知。
-  Future<void> setNotify(
-    Peripheral peripheral,
-    GATTCharacteristic characteristic, {
-    required bool state,
-  }) => _central.setCharacteristicNotifyState(
-        peripheral,
-        characteristic,
-        state: state,
-      );
-
-  /// 特征通知值流。
-  Stream<GATTCharacteristicNotifiedEventArgs> get characteristicNotified =>
-      _central.characteristicNotified;
 }

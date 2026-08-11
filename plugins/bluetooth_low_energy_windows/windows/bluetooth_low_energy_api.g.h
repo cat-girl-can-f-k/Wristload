@@ -657,10 +657,10 @@ class CentralManagerHostApi {
   virtual void Pair(
     int64_t address_args,
     std::function<void(std::optional<FlutterError> reply)> result) = 0;
-  virtual void ShowToast(
-    const std::string& title_args,
-    const std::string& body_args,
-    std::function<void(std::optional<FlutterError> reply)> result) = 0;
+  // Returns true only when Windows had a pairing record and removed it.
+  virtual void UnpairIfPaired(
+    int64_t address_args,
+    std::function<void(ErrorOr<bool> reply)> result) = 0;
   virtual void ConnectRfcomm(
     int64_t address_args,
     const std::string& service_uuid_args,

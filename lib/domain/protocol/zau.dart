@@ -7,7 +7,7 @@
 /// - `a9u`   ：表盘载荷。oneof：f2=faceId、f5=code、f6=y8u(预装)、f7=x8u(结果)、f9=z8u(错误)
 /// - `y8u`   ：表盘文件信息。f1=faceId、f2=fileSize、f3=long、f4=int、f5=message
 /// - `x8u`   ：表盘安装结果。id/code/canReplace（设备推送，解析用）
-/// - `v8s`   ：RPK 载荷。oneof：f2=j8s(预装请求)、f3=k8s(预装响应)
+/// - `v8s`   ：RPK 载荷。oneof：f2=j8s(预装请求)、f3=k8s(预装响应)、f4=l8s(安装结果)
 /// - `j8s`   ：RPK 预装请求。f1=packageName、f2=versionCode、f3=packageSize
 /// - `k8s`   ：RPK 预装响应。f1=status、f2=expectedSliceLength
 /// - `o1h`   ：Mass 载荷。oneof：f1=s1h(MassPrepare 请求)、f2=u1h(响应)、f3=q1h(取消)
@@ -22,9 +22,65 @@ import 'proto_wire.dart';
 
 /// 表盘 / RPK / Mass 命令号（zau.e）。
 abstract final class ZauCommand {
+  /// Official Vela system-time sync request (TimeSyncer): command=2, sub=3.
+  static const int setSystemTime = 2;
   static const int setFace = 4; // 表盘：预装(f=4) / setFace(f=1)
   static const int prepareInstallApp = 20; // RPK 预装
   static const int massTransfer = 22; // Mass 文件传输（MassPrepare/MassData 控制）
+}
+
+/// Payload used by the official V2/Vela TimeSyncer.
+///
+/// Wire layout (from the APK nano messages): zau.field4=ysr,
+/// ysr.field4=btr, btr={date:ht4,time:nt4,timezone:pt4,is12Hour}.
+abstract final class TimeSyncPayload {
+  static (int, List<int>) encode({
+    required DateTime localTime,
+    required int standardOffsetMinutes,
+    required int daylightOffsetMinutes,
+    required String timezoneId,
+    required bool use24Hour,
+  }) {
+    if (localTime.isUtc) {
+      throw ArgumentError.value(localTime, 'localTime', 'must be local time');
+    }
+    if (standardOffsetMinutes % 15 != 0 || daylightOffsetMinutes % 15 != 0) {
+      throw ArgumentError('timezone offsets must be multiples of 15 minutes');
+    }
+    if (timezoneId.isEmpty) {
+      throw ArgumentError.value(timezoneId, 'timezoneId', 'must not be empty');
+    }
+    final date = ProtoWriter()
+      ..writeInt(1, localTime.year)
+      ..writeInt(2, localTime.month)
+      ..writeInt(3, localTime.day);
+    final time = ProtoWriter()
+      ..writeInt(1, localTime.hour)
+      ..writeInt(2, localTime.minute);
+    if (localTime.second != 0) {
+      time.writeInt(3, localTime.second);
+    }
+    if (localTime.millisecond != 0) {
+      time.writeInt(4, localTime.millisecond);
+    }
+    final timezone = ProtoWriter()
+      // pt4 uses nano i0(), which is sint32/zigzag, for both offsets.
+      ..writeSInt(1, standardOffsetMinutes ~/ 15);
+    if (daylightOffsetMinutes != 0) {
+      timezone.writeSInt(2, daylightOffsetMinutes ~/ 15);
+    }
+    timezone.writeString(3, timezoneId);
+    final btr = ProtoWriter()
+      ..writeMessage(1, date.bytes)
+      ..writeMessage(2, time.bytes)
+      ..writeMessage(3, timezone.bytes);
+    if (!use24Hour) {
+      // The APK stores `!DateFormat.is24HourFormat(...)` in btr.field4.
+      btr.writeBool(4, true);
+    }
+    final ysr = ProtoWriter()..writeMessage(4, btr.bytes);
+    return (4, ysr.bytes);
+  }
 }
 
 /// 业务 dataType（Mass 文件头，type*16+detailType）。
@@ -74,6 +130,16 @@ class Zau {
     }
     return Zau(command: command, sub: sub, payload: payload);
   }
+
+  /// 设备可能在重启或非本协议服务时返回无关数据；调用方用此方法避免把
+  /// 解析异常误判为设备的安装失败。
+  static Zau? tryParse(List<int> data, [IntEncoding enc = IntEncoding.varint]) {
+    try {
+      return parse(data, enc);
+    } on Object {
+      return null;
+    }
+  }
 }
 
 /// 表盘载荷 a9u（zau oneof field 6）。
@@ -83,10 +149,13 @@ abstract final class A9u {
     required int fileSize,
     IntEncoding enc = IntEncoding.varint,
   }) {
-    final w = ProtoWriter();
-    w.writeString(1, faceId);
-    w.writeIntEncoded(2, fileSize, enc);
-    return (6, w.bytes);
+    // zau.field6 = a9u, a9u.field6 = y8u. Skipping the a9u oneof wrapper
+    // makes the device reject the control frame and close RFCOMM.
+    final y8u = ProtoWriter()
+      ..writeString(1, faceId)
+      ..writeIntEncoded(2, fileSize, enc);
+    final a9u = ProtoWriter()..writeMessage(6, y8u.bytes);
+    return (6, a9u.bytes);
   }
 
   static (int, List<int>) withFaceId(String faceId) {
@@ -97,8 +166,8 @@ abstract final class A9u {
 
   /// 解析表盘预装响应/结果。返回 (kind, code/id…)。
   /// kind：success → code；error → errorCode；installResult → (id, code)。
-  static ({String kind, int code, String? faceId}) parse(
-      List<int> data, [IntEncoding enc = IntEncoding.varint]) {
+  static ({String kind, int code, String? faceId}) parse(List<int> data,
+      [IntEncoding enc = IntEncoding.varint]) {
     final r = ProtoReader(data);
     while (!r.isAtEnd) {
       final (field, wt) = r.readFieldHeader();
@@ -153,16 +222,27 @@ abstract final class V8s {
     required int packageSize,
     IntEncoding enc = IntEncoding.varint,
   }) {
-    final w = ProtoWriter();
-    w.writeString(1, packageName);
-    w.writeIntEncoded(2, versionCode, enc);
-    w.writeIntEncoded(3, packageSize, enc);
-    return (22, w.bytes); // v8s oneof f2 = j8s
+    final j8s = ProtoWriter()
+      ..writeString(1, packageName)
+      ..writeIntEncoded(2, versionCode, enc)
+      ..writeIntEncoded(3, packageSize, enc);
+    final v8s = ProtoWriter()..writeMessage(2, j8s.bytes);
+    return (22, v8s.bytes); // zau.field22=v8s, v8s.field2=j8s
   }
 
   /// 解析预装响应 k8s：返回 (status, expectedSliceLength)。
   static ({int status, int expectedSliceLength}) parsePrepareResponse(
-      List<int> data, [IntEncoding enc = IntEncoding.varint]) {
+      List<int> data,
+      [IntEncoding enc = IntEncoding.varint]) {
+    // v8s response is normally carried as v8s.field3 = k8s.
+    final outer = ProtoReader(data);
+    while (!outer.isAtEnd) {
+      final (field, wire) = outer.readFieldHeader();
+      if (field == 3 && wire == 2) {
+        return parsePrepareResponse(outer.readBytes(), enc);
+      }
+      outer.skipField(wire);
+    }
     final r = ProtoReader(data);
     var status = -1;
     var slice = 0;
@@ -179,6 +259,58 @@ abstract final class V8s {
     }
     return (status: status, expectedSliceLength: slice);
   }
+
+  /// 解析设备主动推送的 RPK 安装结果 `20/2`。
+  ///
+  /// v8s.field4=l8s；l8s.field1 是结果码，oneof field2 是失败时包名，
+  /// field3=m8s 是成功时应用信息（m8s.field1 同样是包名）。
+  static ({int code, String packageName}) parseInstallResult(List<int> data) {
+    final outer = ProtoReader(data);
+    List<int>? resultBytes;
+    while (!outer.isAtEnd) {
+      final (field, wire) = outer.readFieldHeader();
+      if (field == 4 && wire == 2) {
+        resultBytes = outer.readBytes();
+      } else {
+        outer.skipField(wire);
+      }
+    }
+    if (resultBytes == null) {
+      throw const FormatException('RPK 安装结果缺少 v8s.field4');
+    }
+
+    final result = ProtoReader(resultBytes);
+    var code = -1;
+    var packageName = '';
+    while (!result.isAtEnd) {
+      final (field, wire) = result.readFieldHeader();
+      switch ((field, wire)) {
+        case (1, 0):
+          code = result.readVarint();
+        case (2, 2):
+          packageName = result.readString();
+        case (3, 2):
+          final appItem = ProtoReader(result.readBytes());
+          while (!appItem.isAtEnd) {
+            final (appField, appWire) = appItem.readFieldHeader();
+            if (appField == 1 && appWire == 2) {
+              packageName = appItem.readString();
+            } else {
+              appItem.skipField(appWire);
+            }
+          }
+        default:
+          result.skipField(wire);
+      }
+    }
+    if (code < 0) {
+      throw const FormatException('RPK 安装结果缺少状态码');
+    }
+    if (packageName.isEmpty) {
+      throw const FormatException('RPK 安装结果缺少包名');
+    }
+    return (code: code, packageName: packageName);
+  }
 }
 
 /// Mass 载荷 o1h（zau oneof field 24）。
@@ -190,17 +322,28 @@ abstract final class O1h {
     required int fileLength,
     IntEncoding enc = IntEncoding.varint,
   }) {
-    final w = ProtoWriter();
-    w.writeIntEncoded(1, dataType, enc);
-    w.writeBytes(2, fileMd5);
-    w.writeIntEncoded(3, fileLength, enc);
-    w.writeIntEncoded(4, 0, enc);
-    return (24, w.bytes); // o1h oneof f1 = s1h
+    final s1h = ProtoWriter()
+      ..writeIntEncoded(1, dataType, enc)
+      ..writeBytes(2, fileMd5)
+      ..writeIntEncoded(3, fileLength, enc)
+      ..writeIntEncoded(4, 0, enc);
+    final o1h = ProtoWriter()..writeMessage(1, s1h.bytes);
+    return (24, o1h.bytes); // zau.field24=o1h, o1h.field1=s1h
   }
 
   /// 解析 MassPrepare 响应 u1h：返回 (prepareStatus, remainLength, expectedSliceLength)。
   static ({int prepareStatus, int remainLength, int expectedSliceLength})
-      parsePrepareResponse(List<int> data, [IntEncoding enc = IntEncoding.varint]) {
+      parsePrepareResponse(List<int> data,
+          [IntEncoding enc = IntEncoding.varint]) {
+    // o1h response is normally carried as o1h.field2 = u1h.
+    final outer = ProtoReader(data);
+    while (!outer.isAtEnd) {
+      final (field, wire) = outer.readFieldHeader();
+      if (field == 2 && wire == 2) {
+        return parsePrepareResponse(outer.readBytes(), enc);
+      }
+      outer.skipField(wire);
+    }
     final r = ProtoReader(data);
     var status = -1;
     var remain = 0;

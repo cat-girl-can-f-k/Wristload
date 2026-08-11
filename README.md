@@ -1,14 +1,16 @@
-# Flutter 应用：第一版
+# 小米穿戴安装工具
 
 此目录是全新实现的 Flutter Material 3 应用，不包含、也不引用任何反编译 APK 的代码、资源、布局或服务端接口。
 
-## 第一版边界
+## 当前能力
 
-- 实际扫描 Android/Windows/Linux 支持的 BLE 设备；
-- 实际建立 BLE GATT 连接并读取服务 UUID；
-- 导入本地 `.bin` 表盘或 `.rpk` 快应用文件；
-- 在设备身份、能力和私有协议均未验证前，只创建明确标记为“等待协议验证”的尝试任务，**不会发送不明安装帧**；
-- 保留 `WearProtocol` 接口，让后续基于自有设备 HCI 日志实现经过验证的协商与传输。
+- Windows 扫描目标设备后自动建立 RFCOMM、完成 L1START 与 authkey 会话；
+- 导入 `.bin` 表盘和 `.rpk` 快应用，发送前校验元数据、文件大小与 MD5；
+- 表盘执行预安装、Mass 传输、安装结果与 `setFace(faceId)`；
+- 快应用执行 `20/1` 预安装、Mass `0x40` 传输，并等待匹配包名的 `20/2` 最终结果；
+- 设备 ACK 驱动双层进度条、KB 进度和 KB/s 实际确认速度；
+- 支持本地取消、超时停止、检查点和重连后的源文件一致性检查；
+- Android 已接入 RFCOMM 与安全存储，仍需目标设备真机验收；Linux 仅保留明确的不支持提示。
 
 ## 环境
 
@@ -21,15 +23,15 @@ flutter run -d windows
 
 Android 原生工程已生成，最低 SDK 需保持为 21+，并已声明附近设备/蓝牙扫描/连接权限。不要让 Flutter 模板重新生成时覆盖 `lib/` 或 `pubspec.yaml`。
 
-当前工作站验证状态（2026-08-08）：
+当前工作站验证状态（2026-08-10）：
 
 - Flutter 3.44.8 / Dart 3.12.2 已找到并可用；
-- Dart 静态分析与单元测试已通过（含协议核心编码测试）；
+- Dart 静态分析保持无错误；45 项自动化测试覆盖 RPK 最终结果解析、多清单冲突、畸形 PB、压缩包安全边界和安装进度 UI；
 - `flutter build windows --debug` 已成功，产物在 `build\windows\x64\runner\Debug\miwearable_install_tool.exe`，冒烟运行通过；
-- n67cn（小米手环 9 Pro）官方日志已确认 RFCOMM → SPP 版本 2.1.2 → L1START →
-  `sendAppVerify` → `sendAppConfirm` → `device ready` 的认证顺序；应用提供
-  「通过 SPP 验证 authkey」入口。该入口不开放任何安装业务；
-- Android SDK 尚未在 C:、D: 找到，因此不能构建 APK；安装 Android SDK 后设置 `ANDROID_HOME` 即可；
+- n67cn（小米手环 9 Pro）已真机确认 RFCOMM → L1START → `sendAppVerify` →
+  `sendAppConfirm` → `device ready`，以及表盘 Mass 传输；
+- 快应用控制命令、Mass `0x40` 和最终 `20/2` 数据结构已实现，等待本版真机安装验收；
+- 小米手环 7 Pro 已确认属于 Huami/Zepp 独立协议，小米手环 8 Pro 属于旧 Vela V1；二者均与当前 V2 安装链路隔离，详见 [`文档/经典设备协议差异.md`](文档/经典设备协议差异.md)；
 - 逆向工具链（便携 JDK 21 + JADX 1.4.7）与反编译产物在 `项目目录/tools/`，不纳入仓库。
 
 
@@ -39,9 +41,11 @@ Android 原生工程已生成，最低 SDK 需保持为 21+，并已声明附近
 - `lib/domain/`：设备档案、安装任务和协议边界；
 - `lib/domain/protocol/`：私有协议核心（逆向确认的帧与命令，独立实现）；
 - `lib/application/`：状态控制器；
-- `lib/presentation/`：Material 3 界面。
+- `lib/presentation/`：Material 3 安装任务、进度与离线 HCI 页面；
+- `lib/main.dart`：应用入口、首页布局与文件选择交互。
 
-协议帧只能写入 `WearProtocol` 的实现，禁止由 UI 直接写 GATT Characteristic。
+协议帧只能由应用层控制器通过平台 transport 写入，禁止由 UI 直接写 GATT
+Characteristic 或 RFCOMM；所有安装写入还必须通过 `VerificationGate`。
 
 ## 协议核心（`lib/domain/protocol/`）
 
@@ -51,28 +55,28 @@ Android 原生工程已生成，最低 SDK 需保持为 21+，并已声明附近
 |---|---|
 | `proto_wire.dart` | 最小 protobuf wire 编码/解码（varint、zigzag、length-delimited） |
 | `zau.dart` | zau 命令 + 表盘(a9u/y8u/x8u)/RPK(v8s/j8s/k8s)/Mass(o1h/s1h/u1h/q1h) 载荷 |
-| `l1_l2_frame.dart` | SAR 帧：L1（magic/type·frx/seq/len/crc）、L2（channel/opCode）、GATT UUID 常量 |
+| `spp_protocol.dart` | 已验证的 RFCOMM L1/L2 帧、累计 ACK 与版本查询 |
+| `transport_constants.dart` | GATT UUID 与 CRC-16 公共常量，不包含第二套帧实现 |
 | `mass_transfer.dart` | Mass 文件分片（22B 首片头、CRC32 尾、10MB 大块、设备协商数据段长） |
 
 已确认常量（逆向来源见分析文档 §3/§4）：
 
 - GATT：Service `0000fe95-…`、Write `0000005f-…`、Notify `0000005e-…`
 - zau：f1=命令号、f2=子命令；oneof f6=表盘、f22=RPK、f24=Mass
-- 表盘：预装 `(4,4)` → Mass type=1 → 结果 `(4,5)` code∈{2,3} → setFace `(4,1)`
-- RPK：预装 `(20,1)` → Mass type=4 → AppStatus 11 成功
+- 表盘：预装 `(4,4)` → Mass dataType=`0x10` → 结果 `(4,5)` code∈{2,3} → setFace `(4,1)`
+- RPK：预装 `(20,1)` → Mass dataType=`0x40` → 结果 `(20,2)`，状态 0 且包名匹配才成功
 - Mass dataType：表盘 `0x10`、RPK `0x40`
 
-⚠️ **发送门控**：`wear_protocol.dart` 的 `kProtocolVerified` 默认保持 `false`。
-CRC16 算法、`p0` int 编码（varint/zigzag）、段长语义、绑定鉴权仍待真机 HCI 验证，
-验证前任何安装调用都只会返回「等待协议验证」任务。
+发送只允许发生在已完成 authkey 的 RFCOMM 会话。GATT 成功、文件写入完成或
+Mass ACK 完成均不等于安装成功；必须收到对应业务完成事件。
 
-## SPP/authkey 认证（n67cn 已实现，待真机确认）
+## SPP/authkey 认证
 
 `auth_handshake.dart` 使用官方 App 的 `abu/bc0/hc0/ec0` protobuf 结构，认证
 路径与 `analysis/重新绑定日志_SPP鉴权链路_2026-08-08.md` 对照：
 
-1. 连接后点击「通过 SPP 验证 authkey」；
-2. 读取 SPP 版本，发送已由日志核对的 L1START；
+1. 选择设备后自动建立 RFCOMM；
+2. 对已识别 V2 目标直接发送已验证的 L1START；
 3. 发送 f=26，校验设备签名，发送 f=27；
 4. 仅收到 confirm success 时记录 `device ready`。
 

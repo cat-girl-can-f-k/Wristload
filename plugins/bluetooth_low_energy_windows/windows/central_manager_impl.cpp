@@ -4,17 +4,50 @@
 
 namespace bluetooth_low_energy_windows
 {
-	CentralManagerImpl::CentralManagerImpl(flutter::BinaryMessenger *messenger)
+	CentralManagerImpl::CentralManagerImpl(flutter::BinaryMessenger *messenger, PlatformTaskPoster post_to_platform)
 	{
 		const auto api = CentralManagerFlutterApi(messenger);
 		const auto watcher = winrt::Windows::Devices::Bluetooth::Advertisement::BluetoothLEAdvertisementWatcher();
 		watcher.ScanningMode(winrt::Windows::Devices::Bluetooth::Advertisement::BluetoothLEScanningMode::Active);
 		m_api = api;
 		m_watcher = watcher;
+		m_post_to_platform = std::move(post_to_platform);
 	}
 
 	CentralManagerImpl::~CentralManagerImpl()
 	{
+		try
+		{
+			if (m_watcher.has_value() &&
+				m_watcher->Status() == winrt::Windows::Devices::Bluetooth::Advertisement::BluetoothLEAdvertisementWatcherStatus::Started)
+			{
+				m_watcher->Stop();
+			}
+		}
+		catch (...)
+		{
+		}
+		m_watcher_received_revoker.reset();
+		m_radio_state_changed_revoker.reset();
+		m_device_connection_status_changed_revokers.clear();
+		m_session_max_pdu_size_changed_revokers.clear();
+		m_characteristic_value_changed_revokers.clear();
+		m_api.reset();
+	}
+
+	void CentralManagerImpl::PostToPlatform(std::function<void(CentralManagerFlutterApi &)> callback)
+	{
+		if (!m_post_to_platform)
+		{
+			return;
+		}
+		m_post_to_platform([this, callback = std::move(callback)]() mutable
+		{
+			if (m_api.has_value())
+			{
+				callback(m_api.value());
+			}
+		});
 	}
 
 	void CentralManagerImpl::Initialize(std::function<void(std::optional<FlutterError> reply)> result)
@@ -67,6 +100,8 @@ namespace bluetooth_low_energy_windows
 			filter.Advertisement(advertisement);
 			watcher.AdvertisementFilter(filter);
 			watcher.Start();
+			const auto generation = ++m_discovery_generation;
+			PublishKnownDevicesAsync(generation);
 			return std::nullopt;
 		}
 		catch (const winrt::hresult_error &ex)
@@ -82,6 +117,7 @@ namespace bluetooth_low_energy_windows
 	{
 		try
 		{
+			++m_discovery_generation;
 			const auto &watcher = m_watcher.value();
 			watcher.Stop();
 			return std::nullopt;
@@ -95,6 +131,59 @@ namespace bluetooth_low_energy_windows
 		}
 	}
 
+	winrt::fire_and_forget CentralManagerImpl::PublishKnownDevicesAsync(uint64_t generation)
+	{
+		try
+		{
+			const auto selector = winrt::Windows::Devices::Bluetooth::BluetoothLEDevice::GetDeviceSelector();
+			const auto devices = co_await winrt::Windows::Devices::Enumeration::DeviceInformation::FindAllAsync(selector);
+			for (const auto &device_info : devices)
+			{
+				if (m_discovery_generation.load() != generation)
+				{
+					co_return;
+				}
+				const auto device = co_await winrt::Windows::Devices::Bluetooth::BluetoothLEDevice::FromIdAsync(device_info.Id());
+				if (device == nullptr)
+				{
+					continue;
+				}
+				auto name = device.Name();
+				if (name.empty())
+				{
+					name = device_info.Name();
+				}
+				const auto name_args = winrt::to_string(name);
+				if (name_args.empty())
+				{
+					continue;
+				}
+				const auto address_args = static_cast<int64_t>(device.BluetoothAddress());
+				const auto peripheral_args = PeripheralArgs(address_args);
+				const auto advertisement_args = AdvertisementArgs(
+					&name_args,
+					flutter::EncodableList(),
+					flutter::EncodableMap(),
+					flutter::EncodableList());
+				PostToPlatform([peripheral_args, advertisement_args](CentralManagerFlutterApi &api)
+				{
+					api.OnDiscovered(
+						peripheral_args,
+						0,
+						0,
+						AdvertisementTypeArgs::kExtended,
+						advertisement_args,
+						[] {},
+						[](auto error) {});
+				});
+			}
+		}
+		catch (...)
+		{
+			// Live advertisement scanning remains active when cached enumeration is unavailable.
+		}
+	}
+
 	void CentralManagerImpl::Connect(int64_t address_args, std::function<void(std::optional<FlutterError> reply)> result)
 	{
 		ConnectAsync(address_args, std::move(result));
@@ -103,6 +192,11 @@ namespace bluetooth_low_energy_windows
 	void CentralManagerImpl::Pair(int64_t address_args, std::function<void(std::optional<FlutterError> reply)> result)
 	{
 		PairAsync(address_args, std::move(result));
+	}
+
+	void CentralManagerImpl::UnpairIfPaired(int64_t address_args, std::function<void(ErrorOr<bool> reply)> result)
+	{
+		UnpairIfPairedAsync(address_args, std::move(result));
 	}
 
 	void CentralManagerImpl::ConnectRfcomm(int64_t address_args, const std::string &service_uuid_args, std::function<void(ErrorOr<std::vector<uint8_t>> reply)> result)
@@ -114,12 +208,24 @@ namespace bluetooth_low_energy_windows
 	{
 		try
 		{
+			{
+				const std::lock_guard<std::mutex> lock(m_rfcomm_generation_mutex);
+				++m_rfcomm_generations[address_args];
+			}
 			auto it = m_rfcomm_sockets.find(address_args);
 			if (it != m_rfcomm_sockets.end() && it->second.has_value())
 			{
 				it->second->Close();
 			}
+			m_rfcomm_readers.erase(address_args);
+			m_rfcomm_writers.erase(address_args);
 			m_rfcomm_sockets.erase(address_args);
+			auto service_it = m_rfcomm_services.find(address_args);
+			if (service_it != m_rfcomm_services.end() && service_it->second.has_value())
+			{
+				service_it->second->Close();
+			}
+			m_rfcomm_services.erase(address_args);
 			return std::nullopt;
 		}
 		catch (const winrt::hresult_error &ex)
@@ -140,14 +246,14 @@ namespace bluetooth_low_energy_windows
 	{
 		try
 		{
-			auto &socket = m_rfcomm_sockets[address_args].value();
-			auto writer = winrt::Windows::Storage::Streams::DataWriter(socket.OutputStream());
+			auto writer_it = m_rfcomm_writers.find(address_args);
+			if (writer_it == m_rfcomm_writers.end() || !writer_it->second.has_value())
+			{
+				throw BluetoothLowEnergyException("RFCOMM writer is not connected");
+			}
+			auto writer = writer_it->second.value();
 			writer.WriteBytes(data_args);
 			co_await writer.StoreAsync();
-			// DataWriter owns its IOutputStream by default. This writer is scoped to
-			// one packet; detach the stream before it is destroyed so the RFCOMM
-			// socket remains writable and can receive the device response.
-			writer.DetachStream();
 			result(std::nullopt);
 		}
 		catch (const winrt::hresult_error &ex)
@@ -160,6 +266,7 @@ namespace bluetooth_low_energy_windows
 		}
 		catch (const std::exception &ex)
 		{
+			DisconnectRfcomm(address_args);
 			const auto code = "std::exception";
 			const auto message = ex.what();
 			const auto error = FlutterError(code, message);
@@ -169,8 +276,17 @@ namespace bluetooth_low_energy_windows
 
 	winrt::fire_and_forget CentralManagerImpl::ConnectRfcommAsync(int64_t address_args, const std::string &service_uuid_args, std::function<void(ErrorOr<std::vector<uint8_t>> reply)> result)
 	{
+		std::string stage = "initialize";
 		try
 		{
+			// Replace the previous WinRT objects instead of overwriting map entries.
+			// Disconnect invalidates the old read loop before Close() reports EOF.
+			DisconnectRfcomm(address_args);
+			uint64_t generation;
+			{
+				const std::lock_guard<std::mutex> lock(m_rfcomm_generation_mutex);
+				generation = ++m_rfcomm_generations[address_args];
+			}
 			// Format the 48-bit MAC into "d0:ae:05:0c:cc:f2" to match the
 			// DeviceInformation.Id of RFCOMM services.
 			const auto address = static_cast<uint64_t>(address_args);
@@ -184,83 +300,161 @@ namespace bluetooth_low_energy_windows
 				static_cast<unsigned>(address & 0xff));
 			const std::string mac(mac_buf);
 
-			// A fresh Windows installation has no RFCOMM service entry to enumerate
-			// yet. Pair through the LE device first; after Windows completes the
-			// system pairing it registers the BR/EDR SPP service for this wearable.
-			// The previous order looked up SPP first, so first-time pairing could
-			// never be reached.
+			// Pairing a dual-mode wearable through BluetoothLEDevice may create only
+			// a BTHLE record. That record does not prove that the BR/EDR identity or
+			// its Serial Port Profile is ready, so resolve and pair both identities.
+			stage = "resolve BLE identity";
 			const auto ble_device = co_await winrt::Windows::Devices::Bluetooth::BluetoothLEDevice::FromBluetoothAddressAsync(address);
 			if (ble_device == nullptr)
 			{
 				throw BluetoothLowEnergyException("Bluetooth device not found for address: " + mac);
 			}
-			const auto device_info = co_await winrt::Windows::Devices::Enumeration::DeviceInformation::CreateFromIdAsync(
+			stage = "read BLE pairing state";
+			const auto ble_device_info = co_await winrt::Windows::Devices::Enumeration::DeviceInformation::CreateFromIdAsync(
 				ble_device.BluetoothDeviceId().Id());
-			auto device_pairing = device_info.Pairing();
-			if (!device_pairing.IsPaired())
+			auto ble_pairing = ble_device_info.Pairing();
+			bool paired_now = false;
+			if (!ble_pairing.IsPaired())
 			{
-				const auto pairing_result = co_await device_pairing.PairAsync();
+				stage = "pair BLE identity";
+				const auto pairing_result = co_await ble_pairing.PairAsync();
 				const auto status = pairing_result.Status();
 				if (status != winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::Paired &&
 					status != winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::AlreadyPaired)
 				{
 					throw BluetoothLowEnergyException("RFCOMM pairing failed (status: " + std::to_string(static_cast<int>(status)) + ") - confirm the pairing on the band screen");
 				}
+				paired_now = status == winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::Paired;
+			}
+			// PairAsync can finish before Windows has published the BR/EDR identity.
+			if (paired_now)
+			{
+				co_await winrt::resume_after(std::chrono::milliseconds(800));
 			}
 
-			// Enumerate RFCOMM serial-port services and find the device by MAC.
-			const auto selector = winrt::Windows::Devices::Bluetooth::Rfcomm::RfcommDeviceService::GetDeviceSelector(
-				winrt::Windows::Devices::Bluetooth::Rfcomm::RfcommServiceId::SerialPort());
-			const auto device_infos = co_await winrt::Windows::Devices::Enumeration::DeviceInformation::FindAllAsync(selector);
-
-			winrt::Windows::Devices::Enumeration::DeviceInformation matched_info = nullptr;
-			for (const auto &info : device_infos)
+			winrt::Windows::Devices::Bluetooth::BluetoothDevice classic_device = nullptr;
+			for (int attempt = 0; attempt < 5 && classic_device == nullptr; ++attempt)
 			{
-				// DeviceInformation.Id 中 MAC 可能大写，统一转小写后匹配。
-				auto id_string = winrt::to_string(info.Id());
-				std::transform(id_string.begin(), id_string.end(), id_string.begin(), ::tolower);
-				if (id_string.find(mac) != std::string::npos)
+				stage = "resolve classic Bluetooth identity";
+				classic_device = co_await winrt::Windows::Devices::Bluetooth::BluetoothDevice::FromBluetoothAddressAsync(address);
+				if (classic_device == nullptr)
 				{
-					matched_info = info;
-					break;
+					const auto classic_selector = winrt::Windows::Devices::Bluetooth::BluetoothDevice::GetDeviceSelectorFromBluetoothAddress(address);
+					const auto classic_infos = co_await winrt::Windows::Devices::Enumeration::DeviceInformation::FindAllAsync(classic_selector);
+					if (classic_infos.Size() > 0)
+					{
+						auto classic_pairing = classic_infos.GetAt(0).Pairing();
+						if (!classic_pairing.IsPaired())
+						{
+							stage = "pair classic Bluetooth identity";
+							const auto pairing_result = co_await classic_pairing.PairAsync();
+							const auto status = pairing_result.Status();
+							if (status != winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::Paired &&
+								status != winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::AlreadyPaired)
+							{
+								throw BluetoothLowEnergyException("Classic Bluetooth pairing failed (status: " + std::to_string(static_cast<int>(status)) + ") - confirm pairing on the band");
+							}
+						}
+					}
+					co_await winrt::resume_after(std::chrono::milliseconds(600));
 				}
 			}
-			if (matched_info == nullptr)
+
+			if (classic_device == nullptr)
 			{
-				throw BluetoothLowEnergyException("RFCOMM serial service not found for MAC: " + mac);
+				throw BluetoothLowEnergyException("Classic Bluetooth identity was not published for MAC: " + mac +
+					" (Windows currently has only the BLE identity; wake the band and confirm its Bluetooth pairing prompt)");
+			}
+			auto classic_pairing = classic_device.DeviceInformation().Pairing();
+			if (!classic_pairing.IsPaired())
+			{
+				stage = "pair classic Bluetooth identity";
+				const auto pairing_result = co_await classic_pairing.PairAsync();
+				const auto status = pairing_result.Status();
+				if (status != winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::Paired &&
+					status != winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::AlreadyPaired)
+				{
+					throw BluetoothLowEnergyException("Classic Bluetooth pairing failed (status: " + std::to_string(static_cast<int>(status)) + ") - confirm pairing on the band");
+				}
+				co_await winrt::resume_after(std::chrono::milliseconds(800));
 			}
 
-			const auto service = co_await winrt::Windows::Devices::Bluetooth::Rfcomm::RfcommDeviceService::FromIdAsync(matched_info.Id());
+			const auto serial_port = winrt::Windows::Devices::Bluetooth::Rfcomm::RfcommServiceId::SerialPort();
+			winrt::Windows::Devices::Bluetooth::Rfcomm::RfcommDeviceService service = nullptr;
+			int last_rfcomm_error = 0;
+			for (int attempt = 0; attempt < 6 && service == nullptr; ++attempt)
+			{
+				stage = "query target RFCOMM serial service";
+				const auto services_result = co_await classic_device.GetRfcommServicesForIdAsync(
+					serial_port, winrt::Windows::Devices::Bluetooth::BluetoothCacheMode::Uncached);
+				last_rfcomm_error = static_cast<int>(services_result.Error());
+				const auto target_services = services_result.Services();
+				if (last_rfcomm_error == static_cast<int>(winrt::Windows::Devices::Bluetooth::BluetoothError::Success) &&
+					target_services.Size() > 0)
+				{
+					service = target_services.GetAt(0);
+					break;
+				}
+				if (attempt < 5)
+				{
+					co_await winrt::resume_after(std::chrono::milliseconds(600));
+				}
+			}
+			if (service == nullptr)
+			{
+				throw BluetoothLowEnergyException("RFCOMM Serial Port service was not published for MAC: " + mac +
+					" (BluetoothError: " + std::to_string(last_rfcomm_error) + ")");
+			}
 			auto socket = winrt::Windows::Networking::Sockets::StreamSocket();
-			co_await socket.ConnectAsync(service.ConnectionHostName(), service.ConnectionServiceName());
+			// RFCOMM advertises the protection level accepted by the service. Using
+			// the two-argument overload creates a PlainSocket, which Windows may abort
+			// shortly after pairing even though the initial exchange succeeded.
+			stage = "connect RFCOMM socket";
+			co_await socket.ConnectAsync(
+				service.ConnectionHostName(),
+				service.ConnectionServiceName(),
+				service.MaxProtectionLevel());
 
+			m_rfcomm_services[address_args] = service;
 			m_rfcomm_sockets[address_args] = socket;
-			ReadRfcommLoop(address_args);
+			auto reader = winrt::Windows::Storage::Streams::DataReader(socket.InputStream());
+			reader.InputStreamOptions(winrt::Windows::Storage::Streams::InputStreamOptions::Partial);
+			m_rfcomm_readers[address_args] = reader;
+			m_rfcomm_writers[address_args] = winrt::Windows::Storage::Streams::DataWriter(socket.OutputStream());
+			ReadRfcommLoop(address_args, generation);
 
 			result(std::vector<uint8_t>{});
 		}
 		catch (const winrt::hresult_error &ex)
 		{
+			DisconnectRfcomm(address_args);
 			const auto code = "winrt::hresult_error";
 			const auto winrt_message = ex.message();
-			const auto message = winrt::to_string(winrt_message);
+			const auto message = stage + " failed (HRESULT " +
+				std::to_string(static_cast<uint32_t>(ex.code().value)) + "): " +
+				winrt::to_string(winrt_message);
 			result(FlutterError(code, message));
 		}
 		catch (const std::exception &ex)
 		{
+			DisconnectRfcomm(address_args);
 			const auto code = "std::exception";
 			const auto message = ex.what();
 			result(FlutterError(code, message));
 		}
 	}
 
-	winrt::fire_and_forget CentralManagerImpl::ReadRfcommLoop(int64_t address_args)
+	winrt::fire_and_forget CentralManagerImpl::ReadRfcommLoop(int64_t address_args, uint64_t generation)
 	{
+		bool ended = false;
 		try
 		{
-			auto &socket = m_rfcomm_sockets[address_args].value();
-			auto reader = winrt::Windows::Storage::Streams::DataReader(socket.InputStream());
-			reader.InputStreamOptions(winrt::Windows::Storage::Streams::InputStreamOptions::Partial);
+			auto reader_it = m_rfcomm_readers.find(address_args);
+			if (reader_it == m_rfcomm_readers.end() || !reader_it->second.has_value())
+			{
+				co_return;
+			}
+			auto reader = reader_it->second.value();
 			while (true)
 			{
 				// Version replies and ACKs are commonly 14 bytes or smaller. The
@@ -270,50 +464,49 @@ namespace bluetooth_low_energy_windows
 				const auto size = co_await reader.LoadAsync(1024);
 				if (size == 0)
 				{
+					ended = true;
 					break;
 				}
 				std::vector<uint8_t> bytes(size);
 				reader.ReadBytes(bytes);
-				m_api.value().OnRfcommData(address_args, bytes, [] {}, [](const FlutterError &) {});
+				bool is_current_generation;
+				{
+					const std::lock_guard<std::mutex> lock(m_rfcomm_generation_mutex);
+					const auto generation_it = m_rfcomm_generations.find(address_args);
+					is_current_generation = generation_it != m_rfcomm_generations.end() &&
+						generation_it->second == generation;
+				}
+				if (!is_current_generation)
+				{
+					co_return;
+				}
+				PostToPlatform([address_args, bytes](CentralManagerFlutterApi &api)
+				{
+					api.OnRfcommData(address_args, bytes, [] {}, [](const FlutterError &) {});
+				});
 			}
 		}
 		catch (...)
 		{
 			// Socket closed or read error; read loop ends.
+			ended = true;
 		}
-	}
-
-	void CentralManagerImpl::ShowToast(const std::string &title_args, const std::string &body_args, std::function<void(std::optional<FlutterError> reply)> result)
-	{
-		try
+		// An RFCOMM read never produces a legitimate zero-length payload. Use an
+		// empty event as an explicit EOF signal so Dart learns about a remote close
+		// at the time it happens instead of only on the next attempted write.
+		bool is_current_generation;
 		{
-			// CreateToastNotifier() without an AUMID uses the exe name as a temporary
-			// identifier; Win10 1803+ shows the toast for such "legacy apps".
-			auto notifier = winrt::Windows::UI::Notifications::ToastNotificationManager::CreateToastNotifier();
-			winrt::Windows::Data::Xml::Dom::XmlDocument xml;
-			const auto title = winrt::to_hstring(title_args);
-			const auto body = winrt::to_hstring(body_args);
-			const auto xml_string = std::wstring(L"<toast><visual><binding template='ToastGeneric'><text>") +
-				std::wstring(title.c_str()) + L"</text><text>" + std::wstring(body.c_str()) +
-				L"</text></binding></visual></toast>";
-			xml.LoadXml(xml_string);
-			notifier.Show(winrt::Windows::UI::Notifications::ToastNotification(xml));
-			result(std::nullopt);
+			const std::lock_guard<std::mutex> lock(m_rfcomm_generation_mutex);
+			const auto generation_it = m_rfcomm_generations.find(address_args);
+			is_current_generation = generation_it != m_rfcomm_generations.end() &&
+				generation_it->second == generation;
 		}
-		catch (const winrt::hresult_error &ex)
+		if (ended && is_current_generation)
 		{
-			const auto code = "winrt::hresult_error";
-			const auto winrt_message = ex.message();
-			const auto message = winrt::to_string(winrt_message);
-			const auto error = FlutterError(code, message);
-			result(error);
-		}
-		catch (const std::exception &ex)
-		{
-			const auto code = "std::exception";
-			const auto message = ex.what();
-			const auto error = FlutterError(code, message);
-			result(error);
+			PostToPlatform([address_args](CentralManagerFlutterApi &api)
+			{
+				api.OnRfcommData(address_args, std::vector<uint8_t>{}, [] {}, [](const FlutterError &) {});
+			});
 		}
 	}
 
@@ -326,9 +519,15 @@ namespace bluetooth_low_energy_windows
 			// Async: Windows shows the system pairing UI; co_await does not block the platform thread.
 			const auto id_string = device.BluetoothDeviceId().Id();
 			const auto device_info = co_await winrt::Windows::Devices::Enumeration::DeviceInformation::CreateFromIdAsync(id_string);
+			if (device_info.Pairing().IsPaired())
+			{
+				result(std::nullopt);
+				co_return;
+			}
 			const auto pairing_result = co_await device_info.Pairing().PairAsync();
 			const auto status = pairing_result.Status();
-			if (status != winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::Paired)
+			if (status != winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::Paired &&
+				status != winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::AlreadyPaired)
 			{
 				throw BluetoothLowEnergyException("Pair failed: status != Paired");
 			}
@@ -351,16 +550,57 @@ namespace bluetooth_low_energy_windows
 		}
 	}
 
+	winrt::fire_and_forget CentralManagerImpl::UnpairIfPairedAsync(int64_t address_args, std::function<void(ErrorOr<bool> reply)> result)
+	{
+		try
+		{
+			// GATT may be unreachable specifically because an old Windows pairing
+			// is stale. Resolve from the advertised MAC instead of requiring an
+			// already connected entry in m_devices.
+			const auto device = co_await winrt::Windows::Devices::Bluetooth::BluetoothLEDevice::FromBluetoothAddressAsync(
+				static_cast<uint64_t>(address_args));
+			if (device == nullptr)
+			{
+				throw BluetoothLowEnergyException("Bluetooth device not found while checking pairing");
+			}
+			const auto id_string = device.BluetoothDeviceId().Id();
+			const auto device_info = co_await winrt::Windows::Devices::Enumeration::DeviceInformation::CreateFromIdAsync(id_string);
+			auto pairing = device_info.Pairing();
+			if (!pairing.IsPaired())
+			{
+				result(false);
+				co_return;
+			}
+			const auto unpair_result = co_await pairing.UnpairAsync();
+			const auto status = unpair_result.Status();
+			if (status != winrt::Windows::Devices::Enumeration::DeviceUnpairingResultStatus::Unpaired)
+			{
+				throw BluetoothLowEnergyException("Unpair failed: status != Unpaired");
+			}
+			OnDisconnected(address_args);
+			result(true);
+		}
+		catch (const winrt::hresult_error &ex)
+		{
+			result(FlutterError("winrt::hresult_error", winrt::to_string(ex.message())));
+		}
+		catch (const std::exception &ex)
+		{
+			result(FlutterError("std::exception", ex.what()));
+		}
+	}
+
 	std::optional<FlutterError> CentralManagerImpl::Disconnect(int64_t address_args)
 	{
 		try
 		{
 			OnDisconnected(address_args);
-			auto &api = m_api.value();
 			const auto peripheral_args = PeripheralArgs(address_args);
 			const auto state_args = ConnectionStateArgs::kDisconnected;
-			// TODO: Make this thread safe when this issue closed: https://github.com/flutter/flutter/issues/134346.
-			api.OnConnectionStateChanged(peripheral_args, state_args, [] {}, [](auto error) {});
+			PostToPlatform([peripheral_args, state_args](CentralManagerFlutterApi &api)
+			{
+				api.OnConnectionStateChanged(peripheral_args, state_args, [] {}, [](auto error) {});
+			});
 			return std::nullopt;
 		}
 		catch (const winrt::hresult_error &ex)
@@ -463,11 +703,12 @@ namespace bluetooth_low_energy_windows
 						winrt::auto_revoke,
 						[this](winrt::Windows::Devices::Radios::Radio radio, auto obj)
 						{
-							auto &api = m_api.value();
 							const auto state = radio.State();
 							const auto state_args = RadioStateToArgs(state);
-							// TODO: Make this thread safe when this issue closed: https://github.com/flutter/flutter/issues/134346.
-							api.OnStateChanged(state_args, [] {}, [](auto error) {});
+							PostToPlatform([state_args](CentralManagerFlutterApi &api)
+							{
+								api.OnStateChanged(state_args, [] {}, [](auto error) {});
+							});
 						});
 					m_radio = radio;
 				}
@@ -486,7 +727,6 @@ namespace bluetooth_low_energy_windows
 				winrt::auto_revoke,
 				[this](winrt::Windows::Devices::Bluetooth::Advertisement::BluetoothLEAdvertisementWatcher watcher, winrt::Windows::Devices::Bluetooth::Advertisement::BluetoothLEAdvertisementReceivedEventArgs event_args)
 				{
-					auto &api = m_api.value();
 					const auto address = event_args.BluetoothAddress();
 					const auto address_args = static_cast<int64_t>(address);
 					const auto peripheral_args = PeripheralArgs(address_args);
@@ -499,8 +739,10 @@ namespace bluetooth_low_energy_windows
 					const auto type_args = AdvertisementTypeToArgs(type);
 					const auto advertisement = event_args.Advertisement();
 					const auto advertisement_args = AdvertisementToArgs(advertisement);
-					// TODO: Make this thread safe when this issue closed: https://github.com/flutter/flutter/issues/134346.
-					api.OnDiscovered(peripheral_args, rssi_args, timestamp_args, type_args, advertisement_args, [] {}, [](auto error) {});
+					PostToPlatform([peripheral_args, rssi_args, timestamp_args, type_args, advertisement_args](CentralManagerFlutterApi &api)
+					{
+						api.OnDiscovered(peripheral_args, rssi_args, timestamp_args, type_args, advertisement_args, [] {}, [](auto error) {});
+					});
 				});
 			result(std::nullopt);
 		}
@@ -542,13 +784,15 @@ namespace bluetooth_low_energy_windows
 				const auto message = "Connect failed with status: " + std::to_string(status_code);
 				throw BluetoothLowEnergyException(message);
 			}
-			auto &api = m_api.value();
 			const auto peripheral_args = PeripheralArgs(address_args);
 			const auto state_args = ConnectionStateArgs::kConnected;
 			const auto mtu = session.MaxPduSize();
 			const auto mtu_args = static_cast<int64_t>(mtu);
-			api.OnConnectionStateChanged(peripheral_args, state_args, [] {}, [](auto error) {});
-			api.OnMTUChanged(peripheral_args, mtu_args, [] {}, [](auto error) {});
+			PostToPlatform([peripheral_args, state_args, mtu_args](CentralManagerFlutterApi &api)
+			{
+				api.OnConnectionStateChanged(peripheral_args, state_args, [] {}, [](auto error) {});
+				api.OnMTUChanged(peripheral_args, mtu_args, [] {}, [](auto error) {});
+			});
 			m_device_connection_status_changed_revokers[address_args] = device.ConnectionStatusChanged(
 				winrt::auto_revoke,
 				[this, address_args](winrt::Windows::Devices::Bluetooth::BluetoothLEDevice device, auto obj)
@@ -558,21 +802,23 @@ namespace bluetooth_low_energy_windows
 					{
 						OnDisconnected(address_args);
 					}
-					auto &api = m_api.value();
 					const auto peripheral_args = PeripheralArgs(address_args);
 					const auto state_args = ConnectionStatusToArgs(status);
-					// TODO: Make this thread safe when this issue closed: https://github.com/flutter/flutter/issues/134346.
-					api.OnConnectionStateChanged(peripheral_args, state_args, [] {}, [](auto error) {});
+					PostToPlatform([peripheral_args, state_args](CentralManagerFlutterApi &api)
+					{
+						api.OnConnectionStateChanged(peripheral_args, state_args, [] {}, [](auto error) {});
+					});
 				});
 			m_session_max_pdu_size_changed_revokers[address_args] = session.MaxPduSizeChanged(
 				winrt::auto_revoke,
 				[this, peripheral_args](winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattSession session, auto obj)
 				{
-					auto &api = m_api.value();
 					const auto mtu = session.MaxPduSize();
 					const auto mtu_args = static_cast<int64_t>(mtu);
-					// TODO: Make this thread safe when this issue closed: https://github.com/flutter/flutter/issues/134346.
-					api.OnMTUChanged(peripheral_args, mtu_args, [] {}, [](auto error) {});
+					PostToPlatform([peripheral_args, mtu_args](CentralManagerFlutterApi &api)
+					{
+						api.OnMTUChanged(peripheral_args, mtu_args, [] {}, [](auto error) {});
+					});
 				});
 			m_devices[address_args] = device;
 			m_sessions[address_args] = session;
@@ -706,7 +952,6 @@ namespace bluetooth_low_energy_windows
 					winrt::auto_revoke,
 					[this, address_args](const winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattCharacteristic &characteristic, const winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattValueChangedEventArgs &event_args)
 					{
-						auto &api = m_api.value();
 						const auto peripheral_args = PeripheralArgs(address_args);
 						const auto characteristic_args = CharacteristicToArgs(characteristic);
 						const auto value = event_args.CharacteristicValue();
@@ -714,8 +959,10 @@ namespace bluetooth_low_energy_windows
 						auto value_args = std::vector<uint8_t>(value_length);
 						const auto value_reader = winrt::Windows::Storage::Streams::DataReader::FromBuffer(value);
 						value_reader.ReadBytes(value_args);
-						// TODO: Make this thread safe when this issue closed: https://github.com/flutter/flutter/issues/134346.
-						api.OnCharacteristicNotified(peripheral_args, characteristic_args, value_args, []() {}, [](const auto &error) {});
+						PostToPlatform([peripheral_args, characteristic_args, value_args](CentralManagerFlutterApi &api)
+						{
+							api.OnCharacteristicNotified(peripheral_args, characteristic_args, value_args, []() {}, [](const auto &error) {});
+						});
 					});
 				m_characteristics[address_args][characteristic_handle_args] = characteristic;
 				characteristics_args.emplace_back(characteristic_args_value);
