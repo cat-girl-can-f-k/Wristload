@@ -1,5 +1,4 @@
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -80,8 +79,9 @@ class _ToolsPageState extends State<ToolsPage> {
     }
   }
 
-  void _copy(String value) {
-    Clipboard.setData(ClipboardData(text: value));
+  Future<void> _copy(String value) async {
+    await Clipboard.setData(ClipboardData(text: value));
+    if (!mounted) return;
     ScaffoldMessenger.of(context)
         .showSnackBar(const SnackBar(content: Text('已复制')));
   }
@@ -279,7 +279,10 @@ class _ToolsPageState extends State<ToolsPage> {
                   Container(
                     width: double.infinity,
                     padding: const EdgeInsets.all(12),
-                    color: const Color(0xFF3A322A),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF3A322A),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
                     child: const Text(
                       '在您计算解锁码之前，我们强烈建议您先尝试使用连续插拔设备充电器百余次的方法让设备重启三次触发保护恢复出厂设置这种更便捷的方法删除密码。',
                       style: TextStyle(color: Color(0xFFD9B48A)),

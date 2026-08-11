@@ -8,7 +8,7 @@ enum UnlockAlgorithm { old, newer }
 String normalizeUnlockSn(String value) => value.trim().toUpperCase();
 
 String normalizeUnlockMac(String value) =>
-    value.toUpperCase().replaceAll(RegExp(r'[:\-\s.]'), '');
+    value.toUpperCase().replaceAll(RegExp(r'[：:\-\s.]'), '');
 
 bool isValidUnlockSn(String value) => normalizeUnlockSn(value).length >= 4;
 

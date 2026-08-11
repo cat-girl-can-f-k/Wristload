@@ -17,7 +17,7 @@ void main() {
       expect(
         computeUnlockCode(
           ' ABC123456789 ',
-          'AA-BB-CC-DD-EE-FF',
+          'AA：BB：CC：DD：EE：FF',
           algorithm: UnlockAlgorithm.newer,
         ),
         '6164267340',

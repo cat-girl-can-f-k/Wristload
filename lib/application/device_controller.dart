@@ -54,7 +54,15 @@ class DeviceController extends ChangeNotifier {
   /// 设备存储（字节），null 表示未取到。
   int? storageUsedBytes;
   int? storageTotalBytes;
-  bool _statusRefreshInProgress = false;
+  int _sessionEpoch = 0;
+  int? _statusRefreshEpoch;
+
+  bool get statusRefreshInProgress => _statusRefreshEpoch != null;
+
+  void _advanceSessionEpoch() {
+    _sessionEpoch++;
+    _statusRefreshEpoch = null;
+  }
 
   /// 安装队列（串行执行）。
   final List<QueueEntry> installQueue = [];
@@ -103,10 +111,9 @@ class DeviceController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 清空已完成/失败/取消的条目。
+  /// 只清空已成功完成的条目，失败或取消项保留以便重试。
   void clearCompletedQueue() {
-    installQueue.removeWhere((e) =>
-        e.stage != QueueStage.waiting && e.stage != QueueStage.installing);
+    installQueue.removeWhere((entry) => entry.stage == QueueStage.done);
     notifyListeners();
   }
 
@@ -131,7 +138,7 @@ class DeviceController extends ChangeNotifier {
             task.kind == next.request.kind &&
             task.fileName == next.request.metadata.fileName &&
             task.md5Hex == next.request.metadata.md5Hex;
-        if (!producedTask || task == null) {
+        if (!producedTask) {
           next
             ..stage = QueueStage.waiting
             ..message = task?.message;
@@ -465,6 +472,7 @@ class DeviceController extends ChangeNotifier {
   /// probe and is prone to stale Windows "connected" state failures.
   Future<void> _connectWindowsV2(
       Peripheral peripheral, DeviceProfile profile) async {
+    _advanceSessionEpoch();
     error = null;
     sessionReady = false;
     connectedFirmwareVersion = null;
@@ -500,6 +508,7 @@ class DeviceController extends ChangeNotifier {
     Peripheral peripheral, {
     bool resetWindowsPairing = false,
   }) async {
+    _advanceSessionEpoch();
     error = null;
     sessionReady = false;
     connectedFirmwareVersion = null;
@@ -791,8 +800,10 @@ class DeviceController extends ChangeNotifier {
         final (type, payload) = packet;
         _log('SppPacket 回包：type=$type payload=${_hex(payload)}');
         if (type == 106) {
-          _log('  ★ 设备版本：'
-              '${payload.map((b) => b.toRadixString(16).padLeft(2, '0')).join('.')}');
+          connectedFirmwareVersion = payload
+              .map((byte) => byte.toRadixString(16).padLeft(2, '0'))
+              .join('.');
+          _log('  ★ 设备版本：$connectedFirmwareVersion');
           _log('版本确认。发送 L1START_REQ（L1 CMD 帧）…');
           unawaited(_sppSendL1Start());
         } else {
@@ -823,6 +834,7 @@ class DeviceController extends ChangeNotifier {
         _postAuthReconnectAttempts == 0 &&
         !_recoveringPostAuthClose &&
         !_installInProgress;
+    _advanceSessionEpoch();
     sessionReady = false;
     _authenticatedAt = null;
     if (!isTransportTransition) {
@@ -1148,6 +1160,7 @@ class DeviceController extends ChangeNotifier {
       bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
 
   Future<void> disconnect() async {
+    _advanceSessionEpoch();
     if (_installInProgress) {
       await cancelInstall();
       _log('RFCOMM/GATT 正在断开：安装已停止，设备可能保留部分数据。');
@@ -1196,7 +1209,7 @@ class DeviceController extends ChangeNotifier {
       _log('安装被拒绝：系统时间同步正在进行，请等待同步完成。');
       return;
     }
-    if (_statusRefreshInProgress) {
+    if (statusRefreshInProgress) {
       _log('安装被拒绝：正在读取设备状态，请等待完成。');
       return;
     }
@@ -1697,13 +1710,21 @@ class DeviceController extends ChangeNotifier {
   }
 
   Future<void> _refreshAuthenticatedDeviceStatus() async {
-    if (_statusRefreshInProgress || !sessionReady || _sessionCipher == null) {
+    final session = _sessionCipher;
+    final refreshEpoch = _sessionEpoch;
+    if (_statusRefreshEpoch != null || !sessionReady || session == null) {
       return;
     }
-    _statusRefreshInProgress = true;
+    _statusRefreshEpoch = refreshEpoch;
+    notifyListeners();
     try {
-      await syncSystemTime(automatic: true);
-      if (!sessionReady || _sessionCipher == null) return;
+      final synced = await syncSystemTime(automatic: true);
+      if (!synced ||
+          refreshEpoch != _sessionEpoch ||
+          !sessionReady ||
+          !identical(_sessionCipher, session)) {
+        return;
+      }
       final response = await _requestBusiness(
         Zau(
             command: ZauCommand.queryStorageSpace,
@@ -1713,6 +1734,11 @@ class DeviceController extends ChangeNotifier {
         responseCommand: 4,
         responseSub: ZauModule.storageManager,
       );
+      if (refreshEpoch != _sessionEpoch ||
+          !sessionReady ||
+          !identical(_sessionCipher, session)) {
+        return;
+      }
       final payload = response.payload;
       if (payload == null || payload.$1 != 4) {
         throw const FormatException('存储响应缺少 ysr 载荷');
@@ -1725,7 +1751,10 @@ class DeviceController extends ChangeNotifier {
     } on Object catch (exception) {
       _log('读取设备存储失败，保持未知状态：$exception');
     } finally {
-      _statusRefreshInProgress = false;
+      if (_statusRefreshEpoch == refreshEpoch) {
+        _statusRefreshEpoch = null;
+        notifyListeners();
+      }
     }
   }
 

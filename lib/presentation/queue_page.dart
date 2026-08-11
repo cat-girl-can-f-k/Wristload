@@ -23,9 +23,8 @@ class QueuePage extends StatelessWidget {
               final queue = controller.installQueue;
               final total = queue.length;
               final installing = controller.installingCount;
-              final hasCompleted = queue.any((entry) =>
-                  entry.stage != QueueStage.waiting &&
-                  entry.stage != QueueStage.installing);
+              final hasCompleted =
+                  queue.any((entry) => entry.stage == QueueStage.done);
               final hasStarted =
                   queue.any((entry) => entry.stage != QueueStage.waiting);
               final installingLabel =
@@ -52,7 +51,11 @@ class QueuePage extends StatelessWidget {
                         ),
                         const SizedBox(width: 4),
                         FilledButton.icon(
-                          onPressed: controller.pendingCount > 0
+                          onPressed: controller.pendingCount > 0 &&
+                                  controller.sessionReady &&
+                                  !controller.installInProgress &&
+                                  !controller.timeSyncInProgress &&
+                                  !controller.statusRefreshInProgress
                               ? controller.runQueue
                               : null,
                           icon: const Icon(Icons.play_arrow),
@@ -209,7 +212,10 @@ class _QueueStatusIndicator extends StatelessWidget {
           onTap: () => controller.retryQueueEntry(entry),
         );
       case QueueStage.cancelled:
-        return const _StatusChip(label: '已取消');
+        return _StatusChip(
+          label: '已取消 · 重试',
+          onTap: () => controller.retryQueueEntry(entry),
+        );
       case QueueStage.stateUnknown:
         return _StatusChip(
           label: '状态未知 · 重试',

@@ -447,6 +447,14 @@ class HomePage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final device = controller.connectedDevice;
+    final battery = controller.batteryPercent;
+    final hasBattery = battery != null && battery >= 0 && battery <= 100;
+    final storageUsed = controller.storageUsedBytes;
+    final storageTotal = controller.storageTotalBytes;
+    final hasStorage = storageUsed != null &&
+        storageTotal != null &&
+        storageTotal > 0 &&
+        storageUsed <= storageTotal;
     return SafeArea(
       child: Align(
         alignment: Alignment.topCenter,
@@ -487,52 +495,32 @@ class HomePage extends StatelessWidget {
                               ),
                           ],
                         ),
-                        if (device != null &&
-                            (controller.batteryPercent != null ||
-                                (controller.storageUsedBytes != null &&
-                                    controller.storageTotalBytes != null &&
-                                    controller.storageTotalBytes! > 0 &&
-                                    controller.storageUsedBytes! <=
-                                        controller.storageTotalBytes!))) ...[
+                        if (device != null && (hasBattery || hasStorage)) ...[
                           const SizedBox(height: 12),
                           Row(
                             children: [
-                              if (controller.batteryPercent != null)
+                              if (hasBattery)
                                 Expanded(
                                   child: _DeviceStat(
                                     icon: Icons.battery_std,
-                                    value: '${controller.batteryPercent}%',
+                                    value: '$battery%',
                                     detail: '电量',
-                                    progress:
-                                        (controller.batteryPercent ?? 0) / 100,
-                                    progressColor:
-                                        (controller.batteryPercent ?? 100) < 20
-                                            ? Theme.of(context)
-                                                .colorScheme
-                                                .error
-                                            : null,
+                                    progress: battery / 100,
+                                    progressColor: battery < 20
+                                        ? Theme.of(context).colorScheme.error
+                                        : null,
                                   ),
                                 ),
-                              if (controller.batteryPercent != null &&
-                                  controller.storageUsedBytes != null &&
-                                  controller.storageTotalBytes != null &&
-                                  controller.storageTotalBytes! > 0 &&
-                                  controller.storageUsedBytes! <=
-                                      controller.storageTotalBytes!)
+                              if (hasBattery && hasStorage)
                                 const SizedBox(width: 12),
-                              if (controller.storageUsedBytes != null &&
-                                  controller.storageTotalBytes != null &&
-                                  controller.storageTotalBytes! > 0 &&
-                                  controller.storageUsedBytes! <=
-                                      controller.storageTotalBytes!)
+                              if (hasStorage)
                                 Expanded(
                                   child: _DeviceStat(
                                     icon: Icons.sd_storage,
                                     value:
-                                        '${_formatBytes(controller.storageUsedBytes!)} / ${_formatBytes(controller.storageTotalBytes!)}',
+                                        '${_formatBytes(storageUsed)} / ${_formatBytes(storageTotal)}',
                                     detail: '存储',
-                                    progress: controller.storageUsedBytes! /
-                                        controller.storageTotalBytes!,
+                                    progress: storageUsed / storageTotal,
                                   ),
                                 ),
                             ],
@@ -584,7 +572,8 @@ class HomePage extends StatelessWidget {
                     children: [
                       OutlinedButton.icon(
                         onPressed: !controller.installInProgress &&
-                                !controller.timeSyncInProgress
+                                !controller.timeSyncInProgress &&
+                                !controller.statusRefreshInProgress
                             ? controller.syncSystemTime
                             : null,
                         icon: controller.timeSyncInProgress
@@ -628,7 +617,8 @@ class HomePage extends StatelessWidget {
                   preferredTarget: preferredInstallTarget,
                   enabled: controller.sessionReady &&
                       !controller.installInProgress &&
-                      !controller.timeSyncInProgress,
+                      !controller.timeSyncInProgress &&
+                      !controller.statusRefreshInProgress,
                   onInstall: (target) => _pickAndTry(context, target),
                 ),
                 if (controller.latestTask case final task?)
@@ -681,7 +671,12 @@ class _DeviceStat extends StatelessWidget {
             children: [
               Icon(icon, size: 18, color: theme.colorScheme.primary),
               const SizedBox(width: 6),
-              Text(detail, style: theme.textTheme.bodySmall),
+              Text(
+                detail,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
             ],
           ),
           const SizedBox(height: 4),
@@ -693,6 +688,7 @@ class _DeviceStat extends StatelessWidget {
           const SizedBox(height: 6),
           LinearProgressIndicator(
             value: progress.clamp(0.0, 1.0),
+            minHeight: 4,
             color: progressColor ?? theme.colorScheme.primary,
           ),
         ],

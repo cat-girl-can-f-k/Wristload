@@ -11,12 +11,12 @@ class DeviceInfoPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final device = controller.connectedDevice;
     return Scaffold(
       appBar: AppBar(title: const Text('设备信息')),
       body: ListenableBuilder(
         listenable: controller,
         builder: (context, _) {
+          final device = controller.connectedDevice;
           final mac =
               device == null ? null : _formatMac(device.uuid.toString());
           final firmware = controller.connectedFirmwareVersion;
@@ -66,7 +66,7 @@ class DeviceInfoPage extends StatelessWidget {
                         },
                       ),
               ),
-              if (battery != null)
+              if (battery != null && battery >= 0 && battery <= 100)
                 ListTile(
                   leading: const Icon(Icons.battery_std),
                   title: const Text('电量'),
