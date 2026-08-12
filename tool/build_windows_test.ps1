@@ -41,6 +41,9 @@ try {
   Write-Host '== Toolchain =='
   Invoke-Checked -FilePath $flutter -Arguments @('--version')
 
+  Write-Host '== Dependencies =='
+  Invoke-Checked -FilePath $flutter -Arguments @('pub', 'get')
+
   Write-Host '== Static analysis =='
   Invoke-Checked -FilePath $dart -Arguments @('analyze')
 
@@ -52,7 +55,7 @@ try {
   Invoke-Checked -FilePath $flutter -Arguments @('build', 'windows', '--debug')
 
   $buildDirectory = Join-Path $projectRoot 'build\windows\x64\runner\Debug'
-  $exe = Join-Path $buildDirectory 'miwearable_install_tool.exe'
+  $exe = Join-Path $buildDirectory 'wristload.exe'
   $required = @(
     $exe,
     (Join-Path $buildDirectory 'flutter_windows.dll'),
@@ -145,7 +148,7 @@ try {
     $betaVersion = "beta$($latestBeta.Major).$($latestBeta.Minor).$nextPatch"
   }
   $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-  $artifactName = "MiWearableInstallTool-$betaVersion-windows-x64-debug-test-$stamp"
+  $artifactName = "Wristload-$betaVersion-windows-x64-debug-test-$stamp"
   $zipName = "$artifactName.zip"
   $zipPath = Join-Path $OutputRoot $zipName
   $versionDirectory = Join-Path $OutputRoot $betaVersion
@@ -156,7 +159,7 @@ try {
     throw "Refusing to overwrite an existing ZIP: $zipPath"
   }
 
-  $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) "MiWearableInstallTool-$([guid]::NewGuid().ToString('N'))"
+  $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) "Wristload-$([guid]::NewGuid().ToString('N'))"
   $artifactDirectory = Join-Path $temporaryRoot $artifactName
   $extractedDirectory = Join-Path $temporaryRoot 'extracted'
   New-Item -ItemType Directory -Path $artifactDirectory -Force | Out-Null
@@ -216,27 +219,34 @@ try {
       throw "Required runtime file is missing after ZIP extraction: $extractedPath"
     }
   }
-  $finalExe = Join-Path $versionDirectory 'miwearable_install_tool.exe'
-  Write-Host '== Launch extracted beta version =='
-  $normalizedOutputRoot = [IO.Path]::GetFullPath($OutputRoot).TrimEnd('\') + '\'
-  Get-Process -Name 'miwearable_install_tool' -ErrorAction SilentlyContinue |
-    Where-Object {
-      try {
-        $_.Path.StartsWith($normalizedOutputRoot, [StringComparison]::OrdinalIgnoreCase) -and
-          -not $_.Path.Equals($finalExe, [StringComparison]::OrdinalIgnoreCase)
-      } catch {
-        $false
-      }
-    } | Stop-Process -Force
-  $finalProcess = Start-Process -FilePath $finalExe -WorkingDirectory $versionDirectory -PassThru
-  Start-Sleep -Milliseconds 500
-  if ($finalProcess.HasExited) {
-    throw "Extracted beta application exited immediately with code $($finalProcess.ExitCode)."
+  $finalExe = Join-Path $versionDirectory 'wristload.exe'
+  $finalProcess = $null
+  if (-not $SkipSmokeTest) {
+    Write-Host '== Launch extracted beta version =='
+    $normalizedOutputRoot = [IO.Path]::GetFullPath($OutputRoot).TrimEnd('\') + '\'
+    Get-Process -Name 'wristload' -ErrorAction SilentlyContinue |
+      Where-Object {
+        try {
+          $_.Path.StartsWith($normalizedOutputRoot, [StringComparison]::OrdinalIgnoreCase) -and
+            -not $_.Path.Equals($finalExe, [StringComparison]::OrdinalIgnoreCase)
+        } catch {
+          $false
+        }
+      } | Stop-Process -Force
+    $finalProcess = Start-Process -FilePath $finalExe -WorkingDirectory $versionDirectory -PassThru
+    Start-Sleep -Milliseconds 500
+    if ($finalProcess.HasExited) {
+      throw "Extracted beta application exited immediately with code $($finalProcess.ExitCode)."
+    }
   }
 
   Write-Host "Beta version: $betaVersion"
   Write-Host "Extracted directory: $versionDirectory"
-  Write-Host "Final process ID: $($finalProcess.Id)"
+  if ($null -ne $finalProcess) {
+    Write-Host "Final process ID: $($finalProcess.Id)"
+  } else {
+    Write-Host 'Final process: not started'
+  }
   Write-Host "ZIP: $zipPath"
   Write-Host "SHA-256: $zipHash"
 } finally {

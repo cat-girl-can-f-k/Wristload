@@ -2,7 +2,7 @@ import 'dart:convert';
 
 import 'package:archive/archive.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:miwearable_install_tool/domain/device_tools.dart';
+import 'package:wristload/domain/device_tools.dart';
 
 void main() {
   group('unlock code', () {

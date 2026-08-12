@@ -38,11 +38,11 @@ Future<void> main(List<String> args) async {
       return;
     }
   }
-  runApp(MiWearableApp(desktopIntegrationEnabled: Platform.isWindows));
+  runApp(WristloadApp(desktopIntegrationEnabled: Platform.isWindows));
 }
 
-class MiWearableApp extends StatefulWidget {
-  const MiWearableApp({
+class WristloadApp extends StatefulWidget {
+  const WristloadApp({
     this.desktopIntegrationEnabled = false,
     super.key,
   });
@@ -50,10 +50,10 @@ class MiWearableApp extends StatefulWidget {
   final bool desktopIntegrationEnabled;
 
   @override
-  State<MiWearableApp> createState() => _MiWearableAppState();
+  State<WristloadApp> createState() => _WristloadAppState();
 }
 
-class _MiWearableAppState extends State<MiWearableApp> {
+class _WristloadAppState extends State<WristloadApp> {
   final controller = DeviceController();
   final _appShellKey = GlobalKey<_AppShellState>();
   final _installRequestPreflight = const InstallRequestPreflight();
@@ -201,7 +201,7 @@ class _AppShellState extends State<AppShell> {
   @override
   Widget build(BuildContext context) => Scaffold(
         appBar: AppBar(
-          title: const Text('MiWearable 安装工具'),
+          title: const Text('Wristload'),
         ),
         body: SafeArea(
           child: Row(

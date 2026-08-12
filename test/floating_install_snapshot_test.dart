@@ -1,9 +1,9 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:miwearable_install_tool/application/floating_install_snapshot_mapper.dart';
-import 'package:miwearable_install_tool/application/device_controller.dart';
-import 'package:miwearable_install_tool/domain/floating_install_snapshot.dart';
-import 'package:miwearable_install_tool/domain/install_models.dart';
-import 'package:miwearable_install_tool/domain/install_task.dart';
+import 'package:wristload/application/floating_install_snapshot_mapper.dart';
+import 'package:wristload/application/device_controller.dart';
+import 'package:wristload/domain/floating_install_snapshot.dart';
+import 'package:wristload/domain/install_models.dart';
+import 'package:wristload/domain/install_task.dart';
 
 void main() {
   test('floating snapshot survives a method-channel map round trip', () {

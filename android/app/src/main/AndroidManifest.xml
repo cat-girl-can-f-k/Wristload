@@ -9,7 +9,7 @@
     <!-- Required on Android 11 and earlier for BLE scan results. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
     <application
-        android:label="MiWearable 安装工具"
+        android:label="Wristload"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

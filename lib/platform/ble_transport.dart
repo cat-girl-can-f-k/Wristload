@@ -228,8 +228,8 @@ class BleTransport {
   StreamSubscription<dynamic>? _androidRfcommSubscription;
   Stream<Uint8List> get rfcommData => _rfcommDataController.stream;
 
-  static const _androidMethods = MethodChannel('miwearable/rfcomm');
-  static const _androidEvents = EventChannel('miwearable/rfcomm/events');
+  static const _androidMethods = MethodChannel('wristload/rfcomm');
+  static const _androidEvents = EventChannel('wristload/rfcomm/events');
   bool get _isAndroid => defaultTargetPlatform == TargetPlatform.android;
 
   void _requireWindowsOrAndroid() {

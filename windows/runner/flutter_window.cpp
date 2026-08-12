@@ -30,16 +30,24 @@ bool IsValidAuthKey(const std::string& value) {
   return true;
 }
 
-std::filesystem::path AuthKeyPath() {
+std::filesystem::path LocalAppDataPath() {
   PWSTR raw_path = nullptr;
   if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &raw_path))) {
     throw std::runtime_error("Unable to find LocalAppData");
   }
-  const std::filesystem::path directory =
-      std::filesystem::path(raw_path) / L"MiWearableInstallTool";
+  const std::filesystem::path path(raw_path);
   CoTaskMemFree(raw_path);
+  return path;
+}
+
+std::filesystem::path AuthKeyPath() {
+  const std::filesystem::path directory = LocalAppDataPath() / L"Wristload";
   std::filesystem::create_directories(directory);
   return directory / L"authkey.dpapi";
+}
+
+std::filesystem::path LegacyAuthKeyPath() {
+  return LocalAppDataPath() / L"MiWearableInstallTool" / L"authkey.dpapi";
 }
 
 void WriteProtectedAuthKey(const std::string& value) {
@@ -49,7 +57,7 @@ void WriteProtectedAuthKey(const std::string& value) {
   DATA_BLOB input{static_cast<DWORD>(value.size()),
                   reinterpret_cast<BYTE*>(const_cast<char*>(value.data()))};
   DATA_BLOB protected_data{};
-  if (!CryptProtectData(&input, L"MiWearable authkey", nullptr, nullptr, nullptr,
+  if (!CryptProtectData(&input, L"Wristload authkey", nullptr, nullptr, nullptr,
                         CRYPTPROTECT_UI_FORBIDDEN, &protected_data)) {
     throw std::runtime_error("Windows DPAPI encryption failed");
   }
@@ -60,8 +68,8 @@ void WriteProtectedAuthKey(const std::string& value) {
   if (!output) throw std::runtime_error("Unable to store protected authkey");
 }
 
-std::optional<std::string> ReadProtectedAuthKey() {
-  const auto path = AuthKeyPath();
+std::optional<std::string> ReadProtectedAuthKeyAt(
+    const std::filesystem::path& path) {
   if (!std::filesystem::exists(path)) return std::nullopt;
   std::ifstream input(path, std::ios::binary | std::ios::ate);
   const auto size = input.tellg();
@@ -85,9 +93,26 @@ std::optional<std::string> ReadProtectedAuthKey() {
   return value;
 }
 
+std::optional<std::string> ReadProtectedAuthKey() {
+  const auto current = ReadProtectedAuthKeyAt(AuthKeyPath());
+  if (current) return current;
+
+  const auto legacy = ReadProtectedAuthKeyAt(LegacyAuthKeyPath());
+  if (legacy) WriteProtectedAuthKey(*legacy);
+  return legacy;
+}
+
+void DeleteProtectedAuthKey() {
+  for (const auto& path : {AuthKeyPath(), LegacyAuthKeyPath()}) {
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    if (error) throw std::runtime_error("Unable to remove protected authkey");
+  }
+}
+
 void RegisterSecureStore(flutter::BinaryMessenger* messenger) {
   auto channel = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
-      messenger, "miwearable/secure_store", &flutter::StandardMethodCodec::GetInstance());
+      messenger, "wristload/secure_store", &flutter::StandardMethodCodec::GetInstance());
   channel->SetMethodCallHandler(
       [](const auto& call, auto result) {
         try {
@@ -101,9 +126,7 @@ void RegisterSecureStore(flutter::BinaryMessenger* messenger) {
             WriteProtectedAuthKey(*value);
             result->Success();
           } else if (call.method_name() == "delete") {
-            std::error_code error;
-            std::filesystem::remove(AuthKeyPath(), error);
-            if (error) throw std::runtime_error("Unable to remove protected authkey");
+            DeleteProtectedAuthKey();
             result->Success();
           } else {
             result->NotImplemented();
@@ -182,7 +205,7 @@ flutter::EncodableMap ReadSystemTimeInfo() {
 
 void RegisterSystemTime(flutter::BinaryMessenger* messenger) {
   auto channel = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
-      messenger, "miwearable/system_time",
+      messenger, "wristload/system_time",
       &flutter::StandardMethodCodec::GetInstance());
   channel->SetMethodCallHandler([](const auto& call, auto result) {
     try {

@@ -3,7 +3,7 @@ import 'dart:io';
 
 import 'package:archive/archive.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:miwearable_install_tool/domain/firmware_package_inspector.dart';
+import 'package:wristload/domain/firmware_package_inspector.dart';
 
 void main() {
   late Directory tempDirectory;

@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.miwearable_install_tool"
+    namespace = "com.example.wristload"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -15,7 +15,8 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
+        // The deployment ID remains stable across the Wristload rebrand so
+        // installed copies can upgrade in place and migrate their encrypted authkey.
         applicationId = "com.example.miwearable_install_tool"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.

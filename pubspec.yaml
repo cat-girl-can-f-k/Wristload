@@ -1,4 +1,4 @@
-name: miwearable_install_tool
+name: wristload
 description: Experimental cross-platform installer for selected Xiaomi Vela wearables.
 publish_to: none
 version: 0.1.0+1

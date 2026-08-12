@@ -1,7 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:miwearable_install_tool/domain/install_models.dart';
-import 'package:miwearable_install_tool/domain/install_task.dart';
-import 'package:miwearable_install_tool/domain/queue_file_importer.dart';
+import 'package:wristload/domain/install_models.dart';
+import 'package:wristload/domain/install_task.dart';
+import 'package:wristload/domain/queue_file_importer.dart';
 
 void main() {
   final metadata = InstallMetadata(

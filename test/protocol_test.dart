@@ -5,23 +5,23 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:archive/archive.dart';
-import 'package:miwearable_install_tool/domain/protocol/auth_handshake.dart';
-import 'package:miwearable_install_tool/domain/protocol/hci_decoder.dart';
-import 'package:miwearable_install_tool/domain/protocol/mass_transfer.dart';
-import 'package:miwearable_install_tool/domain/protocol/session_cipher.dart';
+import 'package:wristload/domain/protocol/auth_handshake.dart';
+import 'package:wristload/domain/protocol/hci_decoder.dart';
+import 'package:wristload/domain/protocol/mass_transfer.dart';
+import 'package:wristload/domain/protocol/session_cipher.dart';
 import 'package:pointycastle/api.dart';
 import 'package:pointycastle/block/aes.dart';
 import 'package:pointycastle/block/modes/ccm.dart';
-import 'package:miwearable_install_tool/domain/protocol/proto_wire.dart';
-import 'package:miwearable_install_tool/domain/protocol/spp_protocol.dart';
-import 'package:miwearable_install_tool/domain/protocol/transport_constants.dart';
-import 'package:miwearable_install_tool/domain/protocol/zau.dart';
-import 'package:miwearable_install_tool/domain/verification_gate.dart';
-import 'package:miwearable_install_tool/domain/device_profile.dart';
-import 'package:miwearable_install_tool/domain/install_metadata_reader.dart';
-import 'package:miwearable_install_tool/domain/install_models.dart';
-import 'package:miwearable_install_tool/domain/install_task.dart';
-import 'package:miwearable_install_tool/domain/mass_ack_idle_timeout.dart';
+import 'package:wristload/domain/protocol/proto_wire.dart';
+import 'package:wristload/domain/protocol/spp_protocol.dart';
+import 'package:wristload/domain/protocol/transport_constants.dart';
+import 'package:wristload/domain/protocol/zau.dart';
+import 'package:wristload/domain/verification_gate.dart';
+import 'package:wristload/domain/device_profile.dart';
+import 'package:wristload/domain/install_metadata_reader.dart';
+import 'package:wristload/domain/install_models.dart';
+import 'package:wristload/domain/install_task.dart';
+import 'package:wristload/domain/mass_ack_idle_timeout.dart';
 
 void main() {
   test('OTA channel is reserved separately from Mass transfers', () {

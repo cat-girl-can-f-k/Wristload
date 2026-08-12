@@ -7,7 +7,7 @@ import 'dart:io';
 import 'package:flutter/services.dart';
 
 class AuthKeyStore {
-  static const _channel = MethodChannel('miwearable/secure_store');
+  static const _channel = MethodChannel('wristload/secure_store');
 
   Future<String?> read() {
     if (!_supported) return Future.value(null);

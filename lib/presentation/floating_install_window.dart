@@ -152,7 +152,7 @@ class _WindowHeader extends StatelessWidget {
                 child: Align(
                   alignment: Alignment.centerLeft,
                   child: Text(
-                    'MiWearable',
+                    'Wristload',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(fontSize: 11, fontWeight: FontWeight.w500),

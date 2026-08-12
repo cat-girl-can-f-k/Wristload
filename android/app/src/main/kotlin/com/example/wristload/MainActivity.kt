@@ -1,4 +1,4 @@
-package com.example.miwearable_install_tool
+package com.example.wristload
 
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
@@ -25,6 +25,17 @@ import android.security.keystore.KeyProperties
 
 /** Android-only RFCOMM bridge. Protocol framing remains in Dart. */
 class MainActivity : FlutterActivity() {
+    private companion object {
+        const val wristloadRfcommEventsChannel = "wristload/rfcomm/events"
+        const val wristloadRfcommChannel = "wristload/rfcomm"
+        const val wristloadSecureStoreChannel = "wristload/secure_store"
+
+        const val wristloadSecurePreferences = "wristload_secure"
+        const val wristloadAuthKeyAlias = "wristload_authkey"
+        const val legacySecurePreferences = "miwearable_secure"
+        const val legacyAuthKeyAlias = "miwearable_authkey"
+    }
+
     private val executor = Executors.newSingleThreadExecutor()
     @Volatile private var socket: BluetoothSocket? = null
     @Volatile private var input: InputStream? = null
@@ -35,23 +46,23 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        EventChannel(flutterEngine.dartExecutor.binaryMessenger, "miwearable/rfcomm/events")
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, wristloadRfcommEventsChannel)
             .setStreamHandler(object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, sink: EventChannel.EventSink?) { eventSink = sink }
                 override fun onCancel(arguments: Any?) { eventSink = null }
             })
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "miwearable/rfcomm")
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, wristloadRfcommChannel)
             .setMethodCallHandler { call, result -> handleRfcomm(call, result) }
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "miwearable/secure_store")
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, wristloadSecureStoreChannel)
             .setMethodCallHandler { call, result -> handleSecureStore(call, result) }
     }
 
     /** Keeps the authkey encrypted with a non-exportable Android Keystore key. */
     private fun handleSecureStore(call: MethodCall, result: MethodChannel.Result) {
         try {
-            val preferences = getSharedPreferences("miwearable_secure", MODE_PRIVATE)
+            val preferences = getSharedPreferences(wristloadSecurePreferences, MODE_PRIVATE)
             when (call.method) {
-                "read" -> result.success(preferences.getString("authkey", null)?.let { decryptAuthKey(it) })
+                "read" -> result.success(readAuthKey(preferences))
                 "write" -> {
                     val value = call.arguments as? String
                         ?: throw IllegalArgumentException("Missing secure value")
@@ -64,9 +75,13 @@ class MainActivity : FlutterActivity() {
                     result.success(null)
                 }
                 "delete" -> {
-                    check(preferences.edit().remove("authkey").commit()) {
+                    val legacyPreferences =
+                        getSharedPreferences(legacySecurePreferences, MODE_PRIVATE)
+                    check(preferences.edit().remove("authkey").commit() &&
+                        legacyPreferences.edit().remove("authkey").commit()) {
                         "Unable to remove secure value"
                     }
+                    deleteAuthKeyAliases()
                     result.success(null)
                 }
                 else -> result.notImplemented()
@@ -76,12 +91,34 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun authKey(): SecretKey {
+    private fun readAuthKey(preferences: android.content.SharedPreferences): String? {
+        preferences.getString("authkey", null)?.let { return decryptAuthKey(it, wristloadAuthKeyAlias) }
+
+        val legacyPreferences = getSharedPreferences(legacySecurePreferences, MODE_PRIVATE)
+        val legacyValue = legacyPreferences.getString("authkey", null) ?: return null
+        val authKey = decryptAuthKey(legacyValue, legacyAuthKeyAlias)
+        check(preferences.edit().putString("authkey", encryptAuthKey(authKey)).commit()) {
+            "Unable to migrate secure value"
+        }
+        check(legacyPreferences.edit().remove("authkey").commit()) {
+            "Unable to finish secure value migration"
+        }
+        return authKey
+    }
+
+    private fun deleteAuthKeyAliases() {
         val store = java.security.KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-        (store.getKey("miwearable_authkey", null) as? SecretKey)?.let { return it }
+        for (alias in listOf(wristloadAuthKeyAlias, legacyAuthKeyAlias)) {
+            if (store.containsAlias(alias)) store.deleteEntry(alias)
+        }
+    }
+
+    private fun authKey(alias: String = wristloadAuthKeyAlias): SecretKey {
+        val store = java.security.KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        (store.getKey(alias, null) as? SecretKey)?.let { return it }
         val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
         generator.init(KeyGenParameterSpec.Builder(
-            "miwearable_authkey",
+            alias,
             KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
         ).setBlockModes(KeyProperties.BLOCK_MODE_GCM)
             .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
@@ -95,11 +132,11 @@ class MainActivity : FlutterActivity() {
         return Base64.encodeToString(cipher.iv + cipher.doFinal(value.toByteArray()), Base64.NO_WRAP)
     }
 
-    private fun decryptAuthKey(value: String): String {
+    private fun decryptAuthKey(value: String, keyAlias: String = wristloadAuthKeyAlias): String {
         val raw = Base64.decode(value, Base64.NO_WRAP)
         require(raw.size > 12) { "Invalid secure value" }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, authKey(), GCMParameterSpec(128, raw.copyOfRange(0, 12)))
+        cipher.init(Cipher.DECRYPT_MODE, authKey(keyAlias), GCMParameterSpec(128, raw.copyOfRange(0, 12)))
         val decrypted = String(cipher.doFinal(raw.copyOfRange(12, raw.size)))
         require(Regex("^[0-9a-fA-F]{32}$").matches(decrypted)) {
             "Invalid authkey payload"

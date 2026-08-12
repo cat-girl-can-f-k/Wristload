@@ -14,7 +14,7 @@ import 'device_controller.dart';
 import 'floating_install_snapshot_mapper.dart';
 
 const floatingInstallWindowArgument = 'floating-install-window';
-const floatingInstallChannelName = 'miwearable/floating-install-window';
+const floatingInstallChannelName = 'wristload/floating-install-window';
 const floatingInstallWindowSize = Size(264, 148);
 
 typedef FloatingWindowNotice = void Function(FloatingWindowImportNotice notice);
@@ -299,7 +299,7 @@ class FloatingWindowCoordinator with WindowListener {
     final iconPath = _trayIconPath();
     await _systemTray.initSystemTray(
       iconPath: iconPath,
-      toolTip: 'MiWearable 安装工具',
+      toolTip: 'Wristload',
     );
     final menu = Menu();
     await menu.buildFrom([

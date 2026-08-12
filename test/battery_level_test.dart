@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:miwearable_install_tool/domain/protocol/transport_constants.dart';
+import 'package:wristload/domain/protocol/transport_constants.dart';
 
 void main() {
   group('Standard BLE battery level', () {

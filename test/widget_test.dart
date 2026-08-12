@@ -2,18 +2,18 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:miwearable_install_tool/application/device_controller.dart';
-import 'package:miwearable_install_tool/domain/device_profile.dart';
-import 'package:miwearable_install_tool/domain/install_models.dart';
-import 'package:miwearable_install_tool/domain/install_task.dart';
-import 'package:miwearable_install_tool/domain/install_preference_store.dart';
-import 'package:miwearable_install_tool/presentation/install_task_card.dart';
-import 'package:miwearable_install_tool/presentation/install_split_button.dart';
-import 'package:miwearable_install_tool/presentation/install_request_preflight.dart';
-import 'package:miwearable_install_tool/presentation/install_warning_dialog.dart';
-import 'package:miwearable_install_tool/presentation/queue_page.dart';
-import 'package:miwearable_install_tool/presentation/settings_page.dart';
-import 'package:miwearable_install_tool/presentation/tools_page.dart';
+import 'package:wristload/application/device_controller.dart';
+import 'package:wristload/domain/device_profile.dart';
+import 'package:wristload/domain/install_models.dart';
+import 'package:wristload/domain/install_task.dart';
+import 'package:wristload/domain/install_preference_store.dart';
+import 'package:wristload/presentation/install_task_card.dart';
+import 'package:wristload/presentation/install_split_button.dart';
+import 'package:wristload/presentation/install_request_preflight.dart';
+import 'package:wristload/presentation/install_warning_dialog.dart';
+import 'package:wristload/presentation/queue_page.dart';
+import 'package:wristload/presentation/settings_page.dart';
+import 'package:wristload/presentation/tools_page.dart';
 
 void main() {
   test('known profile hints stay restricted to verified observations', () {

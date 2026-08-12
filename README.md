@@ -1,4 +1,4 @@
-# 小米穿戴安装工具
+# Wristload
 
 此目录是全新实现的 Flutter Material 3 应用，不包含、也不引用任何反编译 APK 的代码、资源、布局或服务端接口。
 
@@ -27,7 +27,7 @@ Android 原生工程已生成，最低 SDK 需保持为 21+，并已声明附近
 
 - Flutter 3.44.8 / Dart 3.12.2 已找到并可用；
 - Dart 静态分析保持无错误；45 项自动化测试覆盖 RPK 最终结果解析、多清单冲突、畸形 PB、压缩包安全边界和安装进度 UI；
-- `flutter build windows --debug` 已成功，产物在 `build\windows\x64\runner\Debug\miwearable_install_tool.exe`，冒烟运行通过；
+- `flutter build windows --debug` 已成功，产物在 `build\windows\x64\runner\Debug\wristload.exe`，冒烟运行通过；
 - n67cn（小米手环 9 Pro）已真机确认 RFCOMM → L1START → `sendAppVerify` →
   `sendAppConfirm` → `device ready`，以及表盘 Mass 传输；
 - 快应用控制命令、Mass `0x40` 和最终 `20/2` 数据结构已实现，等待本版真机安装验收；

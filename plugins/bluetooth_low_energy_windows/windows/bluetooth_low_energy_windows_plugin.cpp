@@ -15,7 +15,7 @@ namespace bluetooth_low_energy_windows
 	BluetoothLowEnergyWindowsPlugin::BluetoothLowEnergyWindowsPlugin(flutter::PluginRegistrarWindows *registrar)
 		: m_registrar(registrar),
 		  m_platform_thread_id(GetCurrentThreadId()),
-		  m_dispatch_message(RegisterWindowMessageW(L"MiWearable.BluetoothLowEnergy.PlatformDispatch.v1"))
+		  m_dispatch_message(RegisterWindowMessageW(L"Wristload.BluetoothLowEnergy.PlatformDispatch.v1"))
 	{
 		if (auto view = registrar->GetView())
 		{

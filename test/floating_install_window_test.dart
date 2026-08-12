@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:miwearable_install_tool/domain/floating_install_snapshot.dart';
-import 'package:miwearable_install_tool/domain/install_task.dart';
-import 'package:miwearable_install_tool/presentation/floating_install_window.dart';
+import 'package:wristload/domain/floating_install_snapshot.dart';
+import 'package:wristload/domain/install_task.dart';
+import 'package:wristload/presentation/floating_install_window.dart';
 
 void main() {
   Future<void> pumpFloatingWindow(

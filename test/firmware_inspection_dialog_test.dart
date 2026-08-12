@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:miwearable_install_tool/domain/firmware_package_inspector.dart';
-import 'package:miwearable_install_tool/presentation/firmware_inspection_dialog.dart';
+import 'package:wristload/domain/firmware_package_inspector.dart';
+import 'package:wristload/presentation/firmware_inspection_dialog.dart';
 
 void main() {
   testWidgets('固件检查弹窗展示本地检查结果与禁止传输提示', (tester) async {

@@ -5,7 +5,7 @@ library;
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:miwearable_install_tool/domain/protocol/hci_decoder.dart';
+import 'package:wristload/domain/protocol/hci_decoder.dart';
 
 Future<void> main(List<String> arguments) async {
   if (arguments.length != 1) {

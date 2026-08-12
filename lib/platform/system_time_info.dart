@@ -21,7 +21,7 @@ class SystemTimeInfo {
 class SystemTimeInfoSource {
   const SystemTimeInfoSource();
 
-  static const _channel = MethodChannel('miwearable/system_time');
+  static const _channel = MethodChannel('wristload/system_time');
 
   Future<SystemTimeInfo> read() async {
     final now = DateTime.now();

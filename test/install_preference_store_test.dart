@@ -1,8 +1,8 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'package:miwearable_install_tool/domain/install_preference_store.dart';
-import 'package:miwearable_install_tool/domain/install_task.dart';
+import 'package:wristload/domain/install_preference_store.dart';
+import 'package:wristload/domain/install_task.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
