@@ -4,26 +4,6 @@ import 'package:flutter/services.dart';
 
 import '../domain/device_profile.dart';
 
-class WatchfaceResolutionDialog extends StatelessWidget {
-  const WatchfaceResolutionDialog({super.key});
-
-  @override
-  Widget build(BuildContext context) => AlertDialog(
-        title: const Text('表盘分辨率提示'),
-        content: const Text('该表盘分辨率似乎和您的设备不匹配，请问是否要安装？'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('仍然安装'),
-          ),
-        ],
-      );
-}
-
 class LogPanel extends StatelessWidget {
   const LogPanel({
     required this.logs,

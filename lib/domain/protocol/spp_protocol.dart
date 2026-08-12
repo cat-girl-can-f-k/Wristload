@@ -28,6 +28,14 @@ abstract final class SppProtocol {
 
   static const int channelPb = 1;
   static const int channelMass = 2;
+
+  /// Official V2 L2 channel reserved for firmware OTA traffic.
+  ///
+  /// This is intentionally only a protocol identifier. Firmware packages must
+  /// not be sent through [channelMass], and callers must not use this channel
+  /// until the OTA control frames, acknowledgements, and recovery flow have
+  /// been verified from a device-specific capture.
+  static const int channelOta = 6;
   static const int opCodeWrite = 1;
   static const int opCodeWriteEnc = 2;
 

@@ -4,14 +4,17 @@ import 'package:flutter/services.dart';
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
 
 import 'application/device_controller.dart';
+import 'domain/firmware_package_inspector.dart';
 import 'domain/install_metadata_reader.dart';
 import 'domain/install_models.dart';
 import 'domain/install_preference_store.dart';
 import 'domain/install_task.dart';
 import 'presentation/device_info_page.dart';
+import 'presentation/firmware_inspection_dialog.dart';
 import 'presentation/home_widgets.dart';
 import 'presentation/install_split_button.dart';
 import 'presentation/install_task_card.dart';
+import 'presentation/install_warning_dialog.dart';
 import 'presentation/queue_page.dart';
 import 'presentation/settings_page.dart';
 import 'presentation/tools_page.dart';
@@ -186,6 +189,43 @@ class HomePage extends StatelessWidget {
   final InstallPreference preferredInstallTarget;
   final ValueChanged<InstallPreference> onPreferredInstallTargetChanged;
 
+  Future<void> _pickFirmware(BuildContext context) async {
+    final selected = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: const ['zip', 'bin'],
+    );
+    final file = selected?.files.single;
+    final path = file?.path;
+    if (path == null || !context.mounted) return;
+
+    try {
+      final inspection = await const FirmwarePackageInspector().inspect(path);
+      if (!context.mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (_) => FirmwareInspectionDialog(inspection: inspection),
+      );
+    } on FormatException catch (error) {
+      if (!context.mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (_) => FirmwareInspectionErrorDialog(
+          fileName: file!.name,
+          message: error.message.toString(),
+        ),
+      );
+    } on Object catch (error) {
+      if (!context.mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (_) => FirmwareInspectionErrorDialog(
+          fileName: file!.name,
+          message: '读取固件包时发生错误：$error',
+        ),
+      );
+    }
+  }
+
   Future<void> _pickAndTry(BuildContext context, InstallKind kind) async {
     final extensions =
         kind == InstallKind.watchface ? const ['bin', 'face'] : const ['rpk'];
@@ -205,13 +245,13 @@ class HomePage extends StatelessWidget {
             controller.watchfaceCompatibilityError(metadata);
         if (compatibilityError != null) {
           watchfaceResolutionConfirmed =
-              await _confirmWatchfaceResolution(context);
+              await _confirmWatchfaceResolution(context, metadata);
           if (!watchfaceResolutionConfirmed) return;
           if (!context.mounted) return;
         }
         if (controller.requiresUnsupportedLuaConfirmation(metadata)) {
           unsupportedLuaConfirmed =
-              await _confirmUnsupportedLuaWatchface(context);
+              await _confirmUnsupportedLuaWatchface(context, metadata);
           if (!unsupportedLuaConfirmed) return;
         }
         if (!context.mounted) return;
@@ -247,32 +287,53 @@ class HomePage extends StatelessWidget {
     }
   }
 
-  Future<bool> _confirmWatchfaceResolution(BuildContext context) async =>
-      await showDialog<bool>(
-        context: context,
-        builder: (_) => const WatchfaceResolutionDialog(),
-      ) ??
-      false;
+  Future<bool> _confirmWatchfaceResolution(
+    BuildContext context,
+    InstallMetadata metadata,
+  ) async {
+    var confirmed = false;
+    final profile = controller.connectedProfile;
+    final resolutions = metadata.watchfaceResolutions.isEmpty
+        ? '未识别'
+        : metadata.watchfaceResolutions.join('、');
+    await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => InstallWarningDialog(
+        title: '表盘分辨率不匹配',
+        message: '安装后可能无法正常显示或使用',
+        rows: [
+          ('表盘分辨率', resolutions, false),
+          ('设备分辨率', profile?.watchfaceResolution?.toString() ?? '未知', true),
+          ('文件名', metadata.fileName, false),
+        ],
+        onConfirm: () => confirmed = true,
+      ),
+    );
+    return confirmed;
+  }
 
-  Future<bool> _confirmUnsupportedLuaWatchface(BuildContext context) async =>
-      await showDialog<bool>(
-        context: context,
-        builder: (dialogContext) => AlertDialog(
-          title: const Text('Lua 表盘兼容性提示'),
-          content: const Text('您似乎在安装一个您设备不支持的Lua表盘，请确定是否安装'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text('取消'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text('仍然安装'),
-            ),
-          ],
-        ),
-      ) ??
-      false;
+  Future<bool> _confirmUnsupportedLuaWatchface(
+    BuildContext context,
+    InstallMetadata metadata,
+  ) async {
+    var confirmed = false;
+    await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => InstallWarningDialog(
+        title: 'Lua 不被支持',
+        message: '安装后可能无法正常显示或使用',
+        rows: [
+          ('文件名', metadata.fileName, false),
+          ('检测结果', '检测到lua文件', true),
+          ('目标设备', controller.connectedProfile?.displayName ?? '未知设备', false),
+        ],
+        onConfirm: () => confirmed = true,
+      ),
+    );
+    return confirmed;
+  }
 
   Future<InstallMetadata?> _editFaceId(
       BuildContext context, InstallMetadata metadata) async {
@@ -590,6 +651,7 @@ class HomePage extends StatelessWidget {
                       !controller.timeSyncInProgress &&
                       !controller.statusRefreshInProgress,
                   onInstall: (target) => _pickAndTry(context, target),
+                  onInstallFirmware: () => _pickFirmware(context),
                 ),
                 if (controller.latestTask case final task?)
                   InstallTaskCard(

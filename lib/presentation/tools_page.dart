@@ -293,15 +293,17 @@ class _ToolsPageState extends State<ToolsPage> {
                   ),
                   const SizedBox(height: 12),
                   Container(
+                    key: const ValueKey('unlock-warning-banner'),
                     width: double.infinity,
                     padding: const EdgeInsets.all(12),
                     decoration: BoxDecoration(
-                      color: const Color(0xFF3A322A),
+                      color: theme.colorScheme.errorContainer,
                       borderRadius: BorderRadius.circular(12),
                     ),
-                    child: const Text(
+                    child: Text(
                       '在您计算解锁码之前，我们强烈建议您先尝试使用连续插拔设备充电器百余次的方法让设备重启三次触发保护恢复出厂设置这种更便捷的方法删除密码。',
-                      style: TextStyle(color: Color(0xFFD9B48A)),
+                      style: theme.textTheme.bodyMedium
+                          ?.copyWith(color: theme.colorScheme.onErrorContainer),
                     ),
                   ),
                   const SizedBox(height: 12),

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:miwearable_install_tool/application/device_controller.dart';
@@ -7,10 +8,11 @@ import 'package:miwearable_install_tool/domain/install_models.dart';
 import 'package:miwearable_install_tool/domain/install_task.dart';
 import 'package:miwearable_install_tool/domain/install_preference_store.dart';
 import 'package:miwearable_install_tool/presentation/install_task_card.dart';
-import 'package:miwearable_install_tool/presentation/home_widgets.dart';
 import 'package:miwearable_install_tool/presentation/install_split_button.dart';
+import 'package:miwearable_install_tool/presentation/install_warning_dialog.dart';
 import 'package:miwearable_install_tool/presentation/queue_page.dart';
 import 'package:miwearable_install_tool/presentation/settings_page.dart';
+import 'package:miwearable_install_tool/presentation/tools_page.dart';
 
 void main() {
   test('known profile hints stay restricted to verified observations', () {
@@ -322,18 +324,30 @@ void main() {
     expect(find.text('取消'), findsNothing);
   });
 
-  testWidgets('分辨率不匹配弹窗允许取消或继续安装', (tester) async {
+  testWidgets('安装警告倒计时结束后才能确认，且可取消', (tester) async {
     Future<bool?> openDialog() async => showDialog<bool>(
           context: tester.element(find.byType(Scaffold)),
-          builder: (_) => const WatchfaceResolutionDialog(),
+          barrierDismissible: false,
+          builder: (_) => InstallWarningDialog(
+            title: '表盘分辨率不匹配',
+            message: '安装后可能无法正常显示或使用',
+            rows: const [
+              ('表盘分辨率', '336×480', false),
+              ('设备分辨率', '432×514', true),
+              ('文件名', 'demo.face', false),
+            ],
+            onConfirm: () {},
+          ),
         );
 
     await tester.pumpWidget(const MaterialApp(home: Scaffold()));
     final cancelled = openDialog();
     await tester.pumpAndSettle();
+    expect(find.text('表盘分辨率不匹配'), findsOneWidget);
+    expect(find.text('仍然安装（3）'), findsOneWidget);
     expect(
-      find.text('该表盘分辨率似乎和您的设备不匹配，请问是否要安装？'),
-      findsOneWidget,
+      tester.widget<FilledButton>(find.byType(FilledButton)).onPressed,
+      isNull,
     );
     await tester.tap(find.text('取消'));
     await tester.pumpAndSettle();
@@ -341,9 +355,63 @@ void main() {
 
     final continued = openDialog();
     await tester.pumpAndSettle();
+    await tester.pump(const Duration(seconds: 3));
+    await tester.pump();
     await tester.tap(find.text('仍然安装'));
     await tester.pumpAndSettle();
     expect(await continued, isTrue);
+  });
+
+  testWidgets('安装警告零秒立即启用且 Esc 可取消', (tester) async {
+    var confirmed = false;
+    await tester.pumpWidget(const MaterialApp(home: Scaffold()));
+    final result = showDialog<bool>(
+      context: tester.element(find.byType(Scaffold)),
+      barrierDismissible: false,
+      builder: (_) => InstallWarningDialog(
+        title: '警告',
+        message: '请确认',
+        rows: const [],
+        countdownSeconds: 0,
+        onConfirm: () => confirmed = true,
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('仍然安装'), findsOneWidget);
+    expect(
+      tester.widget<FilledButton>(find.byType(FilledButton)).onPressed,
+      isNotNull,
+    );
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+    expect(await result, isFalse);
+    expect(confirmed, isFalse);
+  });
+
+  testWidgets('解锁码警示条使用浅色主题 errorContainer 角色', (tester) async {
+    final controller = DeviceController();
+    addTearDown(controller.dispose);
+    final scheme = ColorScheme.fromSeed(
+      seedColor: Colors.teal,
+      brightness: Brightness.light,
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: ThemeData(colorScheme: scheme, useMaterial3: true),
+        home: Scaffold(body: ToolsPage(controller: controller)),
+      ),
+    );
+
+    final banner = tester.widget<Container>(
+      find.byKey(const ValueKey('unlock-warning-banner')),
+    );
+    final decoration = banner.decoration as BoxDecoration;
+    expect(decoration.color, scheme.errorContainer);
+    final warningText = tester.widget<Text>(find.descendant(
+      of: find.byKey(const ValueKey('unlock-warning-banner')),
+      matching: find.byType(Text),
+    ));
+    expect(warningText.style?.color, scheme.onErrorContainer);
   });
 
   testWidgets('设置页显示发送窗口间隔与每窗口分片数', (tester) async {
@@ -418,6 +486,7 @@ void main() {
                     : InstallPreference.quickApp,
                 enabled: true,
                 onInstall: (value) async => installed = value,
+                onInstallFirmware: () async {},
               ),
             ),
           ),
@@ -425,9 +494,9 @@ void main() {
 
     await pump(InstallKind.watchface);
     expect(find.text('安装表盘 .bin / .face'), findsOneWidget);
-    final popup = tester.widget<PopupMenuButton<InstallKind>>(
+    final popup = tester.widget(
       find.byKey(const ValueKey('install-menu-popup')),
-    );
+    ) as dynamic;
     expect(
       popup.borderRadius,
       const BorderRadius.horizontal(
@@ -449,6 +518,66 @@ void main() {
     expect(find.text('安装快应用 .rpk'), findsOneWidget);
   });
 
+  testWidgets('Split Button 固件菜单使用独立回调', (tester) async {
+    var installCalls = 0;
+    var firmwareCalls = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: InstallSplitButton(
+            preferredTarget: InstallPreference.watchface,
+            enabled: true,
+            onInstall: (_) async => installCalls++,
+            onInstallFirmware: () async => firmwareCalls++,
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.byKey(const ValueKey('install-menu-popup')));
+    await tester.pumpAndSettle();
+    expect(find.text('安装固件 .zip / .bin（协议取证中）'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('firmware-install-menu-item')));
+    await tester.pumpAndSettle();
+
+    expect(firmwareCalls, 1);
+    expect(installCalls, 0);
+  });
+
+  testWidgets('均有开发时右侧为快应用主区和固件下拉区', (tester) async {
+    InstallKind? installed;
+    var firmwareCalls = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: InstallSplitButton(
+            preferredTarget: InstallPreference.both,
+            enabled: true,
+            onInstall: (kind) async => installed = kind,
+            onInstallFirmware: () async => firmwareCalls++,
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(
+      find.byKey(const ValueKey('both-quick-app-install-button')),
+    );
+    expect(installed, InstallKind.quickApp);
+
+    await tester.tap(find.byKey(const ValueKey('both-firmware-menu-popup')));
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('both-firmware-install-menu-item')),
+      findsOneWidget,
+    );
+    await tester.tap(
+      find.byKey(const ValueKey('both-firmware-install-menu-item')),
+    );
+    await tester.pumpAndSettle();
+    expect(firmwareCalls, 1);
+  });
+
   testWidgets('Split Button 未鉴权时两侧均禁用且副菜单不可打开', (tester) async {
     var installCalls = 0;
     await tester.pumpWidget(
@@ -458,6 +587,7 @@ void main() {
             preferredTarget: InstallPreference.watchface,
             enabled: false,
             onInstall: (_) async => installCalls++,
+            onInstallFirmware: () async => installCalls++,
           ),
         ),
       ),
@@ -513,6 +643,7 @@ void main() {
             preferredTarget: InstallPreference.watchface,
             enabled: true,
             onInstall: (_) async {},
+            onInstallFirmware: () async {},
           ),
         ),
       ),

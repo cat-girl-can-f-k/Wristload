@@ -16,12 +16,14 @@ class InstallSplitButton extends StatefulWidget {
     required this.preferredTarget,
     required this.enabled,
     required this.onInstall,
+    required this.onInstallFirmware,
     super.key,
   });
 
   final InstallPreference preferredTarget;
   final bool enabled;
   final Future<void> Function(InstallKind target) onInstall;
+  final Future<void> Function() onInstallFirmware;
 
   @override
   State<InstallSplitButton> createState() => _InstallSplitButtonState();
@@ -37,7 +39,7 @@ class _InstallSplitButtonState extends State<InstallSplitButton> {
         children: [
           Expanded(child: _bothButton(InstallKind.watchface)),
           const SizedBox(width: 12),
-          Expanded(child: _bothButton(InstallKind.quickApp)),
+          Expanded(child: _bothQuickAppSplitButton()),
         ],
       );
     }
@@ -85,7 +87,7 @@ class _InstallSplitButtonState extends State<InstallSplitButton> {
         SizedBox(
           width: 64,
           height: 56,
-          child: PopupMenuButton<InstallKind>(
+          child: PopupMenuButton<_InstallMenuAction>(
             key: const ValueKey('install-menu-popup'),
             enabled: widget.enabled,
             tooltip: '选择另一种安装文件',
@@ -108,21 +110,42 @@ class _InstallSplitButtonState extends State<InstallSplitButton> {
                 setState(() => _menuOpen = false);
               }
             },
-            onSelected: (target) async {
+            onSelected: (action) async {
               if (mounted) {
                 setState(() => _menuOpen = false);
               }
-              await widget.onInstall(target);
+              switch (action) {
+                case _InstallMenuAction.alternate:
+                  await widget.onInstall(alternate.target);
+                  break;
+                case _InstallMenuAction.firmware:
+                  await widget.onInstallFirmware();
+                  break;
+              }
             },
             itemBuilder: (context) => [
               PopupMenuItem(
                 key: const ValueKey('alternate-install-menu-item'),
-                value: alternate.target,
+                value: _InstallMenuAction.alternate,
                 child: Row(
                   children: [
                     Icon(alternate.icon),
                     const SizedBox(width: 12),
                     Text(alternate.installLabel),
+                  ],
+                ),
+              ),
+              const PopupMenuDivider(),
+              const PopupMenuItem(
+                key: ValueKey('firmware-install-menu-item'),
+                value: _InstallMenuAction.firmware,
+                child: Row(
+                  children: [
+                    Icon(Icons.system_update_alt),
+                    SizedBox(width: 12),
+                    Flexible(
+                      child: Text('安装固件 .zip / .bin（协议取证中）'),
+                    ),
                   ],
                 ),
               ),
@@ -175,7 +198,115 @@ class _InstallSplitButtonState extends State<InstallSplitButton> {
       ),
     );
   }
+
+  Widget _bothQuickAppSplitButton() {
+    const presentation = _InstallTargetPresentation(InstallKind.quickApp);
+    final colors = Theme.of(context).colorScheme;
+    final disabledBackground = colors.onSurface.withValues(alpha: 0.12);
+    final disabledForeground = colors.onSurface.withValues(alpha: 0.38);
+
+    return Row(
+      children: [
+        Expanded(
+          child: _InstallSegment(
+            key: const ValueKey('both-quick-app-install-button'),
+            enabled: widget.enabled,
+            backgroundColor:
+                widget.enabled ? colors.primary : disabledBackground,
+            foregroundColor:
+                widget.enabled ? colors.onPrimary : disabledForeground,
+            borderRadius: const BorderRadius.horizontal(
+              left: Radius.circular(28),
+              right: Radius.circular(6),
+            ),
+            onPressed: () => widget.onInstall(InstallKind.quickApp),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(presentation.icon),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    presentation.installLabel,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 16),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(width: 2),
+        SizedBox(
+          width: 64,
+          height: 56,
+          child: PopupMenuButton<_InstallMenuAction>(
+            key: const ValueKey('both-firmware-menu-popup'),
+            enabled: widget.enabled,
+            tooltip: '安装固件',
+            padding: EdgeInsets.zero,
+            borderRadius: const BorderRadius.horizontal(
+              left: Radius.circular(6),
+              right: Radius.circular(28),
+            ),
+            offset: const Offset(0, 8),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16),
+            ),
+            onOpened: () {
+              if (mounted) setState(() => _menuOpen = true);
+            },
+            onCanceled: () {
+              if (mounted) setState(() => _menuOpen = false);
+            },
+            onSelected: (_) async {
+              if (mounted) setState(() => _menuOpen = false);
+              await widget.onInstallFirmware();
+            },
+            itemBuilder: (context) => const [
+              PopupMenuItem(
+                key: ValueKey('both-firmware-install-menu-item'),
+                value: _InstallMenuAction.firmware,
+                child: Row(
+                  children: [
+                    Icon(Icons.system_update_alt),
+                    SizedBox(width: 12),
+                    Flexible(
+                      child: Text('安装固件 .zip / .bin（协议取证中）'),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            child: _InstallSegment(
+              key: const ValueKey('both-firmware-menu-button'),
+              enabled: widget.enabled,
+              backgroundColor:
+                  widget.enabled ? colors.primary : disabledBackground,
+              foregroundColor:
+                  widget.enabled ? colors.onPrimary : disabledForeground,
+              borderRadius: const BorderRadius.horizontal(
+                left: Radius.circular(6),
+                right: Radius.circular(28),
+              ),
+              onPressed: null,
+              child: AnimatedRotation(
+                turns: _menuOpen ? 0.5 : 0,
+                duration: const Duration(milliseconds: 180),
+                child: Icon(
+                  Icons.keyboard_arrow_down,
+                  color: widget.enabled ? colors.onPrimary : disabledForeground,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
 }
+
+enum _InstallMenuAction { alternate, firmware }
 
 class _InstallSegment extends StatelessWidget {
   const _InstallSegment({

@@ -24,6 +24,11 @@ import 'package:miwearable_install_tool/domain/install_task.dart';
 import 'package:miwearable_install_tool/domain/mass_ack_idle_timeout.dart';
 
 void main() {
+  test('OTA channel is reserved separately from Mass transfers', () {
+    expect(SppProtocol.channelOta, 6);
+    expect(SppProtocol.channelOta, isNot(SppProtocol.channelMass));
+  });
+
   group('Mass ACK 空闲超时', () {
     test('每次确认进度都会续期，而不是限制整个窗口总时长', () async {
       final first = Completer<void>();
