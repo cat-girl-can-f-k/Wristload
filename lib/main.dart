@@ -597,6 +597,7 @@ class HomePage extends StatelessWidget {
                     onCancel: controller.cancelInstall,
                     onCheck: controller.reconnectAndCheckInstall,
                     onRetry: controller.retryInstallFromStart,
+                    onClear: controller.clearLatestTask,
                   ),
               ],
               const SizedBox(height: 12),

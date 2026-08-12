@@ -83,6 +83,7 @@ void main() {
       queuedBytes: 2048,
       totalBytes: 4096,
       bytesPerSecond: 2048,
+      transferElapsed: Duration(seconds: 3),
     );
     await tester.pumpWidget(MaterialApp(
       home: Scaffold(
@@ -98,11 +99,227 @@ void main() {
     expect(find.text('demo.rpk'), findsOneWidget);
     expect(find.textContaining('1.0 KB/4.0 KB'), findsOneWidget);
     expect(find.textContaining('2.0 KB/s'), findsOneWidget);
+    expect(find.text('25.0%'), findsOneWidget);
+    expect(find.text('预计剩余 2 秒'), findsOneWidget);
+    expect(find.textContaining('设备确认'), findsOneWidget);
+    expect(find.text('已确认'), findsOneWidget);
+    expect(find.text('已提交待确认'), findsOneWidget);
     expect(find.textContaining('com.example.demo'), findsOneWidget);
     expect(find.textContaining('版本：42'), findsOneWidget);
+    expect(find.text('详情'), findsOneWidget);
+    expect(find.textContaining('Xiaomi Smart Band 9 Pro'), findsNothing);
+    expect(find.textContaining('0123456789abcdef'), findsNothing);
+    await tester.tap(find.text('详情'));
+    await tester.pumpAndSettle();
     expect(find.textContaining('Xiaomi Smart Band 9 Pro'), findsOneWidget);
     expect(find.textContaining('0123456789abcdef'), findsOneWidget);
     expect(find.text('取消'), findsOneWidget);
+  });
+
+  testWidgets('安装卡片在传输不足两秒时不显示 ETA', (tester) async {
+    const task = InstallTask(
+      kind: InstallKind.watchface,
+      fileName: 'demo.face',
+      stage: InstallStage.transferring,
+      message: '传输中',
+      faceId: '1234',
+      currentSegment: 1,
+      totalSegments: 4,
+      confirmedBytes: 1024,
+      queuedSegment: 2,
+      queuedBytes: 2048,
+      totalBytes: 4096,
+      bytesPerSecond: 2048,
+      transferElapsed: Duration(milliseconds: 1999),
+    );
+
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: InstallTaskCard(
+          task: task,
+          onCancel: () async {},
+          onCheck: () async {},
+          onRetry: () async {},
+        ),
+      ),
+    ));
+
+    expect(find.textContaining('2.0 KB/s'), findsOneWidget);
+    expect(find.textContaining('预计剩余'), findsNothing);
+  });
+
+  testWidgets('安装卡片在窄窗口中不发生布局溢出', (tester) async {
+    tester.view.physicalSize = const Size(360, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    const task = InstallTask(
+      kind: InstallKind.quickApp,
+      fileName: 'a_very_long_quick_application_package_name.rpk',
+      stage: InstallStage.transferring,
+      message: '传输中',
+      packageName: 'com.example.long.package.name',
+      versionCode: 20260812,
+      currentSegment: 1234,
+      totalSegments: 9999,
+      confirmedBytes: 4 * 1024 * 1024,
+      queuedSegment: 1500,
+      queuedBytes: 5 * 1024 * 1024,
+      totalBytes: 12 * 1024 * 1024,
+      bytesPerSecond: 2.5 * 1024 * 1024,
+      transferElapsed: Duration(seconds: 3),
+    );
+
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: SingleChildScrollView(
+          child: InstallTaskCard(
+            task: task,
+            onCancel: () async {},
+            onCheck: () async {},
+            onRetry: () async {},
+          ),
+        ),
+      ),
+    ));
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('取消'), findsOneWidget);
+    expect(find.text('已提交待确认'), findsOneWidget);
+  });
+
+  testWidgets('文件传输完成后隐藏取消按钮', (tester) async {
+    const task = InstallTask(
+      kind: InstallKind.watchface,
+      fileName: 'demo.face',
+      stage: InstallStage.awaitingDevice,
+      message: '等待设备安装结果',
+      currentSegment: 4,
+      totalSegments: 4,
+      confirmedBytes: 4096,
+      queuedSegment: 4,
+      queuedBytes: 4096,
+      totalBytes: 4096,
+      bytesPerSecond: 2048,
+      transferElapsed: Duration(seconds: 2),
+    );
+
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: InstallTaskCard(
+          task: task,
+          onCancel: () async {},
+          onCheck: () async {},
+          onRetry: () async {},
+        ),
+      ),
+    ));
+
+    expect(find.text('取消'), findsNothing);
+    expect(find.text('100.0%'), findsOneWidget);
+  });
+
+  testWidgets('安装卡片确认后才取消传输', (tester) async {
+    var cancelCalls = 0;
+    const task = InstallTask(
+      kind: InstallKind.watchface,
+      fileName: 'demo.face',
+      stage: InstallStage.transferring,
+      message: '传输中',
+      faceId: '1234',
+      currentSegment: 1,
+      totalSegments: 4,
+      confirmedBytes: 1024,
+      totalBytes: 4096,
+      transferElapsed: Duration(seconds: 3),
+    );
+
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: InstallTaskCard(
+          task: task,
+          onCancel: () async => cancelCalls++,
+          onCheck: () async {},
+          onRetry: () async {},
+        ),
+      ),
+    ));
+
+    await tester.tap(find.text('取消'));
+    await tester.pumpAndSettle();
+    expect(find.text('取消后已传输分片作废'), findsOneWidget);
+    expect(cancelCalls, 0);
+    await tester.tap(find.text('继续安装'));
+    await tester.pumpAndSettle();
+    expect(cancelCalls, 0);
+
+    await tester.tap(find.text('取消'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('确认取消'));
+    await tester.pumpAndSettle();
+    expect(cancelCalls, 1);
+  });
+
+  testWidgets('安装卡片完成态显示用时和平均速度并可清除', (tester) async {
+    var clearCalls = 0;
+    const task = InstallTask(
+      kind: InstallKind.quickApp,
+      fileName: 'demo.rpk',
+      stage: InstallStage.succeeded,
+      message: '安装完成',
+      packageName: 'com.example.demo',
+      versionCode: 42,
+      confirmedBytes: 8192,
+      totalBytes: 8192,
+      elapsed: Duration(seconds: 65),
+      transferElapsed: Duration(seconds: 4),
+      averageBytesPerSecond: 2048,
+    );
+
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: InstallTaskCard(
+          task: task,
+          onCancel: () async {},
+          onCheck: () async {},
+          onRetry: () async {},
+          onClear: () => clearCalls++,
+        ),
+      ),
+    ));
+
+    expect(find.byIcon(Icons.check_circle), findsOneWidget);
+    expect(find.text('demo.rpk 安装完成'), findsOneWidget);
+    expect(find.text('用时 1 分 5 秒 · 平均速度 2.0 KB/s'), findsOneWidget);
+    expect(find.text('取消'), findsNothing);
+    await tester.tap(find.text('清除'));
+    expect(clearCalls, 1);
+  });
+
+  testWidgets('安装卡片失败态显示错误原因且隐藏取消', (tester) async {
+    const task = InstallTask(
+      kind: InstallKind.watchface,
+      fileName: 'broken.face',
+      stage: InstallStage.failed,
+      message: '设备拒绝安装',
+    );
+
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: InstallTaskCard(
+          task: task,
+          onCancel: () async {},
+          onCheck: () async {},
+          onRetry: () async {},
+        ),
+      ),
+    ));
+
+    expect(find.byIcon(Icons.error), findsOneWidget);
+    expect(find.text('设备拒绝安装'), findsOneWidget);
+    expect(find.text('取消'), findsNothing);
   });
 
   testWidgets('分辨率不匹配弹窗允许取消或继续安装', (tester) async {

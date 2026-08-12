@@ -39,6 +39,9 @@ final class CentralManagerImpl
   final StreamController<GATTCharacteristicNotifiedEventArgs>
   _characteristicNotifiedController;
   final Map<int, DiscoveryArgs> _discoveriesArgs;
+  // Native initialization registers the Windows advertisement watcher callback.
+  // Retain this Future so the first scan cannot race that setup.
+  late final Future<void> _initialization;
 
   BluetoothLowEnergyState _state;
 
@@ -52,7 +55,7 @@ final class CentralManagerImpl
       _discoveriesArgs = {},
       _state = BluetoothLowEnergyState.unknown {
     CentralManagerFlutterApi.setUp(this);
-    _initialize();
+    _initialization = _initialize();
   }
 
   @override
@@ -84,6 +87,9 @@ final class CentralManagerImpl
 
   @override
   Future<void> startDiscovery({List<UUID>? serviceUUIDs}) async {
+    // On a fresh app start, calling StartDiscovery before initialize() has
+    // registered watcher.Received makes WinRT reject the request.
+    await _initialization;
     _discoveriesArgs.clear();
     final serviceUUIDsArgs =
         serviceUUIDs?.map((uuid) => uuid.toArgs()).toList() ?? [];
@@ -431,10 +437,11 @@ final class CentralManagerImpl
       try {
         _logger.info('initialize');
         await _api.initialize();
-        _getState();
-      } catch (e) {
-        _logger.severe('initialize failed.', e);
+      } catch (error, stackTrace) {
+        _logger.severe('initialize failed.', error, stackTrace);
+        rethrow;
       }
+      unawaited(_getState());
     });
   }
 

@@ -1,20 +1,14 @@
-import 'dart:math' as math;
-
 import 'package:flutter/material.dart';
 
 import '../domain/install_task.dart';
 
-/// Material 3 summary for one active or completed installation.
-///
-/// The grey layer is data submitted to RFCOMM; the primary-colour layer is
-/// data confirmed by cumulative device ACKs. Animation is visual only and
-/// never changes the protocol checkpoint.
 class InstallTaskCard extends StatelessWidget {
   const InstallTaskCard({
     required this.task,
     required this.onCancel,
     required this.onCheck,
     required this.onRetry,
+    this.onClear,
     super.key,
   });
 
@@ -22,139 +16,376 @@ class InstallTaskCard extends StatelessWidget {
   final Future<void> Function() onCancel;
   final Future<void> Function() onCheck;
   final Future<void> Function() onRetry;
+  final VoidCallback? onClear;
+
+  bool get _isDone => task.stage == InstallStage.succeeded;
+
+  bool get _isFailure =>
+      task.stage == InstallStage.failed ||
+      task.stage == InstallStage.stateUnknown;
+
+  bool get _canCancel =>
+      task.stage == InstallStage.waitingForProtocol ||
+      task.stage == InstallStage.validating ||
+      task.stage == InstallStage.transferring;
+
+  bool get _showProgress =>
+      (task.stage == InstallStage.transferring ||
+          task.stage == InstallStage.awaitingDevice) &&
+      (task.totalBytes ?? 0) > 0;
 
   String _kilobytes(num bytes) => '${(bytes / 1024).toStringAsFixed(1)} KB';
 
-  String _speed(double? bytesPerSecond) => bytesPerSecond == null
-      ? '测速中…'
-      : '${(bytesPerSecond / 1024).toStringAsFixed(1)} KB/s';
+  String _speed(double? value, {String unavailable = '测速中…'}) {
+    if (value == null || !value.isFinite || value <= 0) return unavailable;
+    final megabytesPerSecond = value / (1024 * 1024);
+    return megabytesPerSecond >= 1
+        ? '${megabytesPerSecond.toStringAsFixed(1)} MB/s'
+        : '${(value / 1024).toStringAsFixed(1)} KB/s';
+  }
 
-  String _stageLabel(InstallStage stage) => switch (stage) {
-        InstallStage.idle => '待处理',
-        InstallStage.validating => '校验中',
-        InstallStage.waitingForProtocol => '等待协议',
-        InstallStage.transferring => '传输中',
-        InstallStage.awaitingDevice => '设备安装中',
-        InstallStage.succeeded => '已完成',
-        InstallStage.cancelled => '已取消',
-        InstallStage.stateUnknown => '状态未知',
-        InstallStage.failed => '安装失败',
+  String _duration(Duration? value) {
+    if (value == null) return '—';
+    if (value < const Duration(seconds: 1)) return '< 1 秒';
+    final hours = value.inHours;
+    final minutes = value.inMinutes.remainder(60);
+    final seconds = value.inSeconds.remainder(60);
+    if (hours > 0) return '$hours 小时 $minutes 分';
+    if (minutes > 0) return '$minutes 分 $seconds 秒';
+    return '$seconds 秒';
+  }
+
+  TextStyle _tabular(TextStyle? base) => (base ?? const TextStyle()).copyWith(
+        fontFeatures: const [FontFeature.tabularFigures()],
+      );
+
+  String _typeSummary() => switch (task.kind) {
+        InstallKind.watchface => [
+            '表盘',
+            if (task.faceId case final faceId?) 'ID $faceId',
+          ].join(' · '),
+        InstallKind.quickApp => [
+            '快应用',
+            if (task.packageName case final packageName?) packageName,
+            if (task.versionCode case final versionCode?) '版本：$versionCode',
+          ].join(' · '),
       };
 
-  String? _packageSummary() => switch (task.kind) {
-        InstallKind.watchface when task.faceId != null =>
-          'faceId：${task.faceId}',
-        InstallKind.quickApp when task.packageName != null =>
-          '包名：${task.packageName}${task.versionCode == null ? '' : ' · 版本：${task.versionCode}'}',
-        _ => null,
-      };
+  IconData get _headerIcon {
+    if (_isDone) return Icons.check_circle;
+    if (_isFailure) return Icons.error;
+    if (task.stage == InstallStage.cancelled) return Icons.cancel_outlined;
+    return task.kind == InstallKind.watchface ? Icons.watch : Icons.apps;
+  }
+
+  String get _title => _isDone ? '${task.fileName} 安装完成' : task.fileName;
+
+  String _subtitle() {
+    if (_isDone) {
+      return '用时 ${_duration(task.elapsed)} · '
+          '平均速度 ${_speed(task.averageBytesPerSecond, unavailable: '—')}';
+    }
+    if (_isFailure) return task.message;
+    return _typeSummary();
+  }
+
+  Duration? _eta(int confirmedBytes, int totalBytes) {
+    final speed = task.bytesPerSecond;
+    final elapsed = task.transferElapsed;
+    if (task.stage != InstallStage.transferring ||
+        speed == null ||
+        !speed.isFinite ||
+        speed <= 0 ||
+        elapsed == null ||
+        elapsed < const Duration(seconds: 2) ||
+        confirmedBytes >= totalBytes) {
+      return null;
+    }
+    return Duration(
+      seconds: ((totalBytes - confirmedBytes) / speed).ceil(),
+    );
+  }
+
+  Future<void> _confirmCancel(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('取消安装？'),
+        content: const Text('取消后已传输分片作废'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('继续安装'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('确认取消'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) await onCancel();
+  }
 
   @override
-  Widget build(BuildContext context) => Card(
-        margin: const EdgeInsets.only(top: 12),
-        child: ListTile(
-          leading: const Icon(Icons.info_outline),
-          title: Text(task.fileName),
-          subtitle: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(task.message),
-              if (_packageSummary() case final summary?) ...[
-                const SizedBox(height: 4),
-                Text(summary),
-              ],
-              if (task.targetDeviceName case final target?)
-                Text('目标设备：$target'),
-              if (task.md5Hex case final digest?)
-                Text(
-                  'MD5：$digest',
-                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                        fontFamily: 'monospace',
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
+    final totalBytes = task.totalBytes ?? 0;
+    final confirmedBytes = (task.confirmedBytes ?? 0).clamp(0, totalBytes);
+    final submittedBytes =
+        (task.queuedBytes ?? confirmedBytes).clamp(confirmedBytes, totalBytes);
+    final percentage = totalBytes > 0 ? confirmedBytes * 100 / totalBytes : 0.0;
+    final eta = _eta(confirmedBytes, totalBytes);
+    final headerColor = _isFailure ? colors.error : colors.primary;
+
+    return Card(
+      margin: const EdgeInsets.only(top: 12),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Container(
+                  width: 40,
+                  height: 40,
+                  decoration: BoxDecoration(
+                    color: colors.surfaceContainerHigh,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Icon(_headerIcon, color: headerColor),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        _title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.titleSmall,
                       ),
+                      const SizedBox(height: 2),
+                      Tooltip(
+                        message: _subtitle(),
+                        child: Text(
+                          _subtitle(),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: _tabular(theme.textTheme.bodySmall?.copyWith(
+                            color: _isFailure
+                                ? colors.error
+                                : colors.onSurfaceVariant,
+                          )),
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
-              if ((task.totalBytes ?? 0) > 0) ...[
-                const SizedBox(height: 8),
-                _InstallProgressBar(
-                  confirmedBytes: task.confirmedBytes ?? 0,
-                  queuedBytes: task.queuedBytes ?? task.confirmedBytes ?? 0,
-                  totalBytes: task.totalBytes!,
-                ),
-                const SizedBox(height: 4),
+                const SizedBox(width: 12),
+                if (_canCancel)
+                  OutlinedButton(
+                    style: OutlinedButton.styleFrom(
+                      minimumSize: const Size(0, 36),
+                      padding: const EdgeInsets.symmetric(horizontal: 14),
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    onPressed: () => _confirmCancel(context),
+                    child: const Text('取消'),
+                  )
+                else if (_isDone && onClear != null)
+                  TextButton(
+                    onPressed: onClear,
+                    child: const Text('清除'),
+                  ),
               ],
-              if (task.currentSegment case final current?)
-                Text(
-                  '设备确认：片 $current/${task.totalSegments ?? '?'} · '
-                  '${_kilobytes(task.confirmedBytes ?? 0)}/'
-                  '${_kilobytes(task.totalBytes ?? 0)}'
-                  '${(task.totalBytes ?? 0) > 0 ? ' · ${((task.confirmedBytes ?? 0) * 100 / task.totalBytes!).toStringAsFixed(1)}%' : ''}'
-                  ' · ${_speed(task.bytesPerSecond)}'
-                  '${task.queuedSegment != null ? '（已提交至 ${task.queuedSegment}/${task.totalSegments ?? '?'} 片）' : ''}',
-                ),
-            ],
-          ),
-          trailing: switch (task.stage) {
-            InstallStage.waitingForProtocol ||
-            InstallStage.transferring ||
-            InstallStage.awaitingDevice =>
-              TextButton(onPressed: onCancel, child: const Text('取消')),
-            InstallStage.cancelled ||
-            InstallStage.stateUnknown =>
-              PopupMenuButton<String>(
-                tooltip: '恢复操作',
-                onSelected: (value) {
-                  if (value == 'check') {
-                    onCheck();
-                  } else {
-                    onRetry();
-                  }
-                },
-                itemBuilder: (context) => const [
-                  PopupMenuItem(value: 'check', child: Text('重新连接并检查')),
-                  PopupMenuItem(value: 'retry', child: Text('从头重试')),
+            ),
+            if (_showProgress) ...[
+              const SizedBox(height: 16),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text(
+                    '${percentage.toStringAsFixed(1)}%',
+                    style: _tabular(theme.textTheme.headlineLarge?.copyWith(
+                      fontSize: 36,
+                      fontWeight: FontWeight.w600,
+                    )),
+                  ),
+                  const Spacer(),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      Text(
+                        _speed(task.bytesPerSecond),
+                        style: _tabular(theme.textTheme.titleSmall),
+                      ),
+                      if (eta != null)
+                        Text(
+                          '预计剩余 ${_duration(eta)}',
+                          style: _tabular(
+                            theme.textTheme.bodySmall?.copyWith(
+                              color: colors.onSurfaceVariant,
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
                 ],
               ),
-            _ => Text(_stageLabel(task.stage)),
-          },
+              const SizedBox(height: 10),
+              _InstallProgressBar(
+                confirmedBytes: confirmedBytes,
+                submittedBytes: submittedBytes,
+                totalBytes: totalBytes,
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      '设备确认 ${task.currentSegment ?? 0}/'
+                      '${task.totalSegments ?? '?'} 片 · '
+                      '${_kilobytes(confirmedBytes)}/${_kilobytes(totalBytes)}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: _tabular(theme.textTheme.bodySmall?.copyWith(
+                        color: colors.onSurfaceVariant,
+                      )),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  _ProgressLegend(
+                    confirmedColor: colors.primary,
+                    submittedColor: colors.primaryContainer,
+                  ),
+                ],
+              ),
+            ],
+            if (!_showProgress && !_isDone && !_isFailure) ...[
+              const SizedBox(height: 10),
+              Text(
+                task.message,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: colors.onSurfaceVariant,
+                ),
+              ),
+            ],
+            ExpansionTile(
+              tilePadding: EdgeInsets.zero,
+              childrenPadding: EdgeInsets.zero,
+              shape: const Border(),
+              collapsedShape: const Border(),
+              title: const Text('详情'),
+              children: [
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: Column(
+                    children: [
+                      _DetailRow(
+                        label: 'MD5',
+                        value: SelectableText(
+                          task.md5Hex ?? '—',
+                          style: _tabular(theme.textTheme.bodySmall?.copyWith(
+                            fontFamily: 'monospace',
+                          )),
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      _DetailRow(
+                        label: '目标设备',
+                        value: Text(
+                          task.targetDeviceName ?? '—',
+                          style: theme.textTheme.bodySmall,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      _DetailRow(
+                        label: '已提交分片',
+                        value: Text(
+                          '${task.queuedSegment ?? task.currentSegment ?? 0}/'
+                          '${task.totalSegments ?? '?'}',
+                          style: _tabular(theme.textTheme.bodySmall),
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      _DetailRow(
+                        label: '当前阶段',
+                        value: Text(
+                          task.stage.name,
+                          style: theme.textTheme.bodySmall,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            if (task.stage == InstallStage.cancelled ||
+                task.stage == InstallStage.stateUnknown)
+              Align(
+                alignment: Alignment.centerRight,
+                child: Wrap(
+                  spacing: 8,
+                  children: [
+                    TextButton(
+                      onPressed: onCheck,
+                      child: const Text('重新连接并检查'),
+                    ),
+                    TextButton(
+                      onPressed: onRetry,
+                      child: const Text('从头重试'),
+                    ),
+                  ],
+                ),
+              ),
+          ],
         ),
-      );
+      ),
+    );
+  }
 }
 
 class _InstallProgressBar extends StatelessWidget {
   const _InstallProgressBar({
     required this.confirmedBytes,
-    required this.queuedBytes,
+    required this.submittedBytes,
     required this.totalBytes,
   });
 
   final int confirmedBytes;
-  final int queuedBytes;
+  final int submittedBytes;
   final int totalBytes;
 
   @override
   Widget build(BuildContext context) {
-    final confirmed = confirmedBytes.clamp(0, totalBytes) / totalBytes;
-    final queued = queuedBytes.clamp(0, totalBytes) / totalBytes;
     final colors = Theme.of(context).colorScheme;
-    return TweenAnimationBuilder<double>(
-      tween: Tween<double>(end: queued),
-      duration: const Duration(milliseconds: 300),
-      curve: Curves.easeOutCubic,
-      builder: (context, animatedQueued, child) =>
-          TweenAnimationBuilder<double>(
-        tween: Tween<double>(end: confirmed),
-        duration: const Duration(milliseconds: 450),
-        curve: Curves.easeOutCubic,
-        builder: (context, animatedConfirmed, child) => SizedBox(
-          height: 14,
-          width: double.infinity,
-          child: CustomPaint(
-            painter: _InstallProgressPainter(
-              confirmed: animatedConfirmed,
-              queued: animatedQueued,
-              confirmedColor: colors.primary,
-              queuedColor: Colors.grey.shade400,
-              trackColor: Colors.white,
-            ),
+    final confirmed = (confirmedBytes / totalBytes).clamp(0.0, 1.0);
+    final submitted = (submittedBytes / totalBytes).clamp(confirmed, 1.0);
+    return Semantics(
+      label: '安装进度',
+      value: '${(confirmed * 100).toStringAsFixed(1)}%',
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(3),
+        child: SizedBox(
+          height: 6,
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: ColoredBox(color: colors.surfaceContainerHighest),
+              ),
+              FractionallySizedBox(
+                widthFactor: submitted,
+                child: ColoredBox(color: colors.primaryContainer),
+              ),
+              FractionallySizedBox(
+                widthFactor: confirmed,
+                child: ColoredBox(color: colors.primary),
+              ),
+            ],
           ),
         ),
       ),
@@ -162,62 +393,78 @@ class _InstallProgressBar extends StatelessWidget {
   }
 }
 
-class _InstallProgressPainter extends CustomPainter {
-  const _InstallProgressPainter({
-    required this.confirmed,
-    required this.queued,
+class _ProgressLegend extends StatelessWidget {
+  const _ProgressLegend({
     required this.confirmedColor,
-    required this.queuedColor,
-    required this.trackColor,
+    required this.submittedColor,
   });
 
-  final double confirmed;
-  final double queued;
   final Color confirmedColor;
-  final Color queuedColor;
-  final Color trackColor;
+  final Color submittedColor;
 
   @override
-  void paint(Canvas canvas, Size size) {
-    const trackWidth = 10.0;
-    const queuedWidth = 8.0;
-    const confirmedWidth = 6.0;
-    final centerY = size.height / 2;
-    const left = trackWidth / 2;
-    final usableWidth = math.max(0.0, size.width - trackWidth);
+  Widget build(BuildContext context) => Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _LegendItem(color: confirmedColor, label: '已确认'),
+          const SizedBox(width: 10),
+          _LegendItem(color: submittedColor, label: '已提交待确认'),
+        ],
+      );
+}
 
-    Paint line(Color color, double width) => Paint()
-      ..color = color
-      ..strokeWidth = width
-      ..strokeCap = StrokeCap.round
-      ..style = PaintingStyle.stroke;
+class _LegendItem extends StatelessWidget {
+  const _LegendItem({required this.color, required this.label});
 
-    canvas.drawLine(
-      Offset(left, centerY),
-      Offset(left + usableWidth, centerY),
-      line(trackColor, trackWidth),
+  final Color color;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) => Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 8,
+            height: 8,
+            decoration: BoxDecoration(
+              color: color,
+              borderRadius: BorderRadius.circular(1),
+            ),
+          ),
+          const SizedBox(width: 4),
+          Text(
+            label,
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+          ),
+        ],
+      );
+}
+
+class _DetailRow extends StatelessWidget {
+  const _DetailRow({required this.label, required this.value});
+
+  final String label;
+  final Widget value;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 88,
+          child: Text(
+            label,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ),
+        Expanded(child: value),
+      ],
     );
-    if (queued > 0) {
-      canvas.drawLine(
-        Offset(left, centerY),
-        Offset(left + usableWidth * queued, centerY),
-        line(queuedColor, queuedWidth),
-      );
-    }
-    if (confirmed > 0) {
-      canvas.drawLine(
-        Offset(left, centerY),
-        Offset(left + usableWidth * confirmed, centerY),
-        line(confirmedColor, confirmedWidth),
-      );
-    }
   }
-
-  @override
-  bool shouldRepaint(_InstallProgressPainter oldDelegate) =>
-      oldDelegate.confirmed != confirmed ||
-      oldDelegate.queued != queued ||
-      oldDelegate.confirmedColor != confirmedColor ||
-      oldDelegate.queuedColor != queuedColor ||
-      oldDelegate.trackColor != trackColor;
 }

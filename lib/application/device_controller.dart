@@ -118,6 +118,12 @@ class DeviceController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Dismisses the current installation summary without changing queue history.
+  void clearLatestTask() {
+    latestTask = null;
+    notifyListeners();
+  }
+
   /// 串行执行队列。
   Future<void> runQueue() async {
     if (_queueRunning) return;
@@ -804,6 +810,10 @@ class DeviceController extends ChangeNotifier {
   DateTime? _lastSpeedSampleAt;
   int _lastSpeedSampleBytes = 0;
   double? _confirmedBytesPerSecond;
+  Stopwatch? _installStopwatch;
+  Stopwatch? _transferStopwatch;
+  Duration? _completedTransferElapsed;
+  int _transferStartConfirmedBytes = 0;
 
   /// 处理 RFCOMM 收到的字节：先试 SppPacket（版本回包），再增量解析 L1 帧。
   void _handleSppData(Uint8List data) {
@@ -1254,6 +1264,10 @@ class DeviceController extends ChangeNotifier {
     _installInProgress = true;
     _lastInstallRequest = request;
     _installCancelled = false;
+    _installStopwatch = Stopwatch()..start();
+    _transferStopwatch = null;
+    _completedTransferElapsed = null;
+    _transferStartConfirmedBytes = 0;
     _installCancellation = Completer<void>();
     _installTransportFailure = Completer<Object>();
     try {
@@ -1290,6 +1304,12 @@ class DeviceController extends ChangeNotifier {
       _pendingMassAckOrder.clear();
       _pendingMassProgress.clear();
       _resetTransferSpeed();
+      _installStopwatch?.stop();
+      _transferStopwatch?.stop();
+      _installStopwatch = null;
+      _transferStopwatch = null;
+      _completedTransferElapsed = null;
+      _transferStartConfirmedBytes = 0;
       _installCancellation = null;
       _installTransportFailure = null;
       _installInProgress = false;
@@ -1472,7 +1492,7 @@ class DeviceController extends ChangeNotifier {
     // numbers, cumulative ACK handling, and timeout behavior stay unchanged.
     final massAckWindow = massWindowSize;
     var confirmedFileBytes = sentLength;
-    _resetTransferSpeed(confirmedBytes: sentLength);
+    _beginTransferTiming(confirmedBytes: sentLength);
     _publishTask(
       request,
       InstallStage.transferring,
@@ -1537,10 +1557,13 @@ class DeviceController extends ChangeNotifier {
         await Future<void>.delayed(Duration(milliseconds: segmentIntervalMs));
       }
     }
+    _finishTransferTiming();
     _publishTask(request, InstallStage.awaitingDevice, '文件已确认发送，正在等待设备安装结果。',
         currentSegment: totalSegments,
         totalSegments: totalSegments,
         confirmedBytes: bytes.length,
+        queuedSegment: totalSegments,
+        queuedBytes: bytes.length,
         totalBytes: bytes.length,
         bytesPerSecond: _confirmedBytesPerSecond);
     await _checkpointStore.save(InstallCheckpoint(
@@ -1979,6 +2002,23 @@ class DeviceController extends ChangeNotifier {
     _confirmedBytesPerSecond = null;
   }
 
+  void _beginTransferTiming({required int confirmedBytes}) {
+    _transferStartConfirmedBytes = confirmedBytes;
+    _completedTransferElapsed = null;
+    _transferStopwatch = Stopwatch()..start();
+    _resetTransferSpeed(confirmedBytes: confirmedBytes);
+  }
+
+  void _finishTransferTiming() {
+    final stopwatch = _transferStopwatch;
+    if (stopwatch == null) return;
+    stopwatch.stop();
+    _completedTransferElapsed = stopwatch.elapsed;
+  }
+
+  Duration? get _currentTransferElapsed =>
+      _completedTransferElapsed ?? _transferStopwatch?.elapsed;
+
   void _updateTransferSpeed(int confirmedBytes) {
     final now = DateTime.now();
     final previousAt = _lastSpeedSampleAt;
@@ -2004,6 +2044,38 @@ class DeviceController extends ChangeNotifier {
       int? queuedBytes,
       int? totalBytes,
       double? bytesPerSecond}) {
+    final previous = latestTask;
+    final sameTask = previous != null &&
+        previous.kind == request.kind &&
+        previous.fileName == request.metadata.fileName &&
+        previous.md5Hex == request.metadata.md5Hex;
+    final keepProgress = sameTask &&
+        stage != InstallStage.validating &&
+        stage != InstallStage.waitingForProtocol;
+    final resolvedCurrentSegment =
+        currentSegment ?? (keepProgress ? previous.currentSegment : null);
+    final resolvedTotalSegments =
+        totalSegments ?? (keepProgress ? previous.totalSegments : null);
+    final resolvedConfirmedBytes =
+        confirmedBytes ?? (keepProgress ? previous.confirmedBytes : null);
+    final resolvedQueuedSegment =
+        queuedSegment ?? (keepProgress ? previous.queuedSegment : null);
+    final resolvedQueuedBytes =
+        queuedBytes ?? (keepProgress ? previous.queuedBytes : null);
+    final resolvedTotalBytes =
+        totalBytes ?? (keepProgress ? previous.totalBytes : null);
+    final resolvedSpeed =
+        bytesPerSecond ?? (keepProgress ? previous.bytesPerSecond : null);
+    final transferElapsed = _currentTransferElapsed;
+    final transferredBytes =
+        (resolvedConfirmedBytes ?? 0) - _transferStartConfirmedBytes;
+    final averageBytesPerSecond = transferElapsed != null &&
+            transferElapsed.inMicroseconds > 0 &&
+            transferredBytes > 0
+        ? transferredBytes *
+            Duration.microsecondsPerSecond /
+            transferElapsed.inMicroseconds
+        : null;
     latestTask = InstallTask(
         kind: request.kind,
         fileName: request.metadata.fileName,
@@ -2014,13 +2086,16 @@ class DeviceController extends ChangeNotifier {
         faceId: request.metadata.faceId,
         packageName: request.metadata.packageName,
         versionCode: request.metadata.versionCode,
-        currentSegment: currentSegment,
-        totalSegments: totalSegments,
-        confirmedBytes: confirmedBytes,
-        queuedSegment: queuedSegment,
-        queuedBytes: queuedBytes,
-        totalBytes: totalBytes,
-        bytesPerSecond: bytesPerSecond);
+        currentSegment: resolvedCurrentSegment,
+        totalSegments: resolvedTotalSegments,
+        confirmedBytes: resolvedConfirmedBytes,
+        queuedSegment: resolvedQueuedSegment,
+        queuedBytes: resolvedQueuedBytes,
+        totalBytes: resolvedTotalBytes,
+        bytesPerSecond: resolvedSpeed,
+        elapsed: _installStopwatch?.elapsed,
+        transferElapsed: transferElapsed,
+        averageBytesPerSecond: averageBytesPerSecond);
     final shouldLog = stage != InstallStage.transferring ||
         currentSegment == 1 ||
         currentSegment == totalSegments ||

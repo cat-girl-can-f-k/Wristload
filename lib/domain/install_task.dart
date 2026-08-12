@@ -30,6 +30,9 @@ class InstallTask {
     this.queuedBytes,
     this.totalBytes,
     this.bytesPerSecond,
+    this.elapsed,
+    this.transferElapsed,
+    this.averageBytesPerSecond,
   });
 
   final InstallKind kind;
@@ -50,4 +53,13 @@ class InstallTask {
 
   /// 基于设备累计 ACK 的实际确认速度；排队但尚未确认的字节不计入速度。
   final double? bytesPerSecond;
+
+  /// 从安装流程开始到当前状态（或结束状态）的总耗时。
+  final Duration? elapsed;
+
+  /// 文件传输耗时，不包含设备侧安装等待时间。
+  final Duration? transferElapsed;
+
+  /// 基于本次实际传输字节与传输耗时计算的平均速度。
+  final double? averageBytesPerSecond;
 }
