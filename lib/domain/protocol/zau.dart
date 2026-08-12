@@ -22,12 +22,109 @@ import 'proto_wire.dart';
 
 /// 表盘 / RPK / Mass 命令号（zau.e）。
 abstract final class ZauCommand {
+  /// Device basic-status requests. Battery is sub-command 1 and storage is
+  /// sub-command 62.
+  static const int basicStatus = 2;
+  static const int storageStatus = 62;
+
   /// Official Vela system-time sync request (TimeSyncer): command=2, sub=3.
   static const int setSystemTime = 2;
 
   static const int setFace = 4; // 表盘：预装(f=4) / setFace(f=1)
   static const int prepareInstallApp = 20; // RPK 预装
   static const int massTransfer = 22; // Mass 文件传输（MassPrepare/MassData 控制）
+}
+
+/// Parses the battery percentage returned by the official V2 basic-status
+/// request (`command=2`, `sub=1`).
+///
+/// Response layout: `zau.field4=ysr`, `ysr.field2=asr`,
+/// `asr.field1=status`, `status.field1=batteryPercent`. Missing, malformed, or
+/// out-of-range values remain unknown instead of being presented as 0%.
+abstract final class BatteryStatusPayload {
+  static int? parse((int, List<int>)? payload) {
+    if (payload == null || payload.$1 != 4) return null;
+    try {
+      final asrBytes = _messageField(payload.$2, 2);
+      if (asrBytes == null) return null;
+      final statusBytes = _messageField(asrBytes, 1);
+      if (statusBytes == null) return null;
+      final battery = _intField(statusBytes, 1);
+      if (battery == null || battery < 0 || battery > 100) return null;
+      return battery;
+    } on FormatException {
+      return null;
+    }
+  }
+
+  static List<int>? _messageField(List<int> bytes, int expectedField) {
+    final reader = ProtoReader(bytes);
+    while (!reader.isAtEnd) {
+      final (field, wire) = reader.readFieldHeader();
+      if (field == expectedField && wire == 2) return reader.readBytes();
+      reader.skipField(wire);
+    }
+    return null;
+  }
+
+  static int? _intField(List<int> bytes, int expectedField) {
+    final reader = ProtoReader(bytes);
+    while (!reader.isAtEnd) {
+      final (field, wire) = reader.readFieldHeader();
+      if (field == expectedField && wire == 0) return reader.readVarint();
+      reader.skipField(wire);
+    }
+    return null;
+  }
+}
+
+/// Parses the storage usage returned by the official music-page query
+/// (`command=2`, `sub=62`).
+///
+/// The complete log from Xiaomi Fitness 9.23.35 confirms this wire layout:
+/// `zau.field4=ysr`, `ysr.field44=xsr`, where `xsr.field1` is used bytes and
+/// `xsr.field2` is total bytes. The response is still an outer `2/62` ZAU
+/// message; field 4 selects the payload and is not a response command.
+abstract final class StorageStatusPayload {
+  static ({int usedBytes, int totalBytes})? parse((int, List<int>)? payload) {
+    if (payload == null || payload.$1 != 4) return null;
+    try {
+      final ysr = ProtoReader(payload.$2);
+      List<int>? storageBytes;
+      while (!ysr.isAtEnd) {
+        final (field, wire) = ysr.readFieldHeader();
+        if (field == 44 && wire == 2) {
+          storageBytes = ysr.readBytes();
+        } else {
+          ysr.skipField(wire);
+        }
+      }
+      if (storageBytes == null) return null;
+
+      final storage = ProtoReader(storageBytes);
+      int? usedBytes;
+      int? totalBytes;
+      while (!storage.isAtEnd) {
+        final (field, wire) = storage.readFieldHeader();
+        if (field == 1 && wire == 0) {
+          usedBytes = storage.readVarint();
+        } else if (field == 2 && wire == 0) {
+          totalBytes = storage.readVarint();
+        } else {
+          storage.skipField(wire);
+        }
+      }
+      if (usedBytes == null ||
+          totalBytes == null ||
+          totalBytes <= 0 ||
+          usedBytes > totalBytes) {
+        return null;
+      }
+      return (usedBytes: usedBytes, totalBytes: totalBytes);
+    } on FormatException {
+      return null;
+    }
+  }
 }
 
 /// Payload used by the official V2/Vela TimeSyncer.

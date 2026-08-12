@@ -1972,15 +1972,57 @@ class DeviceController extends ChangeNotifier {
           !identical(_sessionCipher, session)) {
         return;
       }
-      // StorageManager uses the official Profile Channel API (module 62,
-      // request command 3 / response command 4), not a ZAU 2/62 message.
-      // RFCOMM currently implements PB WRITE_ENC and Mass only, so leave the
-      // values unknown instead of sending an invalid request that blocks for
-      // twelve seconds or interpreting unrelated business notifications.
+      batteryPercent = null;
+      try {
+        final response = await _requestBusiness(
+          Zau(command: ZauCommand.basicStatus, sub: 1),
+          ZauCommand.basicStatus,
+          1,
+        );
+        if (refreshEpoch != _sessionEpoch ||
+            !sessionReady ||
+            !identical(_sessionCipher, session)) {
+          return;
+        }
+        final battery = BatteryStatusPayload.parse(response.payload);
+        if (battery == null) {
+          _log('设备电量响应缺少有效百分比，保持未知状态');
+        } else {
+          batteryPercent = battery;
+          _log('设备电量：$battery%');
+        }
+      } on Object catch (exception) {
+        _log('读取设备电量失败，保持未知状态：$exception');
+      }
+      if (refreshEpoch != _sessionEpoch ||
+          !sessionReady ||
+          !identical(_sessionCipher, session)) {
+        return;
+      }
       storageUsedBytes = null;
       storageTotalBytes = null;
-      _log(
-          '设备存储暂不可用：StorageManager module=62、cmd=3/4 使用独立 Profile Channel，当前 RFCOMM 尚未实现该封装');
+      try {
+        final response = await _requestBusiness(
+          Zau(command: ZauCommand.basicStatus, sub: ZauCommand.storageStatus),
+          ZauCommand.basicStatus,
+          ZauCommand.storageStatus,
+        );
+        if (refreshEpoch != _sessionEpoch ||
+            !sessionReady ||
+            !identical(_sessionCipher, session)) {
+          return;
+        }
+        final storage = StorageStatusPayload.parse(response.payload);
+        if (storage == null) {
+          _log('设备存储响应缺少有效容量，保持未知状态');
+        } else {
+          storageUsedBytes = storage.usedBytes;
+          storageTotalBytes = storage.totalBytes;
+          _log('设备存储：已用 ${storage.usedBytes} / 总计 ${storage.totalBytes} 字节');
+        }
+      } on Object catch (exception) {
+        _log('读取设备存储失败，保持未知状态：$exception');
+      }
     } on Object catch (exception) {
       _log('设备状态刷新失败：$exception');
     } finally {

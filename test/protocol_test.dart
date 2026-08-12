@@ -239,6 +239,112 @@ void main() {
   });
 
   group('zau', () {
+    test('官方 V2 电量查询请求与 protobuf 字节向量一致', () {
+      expect(
+        Zau(command: ZauCommand.basicStatus, sub: 1).encode(),
+        [0x08, 0x02, 0x10, 0x01],
+      );
+    });
+
+    test('V2 电量响应按官方嵌套字段解析 0、37、100', () {
+      (int, List<int>) payloadFor(int battery) {
+        final status = ProtoWriter()..writeInt(1, battery);
+        final asr = ProtoWriter()..writeMessage(1, status.bytes);
+        final ysr = ProtoWriter()..writeMessage(2, asr.bytes);
+        return (4, ysr.bytes);
+      }
+
+      expect(BatteryStatusPayload.parse(payloadFor(0)), 0);
+      expect(BatteryStatusPayload.parse(payloadFor(37)), 37);
+      expect(BatteryStatusPayload.parse(payloadFor(100)), 100);
+    });
+
+    test('V2 电量响应缺字段、字段错误、畸形或越界时保持未知', () {
+      (int, List<int>) payloadFor(int battery) {
+        final status = ProtoWriter()..writeInt(1, battery);
+        final asr = ProtoWriter()..writeMessage(1, status.bytes);
+        final ysr = ProtoWriter()..writeMessage(2, asr.bytes);
+        return (4, ysr.bytes);
+      }
+
+      expect(BatteryStatusPayload.parse(null), isNull);
+      expect(BatteryStatusPayload.parse((3, const [])), isNull);
+      expect(BatteryStatusPayload.parse((4, const [])), isNull);
+      expect(BatteryStatusPayload.parse((4, const [0x12, 0x04, 0x0a])), isNull);
+      expect(BatteryStatusPayload.parse(payloadFor(101)), isNull);
+    });
+
+    test('官方音乐页存储查询是无载荷 ZAU 2/62', () {
+      final encoded = Zau(
+        command: ZauCommand.basicStatus,
+        sub: ZauCommand.storageStatus,
+      ).encode();
+
+      expect(encoded, [0x08, 0x02, 0x10, 0x3e]);
+      final parsed = Zau.parse(encoded);
+      expect(parsed.command, 2);
+      expect(parsed.sub, 62);
+      expect(parsed.payload, isNull);
+    });
+
+    test('存储响应按 field4/field44 解析日志中的真实容量', () {
+      (int, List<int>) payloadFor(int usedBytes, int totalBytes) {
+        final storage = ProtoWriter()
+          ..writeInt(1, usedBytes)
+          ..writeInt(2, totalBytes);
+        final ysr = ProtoWriter()..writeMessage(44, storage.bytes);
+        return (4, ysr.bytes);
+      }
+
+      expect(
+        StorageStatusPayload.parse(payloadFor(489160704, 2181824512)),
+        (usedBytes: 489160704, totalBytes: 2181824512),
+      );
+      expect(
+        StorageStatusPayload.parse(payloadFor(500695040, 2181824512)),
+        (usedBytes: 500695040, totalBytes: 2181824512),
+      );
+    });
+
+    test('存储响应不能把 zau.field4 误判为 command=4', () {
+      final storage = ProtoWriter()
+        ..writeInt(1, 489160704)
+        ..writeInt(2, 2181824512);
+      final ysr = ProtoWriter()..writeMessage(44, storage.bytes);
+      final response = Zau(
+        command: ZauCommand.basicStatus,
+        sub: ZauCommand.storageStatus,
+        payload: (4, ysr.bytes),
+      );
+      final parsed = Zau.parse(response.encode());
+
+      expect(parsed.command, 2);
+      expect(parsed.sub, 62);
+      expect(parsed.payload!.$1, 4);
+      expect(
+        StorageStatusPayload.parse(parsed.payload),
+        (usedBytes: 489160704, totalBytes: 2181824512),
+      );
+    });
+
+    test('存储响应缺字段、畸形或容量关系无效时保持未知', () {
+      (int, List<int>) payloadFor(int usedBytes, int totalBytes) {
+        final storage = ProtoWriter()
+          ..writeInt(1, usedBytes)
+          ..writeInt(2, totalBytes);
+        final ysr = ProtoWriter()..writeMessage(44, storage.bytes);
+        return (4, ysr.bytes);
+      }
+
+      expect(StorageStatusPayload.parse(null), isNull);
+      expect(StorageStatusPayload.parse((3, const [])), isNull);
+      expect(StorageStatusPayload.parse((4, const [])), isNull);
+      expect(StorageStatusPayload.parse((4, const [0xe2, 0x02, 0x04, 0x08])),
+          isNull);
+      expect(StorageStatusPayload.parse(payloadFor(1, 0)), isNull);
+      expect(StorageStatusPayload.parse(payloadFor(101, 100)), isNull);
+    });
+
     test('官方 V2 时间同步命令与 protobuf 字节向量一致', () {
       final payload = TimeSyncPayload.encode(
         localTime: DateTime(2026, 8, 11, 18, 30, 45, 123),
