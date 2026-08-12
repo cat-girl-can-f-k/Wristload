@@ -116,6 +116,13 @@ class _WristloadAppState extends State<WristloadApp> {
     }
   }
 
+  Future<void> _replayOobe() async {
+    await _oobeStore.markNotCompleted();
+    if (!mounted) return;
+    setState(() => _oobeCompleted = false);
+    _navigatorKey.currentState?.pushNamedAndRemoveUntil('/oobe', (_) => false);
+  }
+
   Widget _buildOobePage() => OobePage(
         installPreference: _preferredInstallTarget,
         onInstallPreferenceChanged: _setOobePreference,
@@ -129,6 +136,7 @@ class _WristloadAppState extends State<WristloadApp> {
           controller: controller,
           preferredInstallTarget: _preferredInstallTarget,
           onPreferredInstallTargetChanged: _setOobePreference,
+          onReplayOobe: _replayOobe,
           floatingInstallWindowEnabled: _floatingInstallWindowEnabled,
           onFloatingInstallWindowEnabledChanged: (enabled) {
             unawaited(_setFloatingInstallWindowEnabled(enabled));
@@ -224,6 +232,7 @@ class AppShell extends StatefulWidget {
     required this.controller,
     required this.preferredInstallTarget,
     required this.onPreferredInstallTargetChanged,
+    required this.onReplayOobe,
     required this.floatingInstallWindowEnabled,
     required this.onFloatingInstallWindowEnabledChanged,
     super.key,
@@ -232,6 +241,7 @@ class AppShell extends StatefulWidget {
   final DeviceController controller;
   final InstallPreference preferredInstallTarget;
   final ValueChanged<InstallPreference> onPreferredInstallTargetChanged;
+  final Future<void> Function() onReplayOobe;
   final bool floatingInstallWindowEnabled;
   final ValueChanged<bool> onFloatingInstallWindowEnabledChanged;
 
@@ -322,6 +332,7 @@ class _AppShellState extends State<AppShell> {
                           widget.onFloatingInstallWindowEnabledChanged,
                       onPreferredInstallTargetChanged:
                           widget.onPreferredInstallTargetChanged,
+                      onReplayOobe: widget.onReplayOobe,
                     ),
                 },
               ),

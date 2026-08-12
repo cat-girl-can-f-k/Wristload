@@ -12,4 +12,9 @@ class OobeStore {
     final preferences = await SharedPreferences.getInstance();
     await preferences.setBool(key, true);
   }
+
+  Future<void> markNotCompleted() async {
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setBool(key, false);
+  }
 }

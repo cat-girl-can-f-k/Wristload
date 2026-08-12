@@ -18,6 +18,7 @@ class TransferSettingsPage extends StatelessWidget {
     required this.onMassWindowSizeChanged,
     this.onAutoTimeSyncChanged,
     this.onFloatingInstallWindowEnabledChanged,
+    this.onReplayOobe,
     required this.onPreferredInstallTargetChanged,
     super.key,
   });
@@ -34,6 +35,7 @@ class TransferSettingsPage extends StatelessWidget {
   final ValueChanged<int> onMassWindowSizeChanged;
   final ValueChanged<bool>? onAutoTimeSyncChanged;
   final ValueChanged<bool>? onFloatingInstallWindowEnabledChanged;
+  final VoidCallback? onReplayOobe;
   final ValueChanged<InstallPreference> onPreferredInstallTargetChanged;
 
   @override
@@ -72,6 +74,16 @@ class TransferSettingsPage extends StatelessWidget {
               subtitle: const Text('可将文件直接拖入右下角悬浮窗安装。'),
               value: floatingInstallWindowEnabled,
               onChanged: onFloatingInstallWindowEnabledChanged,
+            ),
+            const Divider(height: 40),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.replay_outlined),
+              title: const Text('重新查看使用引导'),
+              subtitle: const Text('重置引导完成状态，并立即回到首次使用引导。'),
+              trailing: const Icon(Icons.chevron_right),
+              enabled: onReplayOobe != null,
+              onTap: onReplayOobe,
             ),
             const Divider(height: 40),
             Text('传输', style: theme.textTheme.titleMedium),

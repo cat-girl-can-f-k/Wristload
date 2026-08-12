@@ -536,6 +536,36 @@ void main() {
     expect(changedTo, isTrue);
   });
 
+  testWidgets('设置页重新查看引导入口转发回调', (tester) async {
+    var replayCalls = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: TransferSettingsPage(
+            connectionMode: ConnectionMode.modern,
+            preferredInstallTarget: InstallPreference.watchface,
+            connectionModeEnabled: true,
+            segmentIntervalMs: 5,
+            massWindowSize: 3,
+            onConnectionModeChanged: (_) {},
+            onSegmentIntervalChanged: (_) {},
+            onMassWindowSizeChanged: (_) {},
+            onPreferredInstallTargetChanged: (_) {},
+            onReplayOobe: () => replayCalls++,
+          ),
+        ),
+      ),
+    );
+
+    await tester.scrollUntilVisible(
+      find.text('重新查看使用引导'),
+      250,
+      scrollable: find.byType(Scrollable),
+    );
+    await tester.tap(find.text('重新查看使用引导'));
+    expect(replayCalls, 1);
+  });
+
   testWidgets('Split Button 主区跟随偏好并复用安装回调', (tester) async {
     InstallKind? installed;
 

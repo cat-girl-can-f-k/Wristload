@@ -21,6 +21,10 @@ void main() {
     final preferences = await SharedPreferences.getInstance();
     expect(preferences.getBool(OobeStore.key), isTrue);
     expect(await store.readCompleted(), isTrue);
+
+    await store.markNotCompleted();
+    expect(preferences.getBool(OobeStore.key), isFalse);
+    expect(await store.readCompleted(), isFalse);
   });
 
   testWidgets('OOBE 只能通过底部按钮翻页并保存安装偏好', (tester) async {
@@ -149,6 +153,41 @@ void main() {
     await tester.binding.handlePopRoute();
     await tester.pumpAndSettle();
     expect(find.byType(OobePage), findsNothing);
+  });
+
+  testWidgets('设置页可重置完成状态并重新进入 OOBE', (tester) async {
+    SharedPreferences.setMockInitialValues({
+      OobeStore.key: true,
+      InstallPreferenceStore.key: 'both',
+    });
+    await tester.pumpWidget(
+      const WristloadApp(
+        initialOobeCompleted: true,
+        initialPreference: InstallPreference.both,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('设置'));
+    await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(
+      find.text('重新查看使用引导'),
+      250,
+      scrollable: find.byType(Scrollable),
+    );
+    await tester.tap(find.text('重新查看使用引导'));
+    await tester.pumpAndSettle();
+
+    final preferences = await SharedPreferences.getInstance();
+    expect(preferences.getBool(OobeStore.key), isFalse);
+    expect(
+      preferences.getString(InstallPreferenceStore.key),
+      'both',
+    );
+    expect(find.byType(OobePage), findsOneWidget);
+    expect(find.text('欢迎使用 Wristload'), findsOneWidget);
+    final navigator = tester.state<NavigatorState>(find.byType(Navigator));
+    expect(navigator.canPop(), isFalse);
   });
 
   testWidgets('预览第二段平滑伸出且两组间距正确', (tester) async {
