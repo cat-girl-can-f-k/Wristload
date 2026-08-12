@@ -74,9 +74,6 @@ class InstallMetadataReader {
       Uint8List bytes, String fileName, String digest, String strongDigest) {
     final resource = _resourceFromArchive(bytes) ?? bytes;
     final faceId = _faceIdFromResource(resource);
-    if (faceId == null) {
-      throw const FormatException('无法从表盘数据读取数值型 faceId');
-    }
     final inspection = _inspectWatchface(resource);
     return InstallMetadata(
         fileName: fileName,

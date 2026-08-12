@@ -1,9 +1,15 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
+import 'package:window_manager/window_manager.dart';
 
 import 'application/device_controller.dart';
+import 'application/floating_window_coordinator.dart';
 import 'domain/firmware_package_inspector.dart';
 import 'domain/install_metadata_reader.dart';
 import 'domain/install_models.dart';
@@ -11,18 +17,37 @@ import 'domain/install_preference_store.dart';
 import 'domain/install_task.dart';
 import 'presentation/device_info_page.dart';
 import 'presentation/firmware_inspection_dialog.dart';
+import 'presentation/floating_install_window_app.dart';
 import 'presentation/home_widgets.dart';
 import 'presentation/install_split_button.dart';
 import 'presentation/install_task_card.dart';
 import 'presentation/install_warning_dialog.dart';
+import 'presentation/install_request_preflight.dart';
 import 'presentation/queue_page.dart';
 import 'presentation/settings_page.dart';
 import 'presentation/tools_page.dart';
 
-void main() => runApp(const MiWearableApp());
+Future<void> main(List<String> args) async {
+  WidgetsFlutterBinding.ensureInitialized();
+  if (Platform.isWindows) {
+    await windowManager.ensureInitialized();
+    final currentWindow = await WindowController.fromCurrentEngine();
+    await windowManager.setPreventClose(true);
+    if (currentWindow.arguments == floatingInstallWindowArgument) {
+      runApp(const FloatingInstallWindowApp());
+      return;
+    }
+  }
+  runApp(MiWearableApp(desktopIntegrationEnabled: Platform.isWindows));
+}
 
 class MiWearableApp extends StatefulWidget {
-  const MiWearableApp({super.key});
+  const MiWearableApp({
+    this.desktopIntegrationEnabled = false,
+    super.key,
+  });
+
+  final bool desktopIntegrationEnabled;
 
   @override
   State<MiWearableApp> createState() => _MiWearableAppState();
@@ -30,9 +55,66 @@ class MiWearableApp extends StatefulWidget {
 
 class _MiWearableAppState extends State<MiWearableApp> {
   final controller = DeviceController();
+  final _appShellKey = GlobalKey<_AppShellState>();
+  final _installRequestPreflight = const InstallRequestPreflight();
+  late final FloatingWindowCoordinator _floatingWindowCoordinator;
+  bool _floatingInstallWindowEnabled = false;
+
+  @override
+  void initState() {
+    super.initState();
+    controller.queueInstallPreparer = _prepareQueuedRequest;
+    _floatingWindowCoordinator = FloatingWindowCoordinator(
+      controller: controller,
+      onOpenMainWindow: () => _appShellKey.currentState?.showHome(),
+    );
+    if (widget.desktopIntegrationEnabled) {
+      unawaited(_initializeFloatingWindow());
+    }
+  }
+
+  Future<InstallRequest?> _prepareQueuedRequest(InstallRequest request) async {
+    var context = _appShellKey.currentContext;
+    if (context == null || !context.mounted) return null;
+    if (widget.desktopIntegrationEnabled &&
+        _installRequestPreflight.requiresInteraction(controller, request)) {
+      await _floatingWindowCoordinator.showMainWindow();
+      context = _appShellKey.currentContext;
+      if (context == null || !context.mounted) return null;
+    }
+    return _installRequestPreflight.prepare(context, controller, request);
+  }
+
+  Future<void> _initializeFloatingWindow() async {
+    try {
+      await _floatingWindowCoordinator.initialize();
+      if (!mounted) return;
+      setState(() {
+        _floatingInstallWindowEnabled = _floatingWindowCoordinator.enabled;
+      });
+    } on Object catch (error, stackTrace) {
+      debugPrint('Floating window initialization failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+    }
+  }
+
+  Future<void> _setFloatingInstallWindowEnabled(bool enabled) async {
+    try {
+      await _floatingWindowCoordinator.setEnabled(enabled);
+      if (!mounted) return;
+      setState(() {
+        _floatingInstallWindowEnabled = _floatingWindowCoordinator.enabled;
+      });
+    } on Object catch (error, stackTrace) {
+      debugPrint('Floating window setting failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+    }
+  }
 
   @override
   void dispose() {
+    controller.queueInstallPreparer = null;
+    unawaited(_floatingWindowCoordinator.dispose());
     controller.dispose();
     super.dispose();
   }
@@ -53,7 +135,14 @@ class _MiWearableAppState extends State<MiWearableApp> {
         themeMode: ThemeMode.system,
         home: ListenableBuilder(
           listenable: controller,
-          builder: (context, _) => AppShell(controller: controller),
+          builder: (context, _) => AppShell(
+            key: _appShellKey,
+            controller: controller,
+            floatingInstallWindowEnabled: _floatingInstallWindowEnabled,
+            onFloatingInstallWindowEnabledChanged: (enabled) {
+              unawaited(_setFloatingInstallWindowEnabled(enabled));
+            },
+          ),
         ),
         routes: {
           '/device-info': (context) => DeviceInfoPage(controller: controller),
@@ -64,9 +153,16 @@ class _MiWearableAppState extends State<MiWearableApp> {
 }
 
 class AppShell extends StatefulWidget {
-  const AppShell({required this.controller, super.key});
+  const AppShell({
+    required this.controller,
+    required this.floatingInstallWindowEnabled,
+    required this.onFloatingInstallWindowEnabledChanged,
+    super.key,
+  });
 
   final DeviceController controller;
+  final bool floatingInstallWindowEnabled;
+  final ValueChanged<bool> onFloatingInstallWindowEnabledChanged;
 
   @override
   State<AppShell> createState() => _AppShellState();
@@ -82,6 +178,11 @@ class _AppShellState extends State<AppShell> {
   void initState() {
     super.initState();
     _loadInstallPreference();
+  }
+
+  void showHome() {
+    if (_selectedIndex == 0 || !mounted) return;
+    setState(() => _selectedIndex = 0);
   }
 
   Future<void> _loadInstallPreference() async {
@@ -159,6 +260,8 @@ class _AppShellState extends State<AppShell> {
                       segmentIntervalMs: widget.controller.segmentIntervalMs,
                       massWindowSize: widget.controller.massWindowSize,
                       autoTimeSync: widget.controller.autoTimeSync,
+                      floatingInstallWindowEnabled:
+                          widget.floatingInstallWindowEnabled,
                       onConnectionModeChanged:
                           widget.controller.setConnectionMode,
                       onSegmentIntervalChanged:
@@ -166,6 +269,8 @@ class _AppShellState extends State<AppShell> {
                       onMassWindowSizeChanged:
                           widget.controller.setMassWindowSize,
                       onAutoTimeSyncChanged: widget.controller.setAutoTimeSync,
+                      onFloatingInstallWindowEnabledChanged:
+                          widget.onFloatingInstallWindowEnabledChanged,
                       onPreferredInstallTargetChanged:
                           _setPreferredInstallTarget,
                     ),

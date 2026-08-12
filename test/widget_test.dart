@@ -9,6 +9,7 @@ import 'package:miwearable_install_tool/domain/install_task.dart';
 import 'package:miwearable_install_tool/domain/install_preference_store.dart';
 import 'package:miwearable_install_tool/presentation/install_task_card.dart';
 import 'package:miwearable_install_tool/presentation/install_split_button.dart';
+import 'package:miwearable_install_tool/presentation/install_request_preflight.dart';
 import 'package:miwearable_install_tool/presentation/install_warning_dialog.dart';
 import 'package:miwearable_install_tool/presentation/queue_page.dart';
 import 'package:miwearable_install_tool/presentation/settings_page.dart';
@@ -433,8 +434,18 @@ void main() {
       ),
     ));
 
+    await tester.scrollUntilVisible(
+      find.text('发送窗口间隔'),
+      250,
+      scrollable: find.byType(Scrollable),
+    );
     expect(find.text('发送窗口间隔'), findsOneWidget);
     expect(find.text('5 ms'), findsOneWidget);
+    await tester.scrollUntilVisible(
+      find.text('每窗口分片数'),
+      250,
+      scrollable: find.byType(Scrollable),
+    );
     expect(find.text('每窗口分片数'), findsOneWidget);
     expect(find.text('50 片'), findsOneWidget);
     await tester.scrollUntilVisible(
@@ -468,9 +479,48 @@ void main() {
       ),
     );
 
-    final tile = tester.widget<SwitchListTile>(find.byType(SwitchListTile));
+    final tileFinder = find.ancestor(
+      of: find.text('自动同步时间与时区'),
+      matching: find.byType(SwitchListTile),
+    );
+    final tile = tester.widget<SwitchListTile>(tileFinder);
     expect(tile.value, isFalse);
     await tester.tap(find.text('自动同步时间与时区'));
+    expect(changedTo, isTrue);
+  });
+
+  testWidgets('悬浮安装窗开关默认关闭并转发设置变更', (tester) async {
+    bool? changedTo;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: TransferSettingsPage(
+            connectionMode: ConnectionMode.modern,
+            preferredInstallTarget: InstallPreference.watchface,
+            connectionModeEnabled: true,
+            segmentIntervalMs: 5,
+            massWindowSize: 3,
+            onConnectionModeChanged: (_) {},
+            onSegmentIntervalChanged: (_) {},
+            onMassWindowSizeChanged: (_) {},
+            onFloatingInstallWindowEnabledChanged: (value) => changedTo = value,
+            onPreferredInstallTargetChanged: (_) {},
+          ),
+        ),
+      ),
+    );
+
+    await tester.scrollUntilVisible(
+      find.text('启用悬浮安装窗'),
+      250,
+      scrollable: find.byType(Scrollable),
+    );
+    final tileFinder = find.ancestor(
+      of: find.text('启用悬浮安装窗'),
+      matching: find.byType(SwitchListTile),
+    );
+    expect(tester.widget<SwitchListTile>(tileFinder).value, isFalse);
+    await tester.tap(find.text('启用悬浮安装窗'));
     expect(changedTo, isTrue);
   });
 
@@ -706,6 +756,142 @@ void main() {
     expect(find.byKey(const ValueKey('queue-add-more')), findsOneWidget);
     expect(find.byIcon(Icons.check_circle), findsOneWidget);
     expect(find.text('已完成'), findsNothing);
+  });
+
+  testWidgets('队列二次失败显示已跳过且不再提供重试', (tester) async {
+    final controller = DeviceController();
+    addTearDown(controller.dispose);
+    controller.enqueue(
+      InstallRequest(
+        kind: InstallKind.watchface,
+        path: r'C:\packages\broken.face',
+        metadata: InstallMetadata(
+          fileName: 'broken.face',
+          fileSize: 1024,
+          md5Hex: '0123456789abcdef0123456789abcdef',
+          sha256Hex: '0' * 64,
+          faceId: '1234',
+        ),
+      ),
+    );
+    controller.installQueue.single
+      ..stage = QueueStage.failed
+      ..failureAttempts = QueueEntry.maximumFailureAttempts
+      ..skippedAfterRetry = true;
+
+    await tester.pumpWidget(
+      MaterialApp(home: Scaffold(body: QueuePage(controller: controller))),
+    );
+
+    expect(find.text('失败 · 已跳过'), findsOneWidget);
+    final chip = tester.widget<ActionChip>(find.byType(ActionChip));
+    expect(chip.onPressed, isNull);
+  });
+
+  test('取消共享安装前确认时队列保持等待且不计失败', () async {
+    final controller = DeviceController();
+    addTearDown(controller.dispose);
+    controller.queueInstallPreparer = (_) async => null;
+    controller.enqueue(
+      InstallRequest(
+        kind: InstallKind.quickApp,
+        path: r'C:\packages\needs-version.rpk',
+        metadata: InstallMetadata(
+          fileName: 'needs-version.rpk',
+          fileSize: 2048,
+          md5Hex: '0123456789abcdef0123456789abcdef',
+          sha256Hex: '0' * 64,
+          packageName: 'com.example.demo',
+        ),
+      ),
+    );
+
+    await controller.runQueue();
+
+    final entry = controller.installQueue.single;
+    expect(entry.stage, QueueStage.waiting);
+    expect(entry.failureAttempts, 0);
+    expect(controller.latestTask, isNull);
+  });
+
+  test('首次失败持续阻塞后续队列，直到显式重试', () async {
+    final controller = DeviceController();
+    addTearDown(controller.dispose);
+    var prepareCalls = 0;
+    controller.queueInstallPreparer = (request) async {
+      prepareCalls++;
+      return request;
+    };
+    final failed = QueueEntry(
+      request: InstallRequest(
+        kind: InstallKind.watchface,
+        path: r'C:\packages\failed.face',
+        metadata: InstallMetadata(
+          fileName: 'failed.face',
+          fileSize: 1024,
+          md5Hex: '0123456789abcdef0123456789abcdef',
+          sha256Hex: '0' * 64,
+          faceId: '1234',
+        ),
+      ),
+      stage: QueueStage.failed,
+    )..failureAttempts = 1;
+    controller.installQueue.add(failed);
+    controller.enqueue(
+      InstallRequest(
+        kind: InstallKind.quickApp,
+        path: r'C:\packages\next.rpk',
+        metadata: InstallMetadata(
+          fileName: 'next.rpk',
+          fileSize: 2048,
+          md5Hex: 'fedcba9876543210fedcba9876543210',
+          sha256Hex: '1' * 64,
+          packageName: 'com.example.next',
+          versionCode: 1,
+        ),
+      ),
+    );
+
+    await controller.runQueue();
+
+    expect(prepareCalls, 0);
+    expect(failed.canRetry, isTrue);
+    expect(controller.installQueue.last.stage, QueueStage.waiting);
+  });
+
+  test('共享安装前检查识别分辨率、Lua 与缺失 RPK 版本', () {
+    const preflight = InstallRequestPreflight();
+    final controller = DeviceController();
+    addTearDown(controller.dispose);
+    controller.connectedProfile = DeviceProfile.redmiWatch5;
+
+    final watchface = InstallRequest(
+      kind: InstallKind.watchface,
+      path: r'C:\packages\demo.face',
+      metadata: InstallMetadata(
+        fileName: 'demo.face',
+        fileSize: 1024,
+        md5Hex: '0123456789abcdef0123456789abcdef',
+        sha256Hex: '0' * 64,
+        faceId: '1234',
+        watchfaceResolutions: const [WatchfaceResolution(336, 480)],
+        containsLua: true,
+      ),
+    );
+    final quickApp = InstallRequest(
+      kind: InstallKind.quickApp,
+      path: r'C:\packages\demo.rpk',
+      metadata: InstallMetadata(
+        fileName: 'demo.rpk',
+        fileSize: 2048,
+        md5Hex: '0123456789abcdef0123456789abcdef',
+        sha256Hex: '0' * 64,
+        packageName: 'com.example.demo',
+      ),
+    );
+
+    expect(preflight.requiresInteraction(controller, watchface), isTrue);
+    expect(preflight.requiresInteraction(controller, quickApp), isTrue);
   });
 
   test('从队列页加入请求保持等待，直到显式开始安装', () {

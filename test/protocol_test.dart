@@ -94,6 +94,27 @@ void main() {
     }
   });
 
+  test('表盘缺失 faceId 时保留元数据并交由安装前确认补充', () async {
+    final bytes = Uint8List(128);
+    bytes[0] = 0x5a;
+    bytes[1] = 0xa5;
+    bytes.setRange(64, 68, [0xb0, 0x01, 0x02, 0x02]); // 432×514 U16LE
+    final directory = await Directory.systemTemp.createTemp('miwear-face-');
+    final file = File('${directory.path}${Platform.pathSeparator}missing.face');
+    try {
+      await file.writeAsBytes(bytes);
+      final metadata =
+          await InstallMetadataReader().read(InstallKind.watchface, file.path);
+      expect(metadata.faceId, isNull);
+      expect(
+        metadata.watchfaceResolutions,
+        contains(const WatchfaceResolution(432, 514)),
+      );
+    } finally {
+      await directory.delete(recursive: true);
+    }
+  });
+
   test('RPK 拒绝超过安全上限的清单条目', () async {
     final manifest =
         List<int>.filled(InstallMetadataReader.maxManifestBytes + 1, 0x20);

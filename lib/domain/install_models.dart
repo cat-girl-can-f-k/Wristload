@@ -1,4 +1,4 @@
-﻿/// 安装任务的纯数据模型。
+/// 安装任务的纯数据模型。
 ///
 /// 模型不包含 authkey、会话密钥或文件副本，因此可安全用于可恢复检查点。
 library;
@@ -156,7 +156,20 @@ enum QueueStage { waiting, installing, done, failed, cancelled, stateUnknown }
 class QueueEntry {
   QueueEntry({required this.request, this.stage = QueueStage.waiting});
 
-  final InstallRequest request;
+  /// A failed entry pauses the queue once. A second failed attempt is kept
+  /// for inspection but no longer blocks the files behind it.
+  static const int maximumFailureAttempts = 2;
+
+  InstallRequest request;
   QueueStage stage;
   String? message;
+  int failureAttempts = 0;
+  bool skippedAfterRetry = false;
+
+  bool get isFailure =>
+      stage == QueueStage.failed ||
+      stage == QueueStage.cancelled ||
+      stage == QueueStage.stateUnknown;
+
+  bool get canRetry => isFailure && failureAttempts < maximumFailureAttempts;
 }

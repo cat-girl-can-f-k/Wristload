@@ -13,6 +13,7 @@
 #include <optional>
 #include <unordered_map>
 
+#include "desktop_multi_window/desktop_multi_window_plugin.h"
 #include "flutter/generated_plugin_registrant.h"
 #include "utils.h"
 
@@ -219,6 +220,17 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
+  // Every desktop_multi_window child engine must register the same generated
+  // plugins as the primary engine before its Dart isolate starts using them.
+  DesktopMultiWindowSetWindowCreatedCallback([](void* controller) {
+    auto* flutter_view_controller =
+        reinterpret_cast<flutter::FlutterViewController*>(controller);
+    if (flutter_view_controller == nullptr ||
+        flutter_view_controller->engine() == nullptr) {
+      return;
+    }
+    RegisterPlugins(flutter_view_controller->engine());
+  });
   RegisterSecureStore(flutter_controller_->engine()->messenger());
   RegisterSystemTime(flutter_controller_->engine()->messenger());
   SetChildContent(flutter_controller_->view()->GetNativeWindow());

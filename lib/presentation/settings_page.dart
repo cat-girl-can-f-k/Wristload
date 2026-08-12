@@ -11,10 +11,12 @@ class TransferSettingsPage extends StatelessWidget {
     required this.segmentIntervalMs,
     required this.massWindowSize,
     this.autoTimeSync = false,
+    this.floatingInstallWindowEnabled = false,
     required this.onConnectionModeChanged,
     required this.onSegmentIntervalChanged,
     required this.onMassWindowSizeChanged,
     this.onAutoTimeSyncChanged,
+    this.onFloatingInstallWindowEnabledChanged,
     required this.onPreferredInstallTargetChanged,
     super.key,
   });
@@ -25,10 +27,12 @@ class TransferSettingsPage extends StatelessWidget {
   final int segmentIntervalMs;
   final int massWindowSize;
   final bool autoTimeSync;
+  final bool floatingInstallWindowEnabled;
   final ValueChanged<ConnectionMode> onConnectionModeChanged;
   final ValueChanged<int> onSegmentIntervalChanged;
   final ValueChanged<int> onMassWindowSizeChanged;
   final ValueChanged<bool>? onAutoTimeSyncChanged;
+  final ValueChanged<bool>? onFloatingInstallWindowEnabledChanged;
   final ValueChanged<InstallPreference> onPreferredInstallTargetChanged;
 
   @override
@@ -82,6 +86,15 @@ class TransferSettingsPage extends StatelessWidget {
               subtitle: const Text('鉴权成功后使用电脑当前的时间、时区和小时制同步设备'),
               value: autoTimeSync,
               onChanged: onAutoTimeSyncChanged,
+            ),
+            const Divider(height: 40),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              secondary: const Icon(Icons.picture_in_picture_alt_outlined),
+              title: const Text('启用悬浮安装窗'),
+              subtitle: const Text('可将文件直接拖入右下角悬浮窗安装。'),
+              value: floatingInstallWindowEnabled,
+              onChanged: onFloatingInstallWindowEnabledChanged,
             ),
             const Divider(height: 40),
             Text('传输', style: theme.textTheme.titleMedium),

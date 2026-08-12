@@ -1,13 +1,11 @@
-import 'dart:io';
-
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../application/device_controller.dart';
-import '../domain/install_metadata_reader.dart';
 import '../domain/install_models.dart';
 import '../domain/install_task.dart';
+import '../domain/queue_file_importer.dart';
 
 class QueuePage extends StatefulWidget {
   const QueuePage({required this.controller, super.key});
@@ -35,47 +33,20 @@ class _QueuePageState extends State<QueuePage> {
   }
 
   Future<void> _addPaths(Iterable<String> paths) async {
-    final existing = controller.installQueue
-        .map((entry) => File(entry.request.path).absolute.path.toLowerCase())
-        .toSet();
-    var added = 0;
-    var duplicate = 0;
-    var unsupported = 0;
-
-    for (final sourcePath in paths) {
-      final path = File(sourcePath).absolute.path;
-      final normalized = path.toLowerCase();
-      if (existing.contains(normalized)) {
-        duplicate++;
-        continue;
-      }
-
-      final extension = normalized.split('.').last;
-      final kind = switch (extension) {
-        'bin' || 'face' => InstallKind.watchface,
-        'rpk' => InstallKind.quickApp,
-        _ => null,
-      };
-      if (kind == null) {
-        unsupported++;
-        continue;
-      }
-
-      try {
-        final metadata = await InstallMetadataReader().read(kind, path);
-        controller.enqueue(
-          InstallRequest(kind: kind, path: path, metadata: metadata),
-        );
-        existing.add(normalized);
-        added++;
-      } on Object catch (error) {
-        controller.reportError('无法加入文件：$error');
-      }
+    final imported = await QueueFileImporter().prepare(
+      paths,
+      existingPaths: controller.installQueue.map((entry) => entry.request.path),
+    );
+    for (final request in imported.requests) {
+      controller.enqueue(request);
+    }
+    for (final failure in imported.failures) {
+      controller.reportError('无法加入文件：${failure.error}');
     }
 
     if (!mounted) return;
     final messenger = ScaffoldMessenger.of(context);
-    if (unsupported > 0) {
+    if (imported.unsupportedCount > 0) {
       final colors = Theme.of(context).colorScheme;
       messenger.showSnackBar(
         SnackBar(
@@ -87,15 +58,17 @@ class _QueuePageState extends State<QueuePage> {
         ),
       );
     }
-    if (duplicate > 0) {
-      messenger.showSnackBar(
-        SnackBar(content: Text('$duplicate 个文件已在队列中，已跳过')),
-      );
-    }
-    if (added > 0) {
+    if (imported.duplicateCount > 0) {
       messenger.showSnackBar(
         SnackBar(
-          content: Text('已加入 $added 个文件'),
+          content: Text('${imported.duplicateCount} 个文件已在队列中，已跳过'),
+        ),
+      );
+    }
+    if (imported.addedCount > 0) {
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text('已加入 ${imported.addedCount} 个文件'),
           action: SnackBarAction(
             label: '开始安装',
             onPressed: controller.runQueue,
@@ -368,10 +341,17 @@ class _QueueStatus extends StatelessWidget {
     final failed = entry.stage == QueueStage.failed ||
         entry.stage == QueueStage.cancelled ||
         entry.stage == QueueStage.stateUnknown;
+    final canRetry = failed && entry.canRetry;
     return ActionChip(
-      label: Text(failed ? '失败 · 重试' : '等待中'),
+      label: Text(
+        failed
+            ? canRetry
+                ? '失败 · 重试'
+                : '失败 · 已跳过'
+            : '等待中',
+      ),
       backgroundColor: failed ? theme.colorScheme.errorContainer : null,
-      onPressed: failed ? () => controller.retryQueueEntry(entry) : null,
+      onPressed: canRetry ? () => controller.retryQueueEntry(entry) : null,
     );
   }
 }

@@ -23,6 +23,10 @@ import '../platform/ble_transport.dart';
 import '../platform/auth_key_store.dart';
 import '../platform/system_time_info.dart';
 
+typedef QueueInstallPreparer = Future<InstallRequest?> Function(
+  InstallRequest request,
+);
+
 class DeviceController extends ChangeNotifier {
   DeviceController({BleTransport? transport})
       : _transport = transport ?? BleTransport() {
@@ -68,6 +72,10 @@ class DeviceController extends ChangeNotifier {
   /// 安装队列（串行执行）。
   final List<QueueEntry> installQueue = [];
   bool _queueRunning = false;
+  static const queueSuccessDisplayDuration = Duration(milliseconds: 2400);
+  QueueInstallPreparer? queueInstallPreparer;
+
+  bool get queueRunning => _queueRunning;
 
   int get pendingCount =>
       installQueue.where((e) => e.stage == QueueStage.waiting).length;
@@ -82,15 +90,19 @@ class DeviceController extends ChangeNotifier {
   }
 
   /// 将失败、取消或状态未知的条目重新放回串行队列。
-  void retryQueueEntry(QueueEntry entry) {
-    if (!installQueue.contains(entry) || entry.stage == QueueStage.installing) {
-      return;
+  bool retryQueueEntry(QueueEntry entry) {
+    if (!installQueue.contains(entry) ||
+        entry.stage == QueueStage.installing ||
+        !entry.canRetry) {
+      return false;
     }
     entry
       ..stage = QueueStage.waiting
-      ..message = null;
+      ..message = null
+      ..skippedAfterRetry = false;
     notifyListeners();
     unawaited(runQueue());
+    return true;
   }
 
   /// 从队列移除（安装中禁止）。
@@ -130,10 +142,35 @@ class DeviceController extends ChangeNotifier {
     _queueRunning = true;
     try {
       while (true) {
+        // A first failure is a persistent pause point. Starting the queue
+        // again or dropping more files must not silently skip it; only the
+        // explicit retry action moves that entry back to waiting.
+        if (installQueue.any((entry) => entry.canRetry)) break;
         final next = installQueue
             .where((e) => e.stage == QueueStage.waiting)
             .firstOrNull;
         if (next == null) break;
+        final preparer = queueInstallPreparer;
+        if (preparer != null) {
+          try {
+            final prepared = await preparer(next.request);
+            if (!installQueue.contains(next) ||
+                next.stage != QueueStage.waiting) {
+              break;
+            }
+            if (prepared == null) {
+              next.message = null;
+              notifyListeners();
+              break;
+            }
+            next.request = prepared;
+          } on Object catch (exception) {
+            next.message = '安装前检查失败：$exception';
+            _log(next.message!);
+            notifyListeners();
+            break;
+          }
+        }
         final taskBeforeInstall = latestTask;
         next.stage = QueueStage.installing;
         next.message = null;
@@ -171,7 +208,21 @@ class DeviceController extends ChangeNotifier {
           _ => QueueStage.failed,
         };
         next.message = task.message;
+        if (next.isFailure) {
+          next.failureAttempts++;
+          next.skippedAfterRetry =
+              next.failureAttempts >= QueueEntry.maximumFailureAttempts;
+        }
         notifyListeners();
+
+        if (next.stage == QueueStage.done) {
+          await Future<void>.delayed(queueSuccessDisplayDuration);
+          if (_disposed) break;
+        }
+
+        // The first failure is deliberate pause point. Once an explicit retry
+        // has also failed, retain it in history and continue the queue.
+        if (next.isFailure && !next.skippedAfterRetry) break;
       }
     } finally {
       _queueRunning = false;
