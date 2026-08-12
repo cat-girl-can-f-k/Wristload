@@ -15,6 +15,7 @@ import 'domain/install_metadata_reader.dart';
 import 'domain/install_models.dart';
 import 'domain/install_preference_store.dart';
 import 'domain/install_task.dart';
+import 'domain/oobe_store.dart';
 import 'presentation/device_info_page.dart';
 import 'presentation/firmware_inspection_dialog.dart';
 import 'presentation/floating_install_window_app.dart';
@@ -23,6 +24,7 @@ import 'presentation/install_split_button.dart';
 import 'presentation/install_task_card.dart';
 import 'presentation/install_warning_dialog.dart';
 import 'presentation/install_request_preflight.dart';
+import 'presentation/oobe_page.dart';
 import 'presentation/queue_page.dart';
 import 'presentation/settings_page.dart';
 import 'presentation/tools_page.dart';
@@ -38,16 +40,28 @@ Future<void> main(List<String> args) async {
       return;
     }
   }
-  runApp(WristloadApp(desktopIntegrationEnabled: Platform.isWindows));
+  final startupValues = await Future.wait([
+    OobeStore().readCompleted(),
+    InstallPreferenceStore().readPreference(),
+  ]);
+  runApp(WristloadApp(
+    desktopIntegrationEnabled: Platform.isWindows,
+    initialOobeCompleted: startupValues[0] as bool,
+    initialPreference: startupValues[1] as InstallPreference,
+  ));
 }
 
 class WristloadApp extends StatefulWidget {
   const WristloadApp({
     this.desktopIntegrationEnabled = false,
+    this.initialOobeCompleted = false,
+    this.initialPreference = InstallPreference.watchface,
     super.key,
   });
 
   final bool desktopIntegrationEnabled;
+  final bool initialOobeCompleted;
+  final InstallPreference initialPreference;
 
   @override
   State<WristloadApp> createState() => _WristloadAppState();
@@ -57,21 +71,70 @@ class _WristloadAppState extends State<WristloadApp> {
   final controller = DeviceController();
   final _appShellKey = GlobalKey<_AppShellState>();
   final _installRequestPreflight = const InstallRequestPreflight();
+  final _installPreferenceStore = InstallPreferenceStore();
+  final _oobeStore = OobeStore();
+  final _navigatorKey = GlobalKey<NavigatorState>();
   late final FloatingWindowCoordinator _floatingWindowCoordinator;
   bool _floatingInstallWindowEnabled = false;
+  late bool _oobeCompleted;
+  late InstallPreference _preferredInstallTarget;
+  Future<void> _preferenceWrites = Future.value();
+  bool _floatingInitialized = false;
 
   @override
   void initState() {
     super.initState();
+    _oobeCompleted = widget.initialOobeCompleted;
+    _preferredInstallTarget = widget.initialPreference;
     controller.queueInstallPreparer = _prepareQueuedRequest;
     _floatingWindowCoordinator = FloatingWindowCoordinator(
       controller: controller,
       onOpenMainWindow: () => _appShellKey.currentState?.showHome(),
     );
+    if (widget.desktopIntegrationEnabled && _oobeCompleted) {
+      unawaited(_initializeFloatingWindow());
+    }
+  }
+
+  void _setOobePreference(InstallPreference preference) {
+    if (_preferredInstallTarget == preference) return;
+    setState(() => _preferredInstallTarget = preference);
+    _preferenceWrites = _preferenceWrites.then(
+      (_) => _installPreferenceStore.writePreference(preference),
+    );
+  }
+
+  Future<void> _completeOobe() async {
+    await _preferenceWrites;
+    await _installPreferenceStore.writePreference(_preferredInstallTarget);
+    await _oobeStore.markCompleted();
+    if (!mounted) return;
+    setState(() => _oobeCompleted = true);
+    _navigatorKey.currentState?.pushNamedAndRemoveUntil('/', (_) => false);
     if (widget.desktopIntegrationEnabled) {
       unawaited(_initializeFloatingWindow());
     }
   }
+
+  Widget _buildOobePage() => OobePage(
+        installPreference: _preferredInstallTarget,
+        onInstallPreferenceChanged: _setOobePreference,
+        onCompleted: _completeOobe,
+      );
+
+  Widget _buildAppShell() => ListenableBuilder(
+        listenable: controller,
+        builder: (context, _) => AppShell(
+          key: _appShellKey,
+          controller: controller,
+          preferredInstallTarget: _preferredInstallTarget,
+          onPreferredInstallTargetChanged: _setOobePreference,
+          floatingInstallWindowEnabled: _floatingInstallWindowEnabled,
+          onFloatingInstallWindowEnabledChanged: (enabled) {
+            unawaited(_setFloatingInstallWindowEnabled(enabled));
+          },
+        ),
+      );
 
   Future<InstallRequest?> _prepareQueuedRequest(InstallRequest request) async {
     var context = _appShellKey.currentContext;
@@ -86,6 +149,8 @@ class _WristloadAppState extends State<WristloadApp> {
   }
 
   Future<void> _initializeFloatingWindow() async {
+    if (_floatingInitialized) return;
+    _floatingInitialized = true;
     try {
       await _floatingWindowCoordinator.initialize();
       if (!mounted) return;
@@ -93,6 +158,7 @@ class _WristloadAppState extends State<WristloadApp> {
         _floatingInstallWindowEnabled = _floatingWindowCoordinator.enabled;
       });
     } on Object catch (error, stackTrace) {
+      _floatingInitialized = false;
       debugPrint('Floating window initialization failed: $error');
       debugPrintStack(stackTrace: stackTrace);
     }
@@ -121,6 +187,7 @@ class _WristloadAppState extends State<WristloadApp> {
 
   @override
   Widget build(BuildContext context) => MaterialApp(
+        navigatorKey: _navigatorKey,
         debugShowCheckedModeBanner: false,
         theme: ThemeData(
           useMaterial3: true,
@@ -133,18 +200,18 @@ class _WristloadAppState extends State<WristloadApp> {
           brightness: Brightness.dark,
         ),
         themeMode: ThemeMode.system,
-        home: ListenableBuilder(
-          listenable: controller,
-          builder: (context, _) => AppShell(
-            key: _appShellKey,
-            controller: controller,
-            floatingInstallWindowEnabled: _floatingInstallWindowEnabled,
-            onFloatingInstallWindowEnabledChanged: (enabled) {
-              unawaited(_setFloatingInstallWindowEnabled(enabled));
-            },
+        initialRoute: _oobeCompleted ? '/' : '/oobe',
+        onGenerateInitialRoutes: (initialRouteName) => [
+          MaterialPageRoute<void>(
+            settings: RouteSettings(name: initialRouteName),
+            builder: (_) => initialRouteName == '/oobe'
+                ? _buildOobePage()
+                : _buildAppShell(),
           ),
-        ),
+        ],
         routes: {
+          '/': (context) => _buildAppShell(),
+          '/oobe': (context) => _buildOobePage(),
           '/device-info': (context) => DeviceInfoPage(controller: controller),
           '/queue': (context) => QueuePage(controller: controller),
           '/tools': (context) => ToolsPage(controller: controller),
@@ -155,12 +222,16 @@ class _WristloadAppState extends State<WristloadApp> {
 class AppShell extends StatefulWidget {
   const AppShell({
     required this.controller,
+    required this.preferredInstallTarget,
+    required this.onPreferredInstallTargetChanged,
     required this.floatingInstallWindowEnabled,
     required this.onFloatingInstallWindowEnabledChanged,
     super.key,
   });
 
   final DeviceController controller;
+  final InstallPreference preferredInstallTarget;
+  final ValueChanged<InstallPreference> onPreferredInstallTargetChanged;
   final bool floatingInstallWindowEnabled;
   final ValueChanged<bool> onFloatingInstallWindowEnabledChanged;
 
@@ -170,32 +241,10 @@ class AppShell extends StatefulWidget {
 
 class _AppShellState extends State<AppShell> {
   int _selectedIndex = 0;
-  final _installPreferenceStore = InstallPreferenceStore();
-  InstallPreference _preferredInstallTarget = InstallPreference.watchface;
-  bool _installPreferenceChangedByUser = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadInstallPreference();
-  }
 
   void showHome() {
     if (_selectedIndex == 0 || !mounted) return;
     setState(() => _selectedIndex = 0);
-  }
-
-  Future<void> _loadInstallPreference() async {
-    final target = await _installPreferenceStore.readPreference();
-    if (!mounted || _installPreferenceChangedByUser) return;
-    setState(() => _preferredInstallTarget = target);
-  }
-
-  void _setPreferredInstallTarget(InstallPreference target) {
-    if (target == _preferredInstallTarget) return;
-    _installPreferenceChangedByUser = true;
-    setState(() => _preferredInstallTarget = target);
-    _installPreferenceStore.writePreference(target);
   }
 
   @override
@@ -247,14 +296,14 @@ class _AppShellState extends State<AppShell> {
                 child: switch (_selectedIndex) {
                   0 => HomePage(
                       controller: widget.controller,
-                      preferredInstallTarget: _preferredInstallTarget,
+                      preferredInstallTarget: widget.preferredInstallTarget,
                       onPreferredInstallTargetChanged:
-                          _setPreferredInstallTarget,
+                          widget.onPreferredInstallTargetChanged,
                     ),
                   1 => QueuePage(controller: widget.controller),
                   2 => ToolsPage(controller: widget.controller),
                   _ => TransferSettingsPage(
-                      preferredInstallTarget: _preferredInstallTarget,
+                      preferredInstallTarget: widget.preferredInstallTarget,
                       connectionMode: widget.controller.connectionMode,
                       connectionModeEnabled: !widget.controller.isConnected,
                       segmentIntervalMs: widget.controller.segmentIntervalMs,
@@ -272,7 +321,7 @@ class _AppShellState extends State<AppShell> {
                       onFloatingInstallWindowEnabledChanged:
                           widget.onFloatingInstallWindowEnabledChanged,
                       onPreferredInstallTargetChanged:
-                          _setPreferredInstallTarget,
+                          widget.onPreferredInstallTargetChanged,
                     ),
                 },
               ),

@@ -596,9 +596,18 @@ void main() {
       ),
     );
 
+    final menuButtonBottom = tester
+        .getRect(find.byKey(const ValueKey('install-menu-button')))
+        .bottom;
     await tester.tap(find.byKey(const ValueKey('install-menu-popup')));
     await tester.pumpAndSettle();
     expect(find.text('安装固件 .zip / .bin（协议取证中）'), findsOneWidget);
+    expect(
+      tester
+          .getRect(find.byKey(const ValueKey('firmware-install-menu-item')))
+          .top,
+      greaterThan(menuButtonBottom),
+    );
     await tester.tap(find.byKey(const ValueKey('firmware-install-menu-item')));
     await tester.pumpAndSettle();
 
@@ -627,11 +636,22 @@ void main() {
     );
     expect(installed, InstallKind.quickApp);
 
+    final menuButtonBottom = tester
+        .getRect(find.byKey(const ValueKey('both-firmware-menu-button')))
+        .bottom;
     await tester.tap(find.byKey(const ValueKey('both-firmware-menu-popup')));
     await tester.pumpAndSettle();
     expect(
       find.byKey(const ValueKey('both-firmware-install-menu-item')),
       findsOneWidget,
+    );
+    expect(
+      tester
+          .getRect(
+            find.byKey(const ValueKey('both-firmware-install-menu-item')),
+          )
+          .top,
+      greaterThan(menuButtonBottom),
     );
     await tester.tap(
       find.byKey(const ValueKey('both-firmware-install-menu-item')),

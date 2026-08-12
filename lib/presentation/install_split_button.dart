@@ -96,6 +96,7 @@ class _InstallSplitButtonState extends State<InstallSplitButton> {
               left: Radius.circular(6),
               right: Radius.circular(28),
             ),
+            position: PopupMenuPosition.under,
             offset: const Offset(0, 8),
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(16),
@@ -249,6 +250,7 @@ class _InstallSplitButtonState extends State<InstallSplitButton> {
               left: Radius.circular(6),
               right: Radius.circular(28),
             ),
+            position: PopupMenuPosition.under,
             offset: const Offset(0, 8),
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(16),

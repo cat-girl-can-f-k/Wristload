@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../domain/device_profile.dart';
 import '../domain/install_preference_store.dart';
+import 'install_preference_selector.dart';
 
 class TransferSettingsPage extends StatelessWidget {
   const TransferSettingsPage({
@@ -49,34 +50,10 @@ class TransferSettingsPage extends StatelessWidget {
             const SizedBox(height: 4),
             Text('管理设备连接模式与传输参数。', style: theme.textTheme.bodyMedium),
             const SizedBox(height: 28),
-            Text('安装', style: theme.textTheme.titleMedium),
-            const SizedBox(height: 12),
-            SegmentedButton<InstallPreference>(
-              segments: const [
-                ButtonSegment(
-                  value: InstallPreference.watchface,
-                  icon: Icon(Icons.watch),
-                  label: Text('表盘设计优先'),
-                ),
-                ButtonSegment(
-                  value: InstallPreference.quickApp,
-                  icon: Icon(Icons.apps),
-                  label: Text('快应用开发优先'),
-                ),
-                ButtonSegment(
-                  value: InstallPreference.both,
-                  icon: Icon(Icons.apps_outage),
-                  label: Text('均有开发'),
-                ),
-              ],
-              selected: {preferredInstallTarget},
-              onSelectionChanged: (selection) =>
-                  onPreferredInstallTargetChanged(selection.single),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              '主页安装按钮会优先显示所选类型；菜单中的临时安装不会修改此设置。',
-              style: theme.textTheme.bodySmall,
+            InstallPreferenceSelector(
+              value: preferredInstallTarget,
+              onChanged: onPreferredInstallTargetChanged,
+              titleStyle: theme.textTheme.titleMedium,
             ),
             const Divider(height: 40),
             SwitchListTile(
