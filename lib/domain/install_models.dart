@@ -156,20 +156,18 @@ enum QueueStage { waiting, installing, done, failed, cancelled, stateUnknown }
 class QueueEntry {
   QueueEntry({required this.request, this.stage = QueueStage.waiting});
 
-  /// A failed entry pauses the queue once. A second failed attempt is kept
-  /// for inspection but no longer blocks the files behind it.
-  static const int maximumFailureAttempts = 2;
-
   InstallRequest request;
   QueueStage stage;
   String? message;
   int failureAttempts = 0;
-  bool skippedAfterRetry = false;
 
   bool get isFailure =>
       stage == QueueStage.failed ||
       stage == QueueStage.cancelled ||
       stage == QueueStage.stateUnknown;
 
-  bool get canRetry => isFailure && failureAttempts < maximumFailureAttempts;
+  /// Failed packages stay available until the user removes them. Retrying sends
+  /// the same package again and lets MassPrepare negotiate a device-side resume
+  /// offset, rather than silently dropping the item after a fixed attempt cap.
+  bool get canRetry => isFailure;
 }

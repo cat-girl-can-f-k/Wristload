@@ -90,19 +90,36 @@ class DeviceController extends ChangeNotifier {
   }
 
   /// 将失败、取消或状态未知的条目重新放回串行队列。
+  ///
+  /// 重试会重新发送同一安装包。MassPrepare 由设备返回可信的已发送
+  /// 偏移，因此不会因为本地界面重试而强制从零开始。
   bool retryQueueEntry(QueueEntry entry) {
     if (!installQueue.contains(entry) ||
         entry.stage == QueueStage.installing ||
         !entry.canRetry) {
       return false;
     }
+    unawaited(_retryQueueEntry(entry));
+    return true;
+  }
+
+  Future<void> _retryQueueEntry(QueueEntry entry) async {
     entry
       ..stage = QueueStage.waiting
-      ..message = null
-      ..skippedAfterRetry = false;
+      ..message = null;
     notifyListeners();
-    unawaited(runQueue());
-    return true;
+    if (!await _restoreInstallSessionForRetry()) {
+      if (installQueue.contains(entry) && entry.stage == QueueStage.waiting) {
+        entry
+          ..stage = QueueStage.stateUnknown
+          ..message = '未能恢复鉴权会话；请重新连接设备后再次尝试安装。';
+        notifyListeners();
+      }
+      return;
+    }
+    if (installQueue.contains(entry) && entry.stage == QueueStage.waiting) {
+      await runQueue(preferredEntry: entry);
+    }
   }
 
   /// 从队列移除（安装中禁止）。
@@ -137,19 +154,27 @@ class DeviceController extends ChangeNotifier {
   }
 
   /// 串行执行队列。
-  Future<void> runQueue() async {
+  Future<void> runQueue({QueueEntry? preferredEntry}) async {
     if (_queueRunning) return;
     _queueRunning = true;
     try {
       while (true) {
-        // A first failure is a persistent pause point. Starting the queue
-        // again or dropping more files must not silently skip it; only the
-        // explicit retry action moves that entry back to waiting.
-        if (installQueue.any((entry) => entry.canRetry)) break;
-        final next = installQueue
-            .where((e) => e.stage == QueueStage.waiting)
-            .firstOrNull;
+        // Normal queue execution pauses at any failed item. An explicit retry
+        // may target that exact item even when older failure history remains.
+        final preferred = preferredEntry != null &&
+                installQueue.contains(preferredEntry) &&
+                preferredEntry.stage == QueueStage.waiting
+            ? preferredEntry
+            : null;
+        if (preferred == null && installQueue.any((entry) => entry.canRetry)) {
+          break;
+        }
+        final next = preferred ??
+            installQueue
+                .where((e) => e.stage == QueueStage.waiting)
+                .firstOrNull;
         if (next == null) break;
+        preferredEntry = null;
         final preparer = queueInstallPreparer;
         if (preparer != null) {
           try {
@@ -159,9 +184,11 @@ class DeviceController extends ChangeNotifier {
               break;
             }
             if (prepared == null) {
-              next.message = null;
+              // The user declined a required preflight confirmation. This is
+              // an abandoned add-to-queue action, not a waiting installation.
+              installQueue.remove(next);
               notifyListeners();
-              break;
+              continue;
             }
             next.request = prepared;
           } on Object catch (exception) {
@@ -208,11 +235,7 @@ class DeviceController extends ChangeNotifier {
           _ => QueueStage.failed,
         };
         next.message = task.message;
-        if (next.isFailure) {
-          next.failureAttempts++;
-          next.skippedAfterRetry =
-              next.failureAttempts >= QueueEntry.maximumFailureAttempts;
-        }
+        if (next.isFailure) next.failureAttempts++;
         notifyListeners();
 
         if (next.stage == QueueStage.done) {
@@ -220,9 +243,9 @@ class DeviceController extends ChangeNotifier {
           if (_disposed) break;
         }
 
-        // The first failure is deliberate pause point. Once an explicit retry
-        // has also failed, retain it in history and continue the queue.
-        if (next.isFailure && !next.skippedAfterRetry) break;
+        // A failed item is a deliberate pause point. Keep it in the queue and
+        // let the user retry the same package as many times as necessary.
+        if (next.isFailure) break;
       }
     } finally {
       _queueRunning = false;
@@ -1408,15 +1431,73 @@ class DeviceController extends ChangeNotifier {
         '重新认证后将重新 MassPrepare，由设备决定是否给出可信断点。');
   }
 
-  Future<void> retryInstallFromStart() async {
+  /// Retries the same package without discarding the device's Mass checkpoint.
+  ///
+  /// The local checkpoint is only an integrity record. The actual resume offset
+  /// is always negotiated again through MassPrepare, so a device that retained
+  /// part of the package continues from that point and one that did not safely
+  /// asks for the whole package again.
+  Future<void> retryInstall() async {
     final request = _lastInstallRequest;
     if (request == null) {
-      _log('没有可从头重试的安装任务。');
+      _log('没有可继续传输的安装任务。');
       return;
     }
-    await _clearCheckpointBestEffort();
+    final queuedEntry = installQueue.reversed
+        .where((entry) =>
+            entry.canRetry &&
+            entry.request.kind == request.kind &&
+            entry.request.path == request.path &&
+            entry.request.metadata.md5Hex == request.metadata.md5Hex)
+        .firstOrNull;
+    if (queuedEntry != null) {
+      await _retryQueueEntry(queuedEntry);
+      return;
+    }
+    final checkpoint = await _checkpointStore.load();
+    final checkpointMatches = checkpoint != null &&
+        checkpoint.kind == request.kind &&
+        checkpoint.path == request.path &&
+        checkpoint.fileSize == request.metadata.fileSize &&
+        checkpoint.md5Hex == request.metadata.md5Hex &&
+        checkpoint.sha256Hex == request.metadata.sha256Hex;
+    if (checkpointMatches) {
+      _log('继续传输同一文件：本地已确认片 '
+          '${checkpoint.lastAcknowledgedSegment}；将由设备 MassPrepare 决定续传偏移。');
+    } else {
+      _log('重新发送同一文件：没有可用本地检查点；将由设备 MassPrepare 决定续传偏移。');
+    }
+    if (!await _restoreInstallSessionForRetry()) return;
     await startInstall(request);
   }
+
+  Future<bool> _restoreInstallSessionForRetry() async {
+    if (sessionReady && _sessionCipher != null && connectedDevice != null) {
+      return true;
+    }
+    // An explicit disconnect clears the current target. Do not silently revive
+    // a stale peripheral; the user must select the intended device again.
+    if (connectedDevice == null) {
+      _log('无法继续传输：当前没有已连接的目标设备，请重新连接后再次尝试。');
+      return false;
+    }
+    _log('继续传输前正在重建 SPP 鉴权会话…');
+    if (!sppConnecting) await connectSpp();
+    final deadline = DateTime.now().add(const Duration(seconds: 30));
+    while (!sessionReady && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+    if (!sessionReady || _sessionCipher == null) {
+      _log('SPP 鉴权会话尚未恢复，未发送安装包。');
+      return false;
+    }
+    return true;
+  }
+
+  /// Backward-compatible API name retained for integrations compiled against
+  /// older versions. Its behavior intentionally no longer clears a checkpoint.
+  @Deprecated('Use retryInstall() to continue the same package.')
+  Future<void> retryInstallFromStart() => retryInstall();
 
   Future<void> _runInstall(InstallRequest request) async {
     final metadata = request.metadata;

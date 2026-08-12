@@ -56,7 +56,7 @@ void main() {
     expect(decoded.queuePosition, isNull);
   });
 
-  test('a twice-failed skipped item returns the floating window to idle', () {
+  test('a failed queue item keeps the floating window retryable', () {
     final controller = DeviceController();
     addTearDown(controller.dispose);
     const metadata = InstallMetadata(
@@ -74,8 +74,7 @@ void main() {
     ));
     controller.installQueue.single
       ..stage = QueueStage.failed
-      ..failureAttempts = QueueEntry.maximumFailureAttempts
-      ..skippedAfterRetry = true;
+      ..failureAttempts = 2;
     controller.latestTask = const InstallTask(
       kind: InstallKind.watchface,
       fileName: 'failed.face',
@@ -86,7 +85,8 @@ void main() {
 
     expect(
       controller.floatingInstallSnapshot.phase,
-      FloatingInstallPhase.idle,
+      FloatingInstallPhase.failed,
     );
+    expect(controller.floatingInstallSnapshot.canRetry, isTrue);
   });
 }

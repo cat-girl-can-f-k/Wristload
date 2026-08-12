@@ -343,13 +343,7 @@ class _QueueStatus extends StatelessWidget {
         entry.stage == QueueStage.stateUnknown;
     final canRetry = failed && entry.canRetry;
     return ActionChip(
-      label: Text(
-        failed
-            ? canRetry
-                ? '失败 · 重试'
-                : '失败 · 已跳过'
-            : '等待中',
-      ),
+      label: Text(failed ? '失败 · 重试' : '等待中'),
       backgroundColor: failed ? theme.colorScheme.errorContainer : null,
       onPressed: canRetry ? () => controller.retryQueueEntry(entry) : null,
     );

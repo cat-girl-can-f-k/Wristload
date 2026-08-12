@@ -93,7 +93,6 @@ void main() {
         body: InstallTaskCard(
           task: task,
           onCancel: () async {},
-          onCheck: () async {},
           onRetry: () async {},
         ),
       ),
@@ -107,6 +106,18 @@ void main() {
     expect(find.textContaining('设备确认'), findsOneWidget);
     expect(find.text('已确认'), findsOneWidget);
     expect(find.text('已提交待确认'), findsOneWidget);
+    final trackWidth = tester
+        .getSize(find.byKey(const ValueKey('install-progress-track')))
+        .width;
+    final submittedWidth = tester
+        .getSize(find.byKey(const ValueKey('install-progress-submitted')))
+        .width;
+    final confirmedWidth = tester
+        .getSize(find.byKey(const ValueKey('install-progress-confirmed')))
+        .width;
+    expect(trackWidth, greaterThan(0));
+    expect(confirmedWidth, closeTo(trackWidth * .25, .01));
+    expect(submittedWidth, closeTo(trackWidth * .5, .01));
     expect(find.textContaining('com.example.demo'), findsOneWidget);
     expect(find.textContaining('版本：42'), findsOneWidget);
     expect(find.text('详情'), findsOneWidget);
@@ -141,7 +152,6 @@ void main() {
         body: InstallTaskCard(
           task: task,
           onCancel: () async {},
-          onCheck: () async {},
           onRetry: () async {},
         ),
       ),
@@ -180,7 +190,6 @@ void main() {
           child: InstallTaskCard(
             task: task,
             onCancel: () async {},
-            onCheck: () async {},
             onRetry: () async {},
           ),
         ),
@@ -214,7 +223,6 @@ void main() {
         body: InstallTaskCard(
           task: task,
           onCancel: () async {},
-          onCheck: () async {},
           onRetry: () async {},
         ),
       ),
@@ -244,7 +252,6 @@ void main() {
         body: InstallTaskCard(
           task: task,
           onCancel: () async => cancelCalls++,
-          onCheck: () async {},
           onRetry: () async {},
         ),
       ),
@@ -286,7 +293,6 @@ void main() {
         body: InstallTaskCard(
           task: task,
           onCancel: () async {},
-          onCheck: () async {},
           onRetry: () async {},
           onClear: () => clearCalls++,
         ),
@@ -302,6 +308,7 @@ void main() {
   });
 
   testWidgets('安装卡片失败态显示错误原因且隐藏取消', (tester) async {
+    var retryCalls = 0;
     const task = InstallTask(
       kind: InstallKind.watchface,
       fileName: 'broken.face',
@@ -314,8 +321,7 @@ void main() {
         body: InstallTaskCard(
           task: task,
           onCancel: () async {},
-          onCheck: () async {},
-          onRetry: () async {},
+          onRetry: () async => retryCalls++,
         ),
       ),
     ));
@@ -323,6 +329,12 @@ void main() {
     expect(find.byIcon(Icons.error), findsOneWidget);
     expect(find.text('设备拒绝安装'), findsOneWidget);
     expect(find.text('取消'), findsNothing);
+    expect(find.text('再次尝试安装'), findsOneWidget);
+    expect(find.text('检查续传条件'), findsNothing);
+    expect(find.text('从头重试'), findsNothing);
+    await tester.tap(find.text('再次尝试安装'));
+    await tester.pump();
+    expect(retryCalls, 1);
   });
 
   testWidgets('安装警告倒计时结束后才能确认，且可取消', (tester) async {
@@ -758,7 +770,7 @@ void main() {
     expect(find.text('已完成'), findsNothing);
   });
 
-  testWidgets('队列二次失败显示已跳过且不再提供重试', (tester) async {
+  testWidgets('队列失败后始终保留重试入口', (tester) async {
     final controller = DeviceController();
     addTearDown(controller.dispose);
     controller.enqueue(
@@ -776,19 +788,18 @@ void main() {
     );
     controller.installQueue.single
       ..stage = QueueStage.failed
-      ..failureAttempts = QueueEntry.maximumFailureAttempts
-      ..skippedAfterRetry = true;
+      ..failureAttempts = 2;
 
     await tester.pumpWidget(
       MaterialApp(home: Scaffold(body: QueuePage(controller: controller))),
     );
 
-    expect(find.text('失败 · 已跳过'), findsOneWidget);
+    expect(find.text('失败 · 重试'), findsOneWidget);
     final chip = tester.widget<ActionChip>(find.byType(ActionChip));
-    expect(chip.onPressed, isNull);
+    expect(chip.onPressed, isNotNull);
   });
 
-  test('取消共享安装前确认时队列保持等待且不计失败', () async {
+  test('取消共享安装前确认时从队列移除条目且不计失败', () async {
     final controller = DeviceController();
     addTearDown(controller.dispose);
     controller.queueInstallPreparer = (_) async => null;
@@ -808,9 +819,7 @@ void main() {
 
     await controller.runQueue();
 
-    final entry = controller.installQueue.single;
-    expect(entry.stage, QueueStage.waiting);
-    expect(entry.failureAttempts, 0);
+    expect(controller.installQueue, isEmpty);
     expect(controller.latestTask, isNull);
   });
 

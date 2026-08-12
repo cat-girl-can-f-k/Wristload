@@ -762,8 +762,7 @@ class HomePage extends StatelessWidget {
                   InstallTaskCard(
                     task: task,
                     onCancel: controller.cancelInstall,
-                    onCheck: controller.reconnectAndCheckInstall,
-                    onRetry: controller.retryInstallFromStart,
+                    onRetry: controller.retryInstall,
                     onClear: controller.clearLatestTask,
                   ),
               ],

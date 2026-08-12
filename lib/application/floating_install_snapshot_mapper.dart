@@ -51,9 +51,7 @@ FloatingInstallPhase _phaseFor(
     InstallStage.cancelled ||
     InstallStage.stateUnknown ||
     InstallStage.failed =>
-      entry != null && !entry.canRetry && !queueRunning
-          ? FloatingInstallPhase.idle
-          : FloatingInstallPhase.failed,
+      FloatingInstallPhase.failed,
     InstallStage.validating ||
     InstallStage.waitingForProtocol ||
     InstallStage.transferring ||

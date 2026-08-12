@@ -6,7 +6,6 @@ class InstallTaskCard extends StatelessWidget {
   const InstallTaskCard({
     required this.task,
     required this.onCancel,
-    required this.onCheck,
     required this.onRetry,
     this.onClear,
     super.key,
@@ -14,7 +13,6 @@ class InstallTaskCard extends StatelessWidget {
 
   final InstallTask task;
   final Future<void> Function() onCancel;
-  final Future<void> Function() onCheck;
   final Future<void> Function() onRetry;
   final VoidCallback? onClear;
 
@@ -324,22 +322,13 @@ class InstallTaskCard extends StatelessWidget {
                 ),
               ],
             ),
-            if (task.stage == InstallStage.cancelled ||
-                task.stage == InstallStage.stateUnknown)
+            if (_isFailure || task.stage == InstallStage.cancelled)
               Align(
                 alignment: Alignment.centerRight,
-                child: Wrap(
-                  spacing: 8,
-                  children: [
-                    TextButton(
-                      onPressed: onCheck,
-                      child: const Text('重新连接并检查'),
-                    ),
-                    TextButton(
-                      onPressed: onRetry,
-                      child: const Text('从头重试'),
-                    ),
-                  ],
+                child: FilledButton.tonalIcon(
+                  onPressed: onRetry,
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('再次尝试安装'),
                 ),
               ),
           ],
@@ -363,30 +352,58 @@ class _InstallProgressBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
-    final confirmed = (confirmedBytes / totalBytes).clamp(0.0, 1.0);
-    final submitted = (submittedBytes / totalBytes).clamp(confirmed, 1.0);
+    final double confirmed = totalBytes > 0
+        ? (confirmedBytes / totalBytes).clamp(0.0, 1.0).toDouble()
+        : 0.0;
+    final double submitted = totalBytes > 0
+        ? (submittedBytes / totalBytes).clamp(confirmed, 1.0).toDouble()
+        : 0.0;
     return Semantics(
       label: '安装进度',
       value: '${(confirmed * 100).toStringAsFixed(1)}%',
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(3),
-        child: SizedBox(
-          height: 6,
-          child: Stack(
-            children: [
-              Positioned.fill(
-                child: ColoredBox(color: colors.surfaceContainerHighest),
+      child: SizedBox(
+        height: 6,
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            // Stack gives non-positioned children loose constraints. Calculate
+            // explicit left-aligned widths so both progress sections always
+            // paint against the full, finite track width.
+            final trackWidth =
+                constraints.hasBoundedWidth ? constraints.maxWidth : 0.0;
+            return ClipRRect(
+              borderRadius: BorderRadius.circular(3),
+              child: Stack(
+                children: [
+                  Positioned.fill(
+                    child: ColoredBox(
+                      key: const ValueKey('install-progress-track'),
+                      color: colors.surfaceContainerHighest,
+                    ),
+                  ),
+                  Positioned(
+                    left: 0,
+                    top: 0,
+                    bottom: 0,
+                    width: trackWidth * submitted,
+                    child: ColoredBox(
+                      key: const ValueKey('install-progress-submitted'),
+                      color: colors.primaryContainer,
+                    ),
+                  ),
+                  Positioned(
+                    left: 0,
+                    top: 0,
+                    bottom: 0,
+                    width: trackWidth * confirmed,
+                    child: ColoredBox(
+                      key: const ValueKey('install-progress-confirmed'),
+                      color: colors.primary,
+                    ),
+                  ),
+                ],
               ),
-              FractionallySizedBox(
-                widthFactor: submitted,
-                child: ColoredBox(color: colors.primaryContainer),
-              ),
-              FractionallySizedBox(
-                widthFactor: confirmed,
-                child: ColoredBox(color: colors.primary),
-              ),
-            ],
-          ),
+            );
+          },
         ),
       ),
     );
