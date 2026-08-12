@@ -27,10 +27,13 @@ class InstallTaskCard extends StatelessWidget {
       task.stage == InstallStage.validating ||
       task.stage == InstallStage.transferring;
 
-  bool get _showProgress =>
+  bool get _showTransferProgress =>
       (task.stage == InstallStage.transferring ||
           task.stage == InstallStage.awaitingDevice) &&
       (task.totalBytes ?? 0) > 0;
+
+  bool get _showStructuredContent =>
+      _showTransferProgress || _isDone || _isFailure;
 
   String _kilobytes(num bytes) => '${(bytes / 1024).toStringAsFixed(1)} KB';
 
@@ -69,23 +72,12 @@ class InstallTaskCard extends StatelessWidget {
           ].join(' · '),
       };
 
-  IconData get _headerIcon {
-    if (_isDone) return Icons.check_circle;
-    if (_isFailure) return Icons.error;
-    if (task.stage == InstallStage.cancelled) return Icons.cancel_outlined;
-    return task.kind == InstallKind.watchface ? Icons.watch : Icons.apps;
-  }
+  IconData get _headerIcon =>
+      task.kind == InstallKind.watchface ? Icons.watch : Icons.apps;
 
-  String get _title => _isDone ? '${task.fileName} 安装完成' : task.fileName;
+  String get _title => task.fileName;
 
-  String _subtitle() {
-    if (_isDone) {
-      return '用时 ${_duration(task.elapsed)} · '
-          '平均速度 ${_speed(task.averageBytesPerSecond, unavailable: '—')}';
-    }
-    if (_isFailure) return task.message;
-    return _typeSummary();
-  }
+  String _subtitle() => _typeSummary();
 
   Duration? _eta(int confirmedBytes, int totalBytes) {
     final speed = task.bytesPerSecond;
@@ -130,12 +122,17 @@ class InstallTaskCard extends StatelessWidget {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
     final totalBytes = task.totalBytes ?? 0;
-    final confirmedBytes = (task.confirmedBytes ?? 0).clamp(0, totalBytes);
-    final submittedBytes =
-        (task.queuedBytes ?? confirmedBytes).clamp(confirmedBytes, totalBytes);
+    final confirmedBytes =
+        (task.confirmedBytes ?? 0).clamp(0, totalBytes).toInt();
+    final submittedBytes = (task.queuedBytes ?? confirmedBytes)
+        .clamp(confirmedBytes, totalBytes)
+        .toInt();
     final percentage = totalBytes > 0 ? confirmedBytes * 100 / totalBytes : 0.0;
     final eta = _eta(confirmedBytes, totalBytes);
-    final headerColor = _isFailure ? colors.error : colors.primary;
+    final terminalColor = colors.tertiary;
+    final failurePercentage = totalBytes > 0
+        ? (confirmedBytes * 100 / totalBytes).clamp(0.0, 100.0)
+        : 0.0;
 
     return Card(
       margin: const EdgeInsets.only(top: 12),
@@ -153,7 +150,7 @@ class InstallTaskCard extends StatelessWidget {
                     color: colors.surfaceContainerHigh,
                     borderRadius: BorderRadius.circular(12),
                   ),
-                  child: Icon(_headerIcon, color: headerColor),
+                  child: Icon(_headerIcon, color: colors.primary),
                 ),
                 const SizedBox(width: 12),
                 Expanded(
@@ -174,9 +171,7 @@ class InstallTaskCard extends StatelessWidget {
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: _tabular(theme.textTheme.bodySmall?.copyWith(
-                            color: _isFailure
-                                ? colors.error
-                                : colors.onSurfaceVariant,
+                            color: colors.onSurfaceVariant,
                           )),
                         ),
                       ),
@@ -198,30 +193,115 @@ class InstallTaskCard extends StatelessWidget {
                   TextButton(
                     onPressed: onClear,
                     child: const Text('清除'),
+                  )
+                else if (_isFailure)
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      FilledButton.tonal(
+                        onPressed: onRetry,
+                        child: const Text('重试'),
+                      ),
+                      if (onClear != null) ...[
+                        const SizedBox(width: 4),
+                        TextButton(
+                          onPressed: onClear,
+                          child: const Text('清除'),
+                        ),
+                      ],
+                    ],
                   ),
               ],
             ),
-            if (_showProgress) ...[
+            if (_showStructuredContent) ...[
               const SizedBox(height: 16),
               Row(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
-                  Text(
-                    '${percentage.toStringAsFixed(1)}%',
-                    style: _tabular(theme.textTheme.headlineLarge?.copyWith(
-                      fontSize: 36,
-                      fontWeight: FontWeight.w600,
-                    )),
+                  Expanded(
+                    child: Row(
+                      children: [
+                        if (_isDone) ...[
+                          Icon(Icons.check_circle,
+                              color: terminalColor, size: 40),
+                          const SizedBox(width: 10),
+                          Flexible(
+                            child: Text(
+                              '安装完成',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: _tabular(
+                                theme.textTheme.headlineLarge?.copyWith(
+                                  color: terminalColor,
+                                  fontSize: 36,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ] else if (_isFailure) ...[
+                          Icon(Icons.error, color: colors.error, size: 40),
+                          const SizedBox(width: 10),
+                          Flexible(
+                            child: Text(
+                              '安装失败',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: _tabular(
+                                theme.textTheme.headlineLarge?.copyWith(
+                                  color: colors.error,
+                                  fontSize: 36,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ] else
+                          Text(
+                            '${percentage.toStringAsFixed(1)}%',
+                            style: _tabular(
+                              theme.textTheme.headlineLarge?.copyWith(
+                                fontSize: 36,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
                   ),
-                  const Spacer(),
+                  const SizedBox(width: 12),
                   Column(
                     crossAxisAlignment: CrossAxisAlignment.end,
                     children: [
                       Text(
-                        _speed(task.bytesPerSecond),
+                        _isDone
+                            ? '用时 ${_duration(task.elapsed)}'
+                            : _isFailure
+                                ? totalBytes > 0
+                                    ? '中断于 ${failurePercentage.toStringAsFixed(1)}%'
+                                    : '传输已中断'
+                                : _speed(task.bytesPerSecond),
                         style: _tabular(theme.textTheme.titleSmall),
                       ),
-                      if (eta != null)
+                      if (_isDone)
+                        Text(
+                          '平均 ${_speed(task.averageBytesPerSecond, unavailable: '—')}',
+                          style: _tabular(
+                            theme.textTheme.bodySmall?.copyWith(
+                              color: colors.onSurfaceVariant,
+                            ),
+                          ),
+                        )
+                      else if (_isFailure)
+                        Text(
+                          '已用时 ${_duration(task.elapsed)}',
+                          style: _tabular(
+                            theme.textTheme.bodySmall?.copyWith(
+                              color: colors.onSurfaceVariant,
+                            ),
+                          ),
+                        )
+                      else if (eta != null)
                         Text(
                           '预计剩余 ${_duration(eta)}',
                           style: _tabular(
@@ -234,11 +314,20 @@ class InstallTaskCard extends StatelessWidget {
                   ),
                 ],
               ),
+              if (_isFailure) ...[
+                const SizedBox(height: 14),
+                _FailureReason(message: task.message),
+              ],
               const SizedBox(height: 10),
               _InstallProgressBar(
                 confirmedBytes: confirmedBytes,
                 submittedBytes: submittedBytes,
                 totalBytes: totalBytes,
+                terminal: _isDone
+                    ? _TerminalProgress.done
+                    : _isFailure
+                        ? _TerminalProgress.failed
+                        : _TerminalProgress.none,
               ),
               const SizedBox(height: 8),
               Row(
@@ -247,7 +336,9 @@ class InstallTaskCard extends StatelessWidget {
                     child: Text(
                       '设备确认 ${task.currentSegment ?? 0}/'
                       '${task.totalSegments ?? '?'} 片 · '
-                      '${_kilobytes(confirmedBytes)}/${_kilobytes(totalBytes)}',
+                      '${_kilobytes(confirmedBytes)}/'
+                      '${totalBytes > 0 ? _kilobytes(totalBytes) : '—'}'
+                      '${_isDone ? ' · 校验通过' : ''}',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: _tabular(theme.textTheme.bodySmall?.copyWith(
@@ -256,14 +347,19 @@ class InstallTaskCard extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(width: 12),
-                  _ProgressLegend(
-                    confirmedColor: colors.primary,
-                    submittedColor: colors.primaryContainer,
-                  ),
+                  if (_isDone)
+                    _LegendItem(color: terminalColor, label: '全部确认')
+                  else
+                    _ProgressLegend(
+                      confirmedColor: colors.primary,
+                      submittedColor:
+                          _isFailure ? colors.error : colors.primaryContainer,
+                      submittedLabel: _isFailure ? '失败点' : '已提交待确认',
+                    ),
                 ],
               ),
             ],
-            if (!_showProgress && !_isDone && !_isFailure) ...[
+            if (!_showStructuredContent && !_isDone && !_isFailure) ...[
               const SizedBox(height: 10),
               Text(
                 task.message,
@@ -322,15 +418,6 @@ class InstallTaskCard extends StatelessWidget {
                 ),
               ],
             ),
-            if (_isFailure || task.stage == InstallStage.cancelled)
-              Align(
-                alignment: Alignment.centerRight,
-                child: FilledButton.tonalIcon(
-                  onPressed: onRetry,
-                  icon: const Icon(Icons.refresh),
-                  label: const Text('再次尝试安装'),
-                ),
-              ),
           ],
         ),
       ),
@@ -343,21 +430,29 @@ class _InstallProgressBar extends StatelessWidget {
     required this.confirmedBytes,
     required this.submittedBytes,
     required this.totalBytes,
+    required this.terminal,
   });
 
   final int confirmedBytes;
   final int submittedBytes;
   final int totalBytes;
+  final _TerminalProgress terminal;
 
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
-    final double confirmed = totalBytes > 0
-        ? (confirmedBytes / totalBytes).clamp(0.0, 1.0).toDouble()
-        : 0.0;
-    final double submitted = totalBytes > 0
-        ? (submittedBytes / totalBytes).clamp(confirmed, 1.0).toDouble()
-        : 0.0;
+    final double confirmed = terminal == _TerminalProgress.done
+        ? 1
+        : totalBytes > 0
+            ? (confirmedBytes / totalBytes).clamp(0.0, 1.0).toDouble()
+            : 0.0;
+    final double submitted = terminal == _TerminalProgress.failed
+        ? confirmed
+        : totalBytes > 0
+            ? (submittedBytes / totalBytes).clamp(confirmed, 1.0).toDouble()
+            : 0.0;
+    final double failureMarker =
+        terminal == _TerminalProgress.failed ? 0.025 : 0.0;
     return Semantics(
       label: '安装进度',
       value: '${(confirmed * 100).toStringAsFixed(1)}%',
@@ -380,16 +475,17 @@ class _InstallProgressBar extends StatelessWidget {
                       color: colors.surfaceContainerHighest,
                     ),
                   ),
-                  Positioned(
-                    left: 0,
-                    top: 0,
-                    bottom: 0,
-                    width: trackWidth * submitted,
-                    child: ColoredBox(
-                      key: const ValueKey('install-progress-submitted'),
-                      color: colors.primaryContainer,
+                  if (terminal == _TerminalProgress.none)
+                    Positioned(
+                      left: 0,
+                      top: 0,
+                      bottom: 0,
+                      width: trackWidth * submitted,
+                      child: ColoredBox(
+                        key: const ValueKey('install-progress-submitted'),
+                        color: colors.primaryContainer,
+                      ),
                     ),
-                  ),
                   Positioned(
                     left: 0,
                     top: 0,
@@ -397,9 +493,23 @@ class _InstallProgressBar extends StatelessWidget {
                     width: trackWidth * confirmed,
                     child: ColoredBox(
                       key: const ValueKey('install-progress-confirmed'),
-                      color: colors.primary,
+                      color: terminal == _TerminalProgress.done
+                          ? colors.tertiary
+                          : colors.primary,
                     ),
                   ),
+                  if (failureMarker > 0)
+                    Positioned(
+                      left: (trackWidth * confirmed)
+                          .clamp(0.0, trackWidth - trackWidth * failureMarker),
+                      top: 0,
+                      bottom: 0,
+                      width: trackWidth * failureMarker,
+                      child: ColoredBox(
+                        key: const ValueKey('install-progress-failure-marker'),
+                        color: colors.error,
+                      ),
+                    ),
                 ],
               ),
             );
@@ -414,10 +524,12 @@ class _ProgressLegend extends StatelessWidget {
   const _ProgressLegend({
     required this.confirmedColor,
     required this.submittedColor,
+    required this.submittedLabel,
   });
 
   final Color confirmedColor;
   final Color submittedColor;
+  final String submittedLabel;
 
   @override
   Widget build(BuildContext context) => Row(
@@ -425,9 +537,57 @@ class _ProgressLegend extends StatelessWidget {
         children: [
           _LegendItem(color: confirmedColor, label: '已确认'),
           const SizedBox(width: 10),
-          _LegendItem(color: submittedColor, label: '已提交待确认'),
+          _LegendItem(color: submittedColor, label: submittedLabel),
         ],
       );
+}
+
+enum _TerminalProgress { none, done, failed }
+
+class _FailureReason extends StatelessWidget {
+  const _FailureReason({required this.message});
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: colors.errorContainer,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.error_outline, color: colors.error),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  message,
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: colors.onErrorContainer,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  '已传输分片保留，重试将从断点继续。',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: colors.onErrorContainer,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class _LegendItem extends StatelessWidget {

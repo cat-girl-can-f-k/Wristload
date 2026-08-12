@@ -272,16 +272,22 @@ void main() {
     expect(cancelCalls, 1);
   });
 
-  testWidgets('安装卡片完成态显示用时和平均速度并可清除', (tester) async {
+  testWidgets('安装卡片完成态保留完整结构并可清除', (tester) async {
     var clearCalls = 0;
     const task = InstallTask(
       kind: InstallKind.quickApp,
       fileName: 'demo.rpk',
       stage: InstallStage.succeeded,
       message: '安装完成',
+      targetDeviceName: 'Xiaomi Smart Band 9 Pro',
+      md5Hex: '0123456789abcdef0123456789abcdef',
       packageName: 'com.example.demo',
       versionCode: 42,
+      currentSegment: 82,
+      totalSegments: 82,
       confirmedBytes: 8192,
+      queuedSegment: 82,
+      queuedBytes: 8192,
       totalBytes: 8192,
       elapsed: Duration(seconds: 65),
       transferElapsed: Duration(seconds: 4),
@@ -299,21 +305,56 @@ void main() {
       ),
     ));
 
+    expect(find.text('demo.rpk'), findsOneWidget);
+    expect(
+      find.text('快应用 · com.example.demo · 版本：42'),
+      findsOneWidget,
+    );
     expect(find.byIcon(Icons.check_circle), findsOneWidget);
-    expect(find.text('demo.rpk 安装完成'), findsOneWidget);
-    expect(find.text('用时 1 分 5 秒 · 平均速度 2.0 KB/s'), findsOneWidget);
+    expect(find.text('安装完成'), findsOneWidget);
+    expect(find.text('用时 1 分 5 秒'), findsOneWidget);
+    expect(find.text('平均 2.0 KB/s'), findsOneWidget);
+    expect(find.textContaining('设备确认 82/82 片'), findsOneWidget);
+    expect(find.textContaining('校验通过'), findsOneWidget);
+    expect(find.text('全部确认'), findsOneWidget);
+    final trackWidth = tester
+        .getSize(find.byKey(const ValueKey('install-progress-track')))
+        .width;
+    final confirmedWidth = tester
+        .getSize(find.byKey(const ValueKey('install-progress-confirmed')))
+        .width;
+    expect(trackWidth, greaterThan(0));
+    expect(confirmedWidth, closeTo(trackWidth, .01));
+    expect(find.text('详情'), findsOneWidget);
+    expect(find.textContaining('Xiaomi Smart Band 9 Pro'), findsNothing);
+    await tester.tap(find.text('详情'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Xiaomi Smart Band 9 Pro'), findsOneWidget);
+    expect(find.textContaining('0123456789abcdef'), findsOneWidget);
     expect(find.text('取消'), findsNothing);
     await tester.tap(find.text('清除'));
+    await tester.pump();
     expect(clearCalls, 1);
   });
 
-  testWidgets('安装卡片失败态显示错误原因且隐藏取消', (tester) async {
+  testWidgets('安装卡片失败态保留进度并提供断点重试和清除', (tester) async {
     var retryCalls = 0;
+    var clearCalls = 0;
     const task = InstallTask(
       kind: InstallKind.watchface,
       fileName: 'broken.face',
       stage: InstallStage.failed,
-      message: '设备拒绝安装',
+      message: '设备 ACK 超时',
+      targetDeviceName: 'REDMI Watch 5',
+      md5Hex: 'fedcba9876543210fedcba9876543210',
+      faceId: '1234',
+      currentSegment: 50,
+      totalSegments: 82,
+      confirmedBytes: 50 * 1024,
+      queuedSegment: 52,
+      queuedBytes: 52 * 1024,
+      totalBytes: 82 * 1024,
+      elapsed: Duration(seconds: 9),
     );
 
     await tester.pumpWidget(MaterialApp(
@@ -322,19 +363,46 @@ void main() {
           task: task,
           onCancel: () async {},
           onRetry: () async => retryCalls++,
+          onClear: () => clearCalls++,
         ),
       ),
     ));
 
+    expect(find.text('broken.face'), findsOneWidget);
+    expect(find.text('表盘 · ID 1234'), findsOneWidget);
     expect(find.byIcon(Icons.error), findsOneWidget);
-    expect(find.text('设备拒绝安装'), findsOneWidget);
+    expect(find.text('安装失败'), findsOneWidget);
+    expect(find.text('中断于 61.0%'), findsOneWidget);
+    expect(find.text('已用时 9 秒'), findsOneWidget);
+    expect(find.text('设备 ACK 超时'), findsOneWidget);
+    expect(find.text('已传输分片保留，重试将从断点继续。'), findsOneWidget);
+    expect(find.textContaining('设备确认 50/82 片'), findsOneWidget);
+    expect(find.text('已确认'), findsOneWidget);
+    expect(find.text('失败点'), findsOneWidget);
+    final trackWidth = tester
+        .getSize(find.byKey(const ValueKey('install-progress-track')))
+        .width;
+    final confirmedWidth = tester
+        .getSize(find.byKey(const ValueKey('install-progress-confirmed')))
+        .width;
+    final failureWidth = tester
+        .getSize(find.byKey(const ValueKey('install-progress-failure-marker')))
+        .width;
+    expect(trackWidth, greaterThan(0));
+    expect(confirmedWidth, closeTo(trackWidth * 50 / 82, .01));
+    expect(failureWidth, closeTo(trackWidth * .025, .01));
+    expect(find.text('详情'), findsOneWidget);
     expect(find.text('取消'), findsNothing);
-    expect(find.text('再次尝试安装'), findsOneWidget);
-    expect(find.text('检查续传条件'), findsNothing);
-    expect(find.text('从头重试'), findsNothing);
-    await tester.tap(find.text('再次尝试安装'));
+    await tester.tap(find.text('详情'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('REDMI Watch 5'), findsOneWidget);
+    expect(find.textContaining('fedcba9876543210'), findsOneWidget);
+    await tester.tap(find.text('重试'));
     await tester.pump();
     expect(retryCalls, 1);
+    await tester.tap(find.text('清除'));
+    await tester.pump();
+    expect(clearCalls, 1);
   });
 
   testWidgets('安装警告倒计时结束后才能确认，且可取消', (tester) async {
@@ -491,6 +559,13 @@ void main() {
       ),
     );
 
+    await tester.scrollUntilVisible(
+      find.text('自动同步时间与时区'),
+      300,
+      scrollable: find.byType(Scrollable),
+    );
+    await tester.ensureVisible(find.text('自动同步时间与时区'));
+    await tester.pumpAndSettle();
     final tileFinder = find.ancestor(
       of: find.text('自动同步时间与时区'),
       matching: find.byType(SwitchListTile),
@@ -559,10 +634,16 @@ void main() {
 
     await tester.scrollUntilVisible(
       find.text('重新查看使用引导'),
-      250,
+      300,
       scrollable: find.byType(Scrollable),
     );
-    await tester.tap(find.text('重新查看使用引导'));
+    final replayTile = find.ancestor(
+      of: find.text('重新查看使用引导'),
+      matching: find.byType(ListTile),
+    );
+    await tester.ensureVisible(replayTile);
+    await tester.pumpAndSettle();
+    await tester.tap(replayTile);
     expect(replayCalls, 1);
   });
 
@@ -873,7 +954,7 @@ void main() {
     expect(controller.latestTask, isNull);
   });
 
-  test('首次失败持续阻塞后续队列，直到显式重试', () async {
+  test('失败项保留重试且不阻塞后续等待项', () async {
     final controller = DeviceController();
     addTearDown(controller.dispose);
     var prepareCalls = 0;
@@ -913,7 +994,7 @@ void main() {
 
     await controller.runQueue();
 
-    expect(prepareCalls, 0);
+    expect(prepareCalls, 1);
     expect(failed.canRetry, isTrue);
     expect(controller.installQueue.last.stage, QueueStage.waiting);
   });

@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:desktop_multi_window/desktop_multi_window.dart';
-import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:screen_retriever/screen_retriever.dart';
 import 'package:system_tray/system_tray.dart';
@@ -12,6 +12,7 @@ import '../domain/floating_window_preferences.dart';
 import '../domain/queue_file_importer.dart';
 import 'device_controller.dart';
 import 'floating_install_snapshot_mapper.dart';
+import 'theme_controller.dart';
 
 const floatingInstallWindowArgument = 'floating-install-window';
 const floatingInstallChannelName = 'wristload/floating-install-window';
@@ -32,8 +33,11 @@ class FloatingWindowCoordinator with WindowListener {
     this.onNotice,
     this.onOpenMainWindow,
     this.onExitRequested,
+    Color Function()? themeSeedProvider,
   })  : _preferences = preferences ?? FloatingWindowPreferences(),
-        _importer = importer ?? QueueFileImporter();
+        _importer = importer ?? QueueFileImporter(),
+        _themeSeedProvider =
+            themeSeedProvider ?? (() => ThemeController.defaultSeedColor);
 
   final DeviceController controller;
   final FloatingWindowPreferences _preferences;
@@ -41,6 +45,7 @@ class FloatingWindowCoordinator with WindowListener {
   final FloatingWindowNotice? onNotice;
   final FutureOr<void> Function()? onOpenMainWindow;
   final FutureOr<void> Function()? onExitRequested;
+  final Color Function() _themeSeedProvider;
 
   final WindowMethodChannel _channel = const WindowMethodChannel(
     floatingInstallChannelName,
@@ -60,6 +65,10 @@ class FloatingWindowCoordinator with WindowListener {
   bool _disposed = false;
 
   bool get enabled => _enabled;
+
+  Future<void> updateTheme() async {
+    if (_floatingReady && !_disposed) await _sendConfiguration();
+  }
 
   Future<void> initialize() async {
     if (_initialized || !Platform.isWindows) return;
@@ -209,6 +218,7 @@ class FloatingWindowCoordinator with WindowListener {
       'x': position.dx,
       'y': position.dy,
       'alwaysOnTop': !(await windowManager.isFocused()),
+      'seedColor': _themeSeedProvider().toARGB32(),
     });
   }
 

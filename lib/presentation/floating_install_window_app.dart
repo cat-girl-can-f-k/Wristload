@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:window_manager/window_manager.dart';
 
 import '../application/floating_window_coordinator.dart';
+import '../application/theme_controller.dart';
 import '../domain/floating_install_snapshot.dart';
 import 'floating_install_window.dart';
 
@@ -30,6 +31,7 @@ class _FloatingInstallWindowAppState extends State<FloatingInstallWindowApp>
     authenticated: false,
     deviceName: '',
   );
+  Color _seedColor = ThemeController.defaultSeedColor;
   bool _destroying = false;
 
   @override
@@ -100,6 +102,10 @@ class _FloatingInstallWindowAppState extends State<FloatingInstallWindowApp>
     final height = (arguments['height'] as num?)?.toDouble();
     final x = (arguments['x'] as num?)?.toDouble();
     final y = (arguments['y'] as num?)?.toDouble();
+    final seedValue = (arguments['seedColor'] as num?)?.toInt();
+    if (seedValue != null && mounted) {
+      setState(() => _seedColor = Color(seedValue));
+    }
     if (width != null && height != null) {
       final size = Size(width, height);
       await windowManager.setMinimumSize(size);
@@ -200,12 +206,18 @@ class _FloatingInstallWindowAppState extends State<FloatingInstallWindowApp>
         scaffoldMessengerKey: _messengerKey,
         theme: ThemeData(
           useMaterial3: true,
-          colorSchemeSeed: Colors.indigo,
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: _seedColor,
+            brightness: Brightness.light,
+          ),
           brightness: Brightness.light,
         ),
         darkTheme: ThemeData(
           useMaterial3: true,
-          colorSchemeSeed: Colors.indigo,
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: _seedColor,
+            brightness: Brightness.dark,
+          ),
           brightness: Brightness.dark,
         ),
         themeMode: ThemeMode.system,

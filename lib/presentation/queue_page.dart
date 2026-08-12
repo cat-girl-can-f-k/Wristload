@@ -65,17 +65,6 @@ class _QueuePageState extends State<QueuePage> {
         ),
       );
     }
-    if (imported.addedCount > 0) {
-      messenger.showSnackBar(
-        SnackBar(
-          content: Text('已加入 ${imported.addedCount} 个文件'),
-          action: SnackBarAction(
-            label: '开始安装',
-            onPressed: controller.runQueue,
-          ),
-        ),
-      );
-    }
   }
 
   void _setDragging(bool value, [int fileCount = 0]) {

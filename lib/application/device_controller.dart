@@ -184,16 +184,13 @@ class DeviceController extends ChangeNotifier {
     _queueRunning = true;
     try {
       while (true) {
-        // Normal queue execution pauses at any failed item. An explicit retry
-        // may target that exact item even when older failure history remains.
+        // An explicit retry may target the requested item, while failed
+        // history remains visible and does not block later waiting entries.
         final preferred = preferredEntry != null &&
                 installQueue.contains(preferredEntry) &&
                 preferredEntry.stage == QueueStage.waiting
             ? preferredEntry
             : null;
-        if (preferred == null && installQueue.any((entry) => entry.canRetry)) {
-          break;
-        }
         final next = preferred ??
             installQueue
                 .where((e) => e.stage == QueueStage.waiting)
@@ -268,9 +265,8 @@ class DeviceController extends ChangeNotifier {
           if (_disposed) break;
         }
 
-        // A failed item is a deliberate pause point. Keep it in the queue and
-        // let the user retry the same package as many times as necessary.
-        if (next.isFailure) break;
+        // Keep failed items for retry, but continue with later waiting items
+        // whenever the authenticated transport is still usable.
       }
     } finally {
       _queueRunning = false;

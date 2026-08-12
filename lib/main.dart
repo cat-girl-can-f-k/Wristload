@@ -10,6 +10,7 @@ import 'package:window_manager/window_manager.dart';
 
 import 'application/device_controller.dart';
 import 'application/floating_window_coordinator.dart';
+import 'application/theme_controller.dart';
 import 'domain/firmware_package_inspector.dart';
 import 'domain/install_metadata_reader.dart';
 import 'domain/install_models.dart';
@@ -44,11 +45,16 @@ Future<void> main(List<String> args) async {
   final startupValues = await Future.wait([
     OobeStore().readCompleted(),
     InstallPreferenceStore().readPreference(),
+    ThemeController.create(),
   ]);
+  final initialThemeController = startupValues[2] as ThemeController;
+  final initialThemeSeedColor = initialThemeController.seedColor;
+  initialThemeController.dispose();
   runApp(WristloadApp(
     desktopIntegrationEnabled: Platform.isWindows,
     initialOobeCompleted: startupValues[0] as bool,
     initialPreference: startupValues[1] as InstallPreference,
+    initialThemeSeedColor: initialThemeSeedColor,
   ));
 }
 
@@ -57,12 +63,14 @@ class WristloadApp extends StatefulWidget {
     this.desktopIntegrationEnabled = false,
     this.initialOobeCompleted = false,
     this.initialPreference = InstallPreference.watchface,
+    this.initialThemeSeedColor = ThemeController.defaultSeedColor,
     super.key,
   });
 
   final bool desktopIntegrationEnabled;
   final bool initialOobeCompleted;
   final InstallPreference initialPreference;
+  final Color initialThemeSeedColor;
 
   @override
   State<WristloadApp> createState() => _WristloadAppState();
@@ -79,6 +87,7 @@ class _WristloadAppState extends State<WristloadApp> {
   bool _floatingInstallWindowEnabled = false;
   late bool _oobeCompleted;
   late InstallPreference _preferredInstallTarget;
+  late final ThemeController _themeController;
   Future<void> _preferenceWrites = Future.value();
   bool _floatingInitialized = false;
 
@@ -87,10 +96,12 @@ class _WristloadAppState extends State<WristloadApp> {
     super.initState();
     _oobeCompleted = widget.initialOobeCompleted;
     _preferredInstallTarget = widget.initialPreference;
+    _themeController = ThemeController(widget.initialThemeSeedColor);
     controller.queueInstallPreparer = _prepareQueuedRequest;
     _floatingWindowCoordinator = FloatingWindowCoordinator(
       controller: controller,
       onOpenMainWindow: () => _appShellKey.currentState?.showHome(),
+      themeSeedProvider: () => _themeController.seedColor,
     );
     if (widget.desktopIntegrationEnabled && _oobeCompleted) {
       unawaited(_initializeFloatingWindow());
@@ -139,6 +150,11 @@ class _WristloadAppState extends State<WristloadApp> {
           onPreferredInstallTargetChanged: _setOobePreference,
           onReplayOobe: _replayOobe,
           floatingInstallWindowEnabled: _floatingInstallWindowEnabled,
+          themeSeedColor: _themeController.seedColor,
+          onThemeSeedChanged: (color) {
+            unawaited(_themeController.setSeed(color));
+            unawaited(_floatingWindowCoordinator.updateTheme());
+          },
           onFloatingInstallWindowEnabledChanged: (enabled) {
             unawaited(_setFloatingInstallWindowEnabled(enabled));
           },
@@ -191,40 +207,50 @@ class _WristloadAppState extends State<WristloadApp> {
     controller.queueInstallPreparer = null;
     unawaited(_floatingWindowCoordinator.dispose());
     controller.dispose();
+    _themeController.dispose();
     super.dispose();
   }
 
   @override
-  Widget build(BuildContext context) => MaterialApp(
-        navigatorKey: _navigatorKey,
-        debugShowCheckedModeBanner: false,
-        theme: ThemeData(
-          useMaterial3: true,
-          colorSchemeSeed: Colors.indigo,
-          brightness: Brightness.light,
-        ),
-        darkTheme: ThemeData(
-          useMaterial3: true,
-          colorSchemeSeed: Colors.indigo,
-          brightness: Brightness.dark,
-        ),
-        themeMode: ThemeMode.system,
-        initialRoute: _oobeCompleted ? '/' : '/oobe',
-        onGenerateInitialRoutes: (initialRouteName) => [
-          MaterialPageRoute<void>(
-            settings: RouteSettings(name: initialRouteName),
-            builder: (_) => initialRouteName == '/oobe'
-                ? _buildOobePage()
-                : _buildAppShell(),
+  Widget build(BuildContext context) => AnimatedBuilder(
+        animation: _themeController,
+        builder: (context, _) => MaterialApp(
+          navigatorKey: _navigatorKey,
+          debugShowCheckedModeBanner: false,
+          theme: ThemeData(
+            useMaterial3: true,
+            colorScheme: ColorScheme.fromSeed(
+              seedColor: _themeController.seedColor,
+              brightness: Brightness.light,
+            ),
+            brightness: Brightness.light,
           ),
-        ],
-        routes: {
-          '/': (context) => _buildAppShell(),
-          '/oobe': (context) => _buildOobePage(),
-          '/device-info': (context) => DeviceInfoPage(controller: controller),
-          '/queue': (context) => QueuePage(controller: controller),
-          '/tools': (context) => ToolsPage(controller: controller),
-        },
+          darkTheme: ThemeData(
+            useMaterial3: true,
+            colorScheme: ColorScheme.fromSeed(
+              seedColor: _themeController.seedColor,
+              brightness: Brightness.dark,
+            ),
+            brightness: Brightness.dark,
+          ),
+          themeMode: ThemeMode.system,
+          initialRoute: _oobeCompleted ? '/' : '/oobe',
+          onGenerateInitialRoutes: (initialRouteName) => [
+            MaterialPageRoute<void>(
+              settings: RouteSettings(name: initialRouteName),
+              builder: (_) => initialRouteName == '/oobe'
+                  ? _buildOobePage()
+                  : _buildAppShell(),
+            ),
+          ],
+          routes: {
+            '/': (context) => _buildAppShell(),
+            '/oobe': (context) => _buildOobePage(),
+            '/device-info': (context) => DeviceInfoPage(controller: controller),
+            '/queue': (context) => QueuePage(controller: controller),
+            '/tools': (context) => ToolsPage(controller: controller),
+          },
+        ),
       );
 }
 
@@ -236,6 +262,8 @@ class AppShell extends StatefulWidget {
     required this.onReplayOobe,
     required this.floatingInstallWindowEnabled,
     required this.onFloatingInstallWindowEnabledChanged,
+    required this.themeSeedColor,
+    required this.onThemeSeedChanged,
     super.key,
   });
 
@@ -245,6 +273,8 @@ class AppShell extends StatefulWidget {
   final Future<void> Function() onReplayOobe;
   final bool floatingInstallWindowEnabled;
   final ValueChanged<bool> onFloatingInstallWindowEnabledChanged;
+  final Color themeSeedColor;
+  final ValueChanged<Color> onThemeSeedChanged;
 
   @override
   State<AppShell> createState() => _AppShellState();
@@ -388,6 +418,8 @@ class _AppShellState extends State<AppShell> {
                       autoTimeSync: widget.controller.autoTimeSync,
                       floatingInstallWindowEnabled:
                           widget.floatingInstallWindowEnabled,
+                      themeSeedColor: widget.themeSeedColor,
+                      onThemeSeedChanged: widget.onThemeSeedChanged,
                       onConnectionModeChanged:
                           widget.controller.setConnectionMode,
                       onSegmentIntervalChanged:
@@ -777,7 +809,7 @@ class HomePage extends StatelessWidget {
                                       : '已连接：${controller.connectedDeviceName ?? controller.connectedProfile?.displayName ?? '未知设备'}',
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
-                                  style: theme.textTheme.titleMedium),
+                                  style: theme.textTheme.titleLarge),
                             ),
                             if (device != null)
                               IconButton(
@@ -807,23 +839,6 @@ class HomePage extends StatelessWidget {
                               ),
                               const SizedBox(width: 6),
                               Text('已连接', style: theme.textTheme.bodyMedium),
-                              if (hasBattery) ...[
-                                const SizedBox(width: 14),
-                                Icon(
-                                  Icons.battery_std,
-                                  size: 18,
-                                  color: battery < 20
-                                      ? colors.error
-                                      : colors.onSurfaceVariant,
-                                ),
-                                const SizedBox(width: 4),
-                                Text(
-                                  '电量 $battery%',
-                                  style: theme.textTheme.bodyMedium?.copyWith(
-                                    color: battery < 20 ? colors.error : null,
-                                  ),
-                                ),
-                              ],
                               const SizedBox(width: 12),
                               Expanded(
                                 child: Text(
