@@ -7,6 +7,7 @@ import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 
 import '../domain/device_profile.dart';
+import '../domain/connection_issue.dart';
 import '../domain/install_models.dart';
 import '../domain/install_checkpoint_store.dart';
 import '../domain/install_task.dart';
@@ -35,6 +36,7 @@ class DeviceController extends ChangeNotifier {
   }
 
   final BleTransport _transport;
+  final ConnectionIssueTracker _connectionIssues = ConnectionIssueTracker();
   late final Future<void> _transferSettingsReady;
   bool _disposed = false;
   StreamSubscription<DiscoveredEventArgs>? _scanSubscription;
@@ -63,6 +65,29 @@ class DeviceController extends ChangeNotifier {
   int? _statusRefreshEpoch;
 
   bool get statusRefreshInProgress => _statusRefreshEpoch != null;
+
+  /// A pending user-facing connection notice. Diagnostic details remain in
+  /// [logs] and are never used as presentation state.
+  ConnectionIssue? get pendingConnectionIssue => _connectionIssues.pending;
+
+  int get consecutiveConnectionFailures =>
+      _connectionIssues.consecutivePortConflicts;
+
+  void dismissConnectionIssue(int id) {
+    if (_connectionIssues.acknowledge(id)) notifyListeners();
+  }
+
+  bool recordConnectionFailureForTest(Object error) {
+    final published = _connectionIssues.recordConnectionFailure(error);
+    if (published) notifyListeners();
+    return published;
+  }
+
+  bool recordUnexpectedDisconnectForTest() {
+    final published = _connectionIssues.recordUnexpectedDisconnect();
+    if (published) notifyListeners();
+    return published;
+  }
 
   void _advanceSessionEpoch() {
     _sessionEpoch++;
@@ -555,6 +580,7 @@ class DeviceController extends ChangeNotifier {
       notifyListeners();
       return;
     }
+    _connectionIssues.selectTarget(result.peripheral.uuid.toString());
     connectedDeviceName = advertisedName;
     connectedProfile = profile;
     _log('设备名称校验通过：$advertisedName → ${profile.displayName}。');
@@ -834,6 +860,7 @@ class DeviceController extends ChangeNotifier {
       _log('正在建立经典蓝牙 RFCOMM 链路，并独立检查 SPP 配对状态…');
       _log('  Windows 的 BLE 配对不等于经典蓝牙 SPP 配对；若手环弹出请求，请在手环上确认。');
       await _transport.connectRfcomm(device.uuid);
+      _connectionIssues.connectionSucceeded();
       // These V2 targets expose their transport generation through the GATT
       // version characteristic. Repeated device tests show that they do not
       // answer the legacy BA-DC-FE SPP version query, while L1START succeeds
@@ -849,6 +876,7 @@ class DeviceController extends ChangeNotifier {
         _sessionCipher = null;
         _log('会话恢复失败；已丢弃旧会话密钥，下次连接将重新鉴权。');
       }
+      _connectionIssues.recordConnectionFailure(exception);
       _log('SPP 连接失败：$exception');
       notifyListeners();
     }
@@ -963,6 +991,7 @@ class DeviceController extends ChangeNotifier {
       _log('检测到 f=27 后的 RFCOMM 传输切换；保留已确认会话密钥并自动重建链路。');
       unawaited(_recoverPostAuthRfcomm());
     } else {
+      _connectionIssues.recordUnexpectedDisconnect();
       _log('RFCOMM 长连接已被远端关闭；当前鉴权会话失效。');
     }
     notifyListeners();
@@ -1119,6 +1148,7 @@ class DeviceController extends ChangeNotifier {
             _pendingSessionKeys = null;
             _log('  已启用 WRITE_ENC 业务通道与只读解密诊断。');
           }
+          _connectionIssues.authenticated();
           _sppWatchdog?.cancel();
           _sppWatchdog = null;
           // f=27 confirms the authenticated session. Do not send a speculative
@@ -1304,7 +1334,39 @@ class DeviceController extends ChangeNotifier {
     batteryPercent = null;
     storageUsedBytes = null;
     storageTotalBytes = null;
+    _connectionIssues.reset();
     notifyListeners();
+  }
+
+  /// Rebuilds the device connection and performs a fresh authentication.
+  /// The selected device is retained so callers do not need to scan again.
+  Future<void> reconnect() async {
+    if (sppConnecting) return;
+    final device = connectedDevice ?? _lastPeripheral;
+    if (device == null) {
+      error = '没有可重新连接的设备，请先扫描并选择设备。';
+      _log(error!);
+      return;
+    }
+    _advanceSessionEpoch();
+    error = null;
+    sessionReady = false;
+    _authenticatedAt = null;
+    _resumeAuthenticatedSession = false;
+    _sppAwaitingAuthConfirm = false;
+    _pendingSessionKeys = null;
+    _sessionCipher = null;
+    _sppWatchdog?.cancel();
+    _sppWatchdog = null;
+    notifyListeners();
+    _log('正在重新建立设备连接并重新验证身份…');
+    try {
+      await _transport.disconnectRfcomm(device.uuid);
+    } on Object catch (exception) {
+      _log('清理旧 RFCOMM 链路时返回：$exception');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+    await connectSpp();
   }
 
   Future<void> startInstall(InstallRequest request) async {
@@ -1356,16 +1418,19 @@ class DeviceController extends ChangeNotifier {
     } on TimeoutException catch (exception) {
       sessionReady = false;
       _sessionCipher = null;
+      _connectionIssues.recordUnexpectedDisconnect();
       _publishTask(request, InstallStage.stateUnknown,
           '设备未在规定时间响应；已停止发送，设备状态未知。${exception.message ?? ''}');
     } on _InvalidDeviceResponse catch (exception) {
       sessionReady = false;
       _sessionCipher = null;
+      _connectionIssues.recordUnexpectedDisconnect();
       _publishTask(request, InstallStage.stateUnknown,
           '设备响应无法验证；已停止发送，设备状态未知：${exception.message}');
     } on Object catch (exception) {
       sessionReady = false;
       _sessionCipher = null;
+      _connectionIssues.recordUnexpectedDisconnect();
       _publishTask(
           request, InstallStage.stateUnknown, '传输已停止，设备状态未知：$exception');
     } finally {

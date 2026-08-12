@@ -62,7 +62,7 @@ class TransferSettingsPage extends StatelessWidget {
               contentPadding: EdgeInsets.zero,
               secondary: const Icon(Icons.sync),
               title: const Text('自动同步时间与时区'),
-              subtitle: const Text('鉴权成功后使用电脑当前的时间、时区和小时制同步设备'),
+              subtitle: const Text('连接成功后使用电脑当前的时间、时区和小时制同步设备'),
               value: autoTimeSync,
               onChanged: onAutoTimeSyncChanged,
             ),

@@ -46,7 +46,7 @@ class DeviceInfoPage extends StatelessWidget {
               const ListTile(
                 leading: Icon(Icons.link),
                 title: Text('连接方式'),
-                subtitle: Text('经典蓝牙 RFCOMM（SPP）'),
+                subtitle: Text('蓝牙'),
               ),
               _AuthKeyTile(value: controller.authKey),
               if (battery != null && battery >= 0 && battery <= 100)

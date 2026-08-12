@@ -9,6 +9,25 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+function Get-Gta5Processes {
+  @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+      $_.ProcessName -match '^(GTA5|GTA5_Enhanced|GTA5_BattlEye|GrandTheftAutoV)$'
+    })
+}
+
+function Test-Gta5Running {
+  @(Get-Gta5Processes).Count -gt 0
+}
+
+$gta5RunningAtBuildStart = Test-Gta5Running
+if ($gta5RunningAtBuildStart) {
+  $gta5ProcessIds = (Get-Gta5Processes | ForEach-Object Id) -join ', '
+  Write-Host "GTA5 is running (PID: $gta5ProcessIds); automatic application launches are disabled."
+} elseif ($SkipSmokeTest) {
+  Write-Host 'Automatic package launch is disabled by -SkipSmokeTest.'
+} else {
+  Write-Host 'GTA5 is not running; the packaged application will be launched after a successful build.'
+}
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
   $releaseDirectoryName = -join [char[]]@(0x53D1, 0x5E03, 0x5305)
   $OutputRoot = Join-Path (Split-Path (Split-Path $projectRoot -Parent) -Parent) $releaseDirectoryName
@@ -102,7 +121,9 @@ try {
     throw "The Windows runner EXE is older than its newest source: $($latestRunnerInput.FullName)"
   }
 
-  if (-not $SkipSmokeTest) {
+  $gta5RunningBeforeSmokeTest = Test-Gta5Running
+  $skipSmokeLaunch = $SkipSmokeTest -or $gta5RunningBeforeSmokeTest
+  if (-not $skipSmokeLaunch) {
     Write-Host '== Launch smoke test =='
     $process = Start-Process -FilePath $exe -WorkingDirectory $buildDirectory -PassThru
     try {
@@ -115,6 +136,8 @@ try {
         $process.WaitForExit()
       }
     }
+  } elseif ($gta5RunningBeforeSmokeTest) {
+    Write-Host '== Launch smoke test skipped: GTA5 is running =='
   }
 
   $pubspec = Get-Content -LiteralPath (Join-Path $projectRoot 'pubspec.yaml') -Encoding UTF8
@@ -190,13 +213,30 @@ try {
     verification = [ordered]@{
       dartAnalyze = 'passed'
       flutterTest = 'passed'
-      launchSmokeTest = $(if ($SkipSmokeTest) { 'skipped' } else { 'passed' })
+      launchSmokeTest = $(
+        if ($gta5RunningBeforeSmokeTest) { 'skipped-gta5-running' }
+        elseif ($SkipSmokeTest) { 'skipped-by-argument' }
+        else { 'passed' }
+      )
+      automaticLaunch = 'pending-final-check'
+      gta5RunningAtBuildStart = $gta5RunningAtBuildStart
+      gta5RunningBeforeSmokeTest = $gta5RunningBeforeSmokeTest
     }
     files = @($files)
   }
   $manifestPath = Join-Path $artifactDirectory 'build-manifest.json'
   $manifestJson = $manifest | ConvertTo-Json -Depth 6
   Set-Content -LiteralPath $manifestPath -Value $manifestJson -Encoding UTF8
+
+  $gta5RunningBeforeFinalLaunch = Test-Gta5Running
+  $skipFinalLaunch = $SkipSmokeTest -or $gta5RunningBeforeFinalLaunch
+  $manifest.verification.automaticLaunch = $(
+    if ($gta5RunningBeforeFinalLaunch) { 'skipped-gta5-running' }
+    elseif ($SkipSmokeTest) { 'skipped-by-argument' }
+    else { 'started' }
+  )
+  $manifest.verification.gta5RunningBeforeFinalLaunch = $gta5RunningBeforeFinalLaunch
+  $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
 
   Compress-Archive -Path (Join-Path $artifactDirectory '*') -DestinationPath $zipPath -CompressionLevel Optimal
   $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -221,7 +261,14 @@ try {
   }
   $finalExe = Join-Path $versionDirectory 'wristload.exe'
   $finalProcess = $null
-  if (-not $SkipSmokeTest) {
+  # Recheck at the last possible moment. If GTA5 started while the package was
+  # compressed/extracted, never launch Wristload over it.
+  if (-not $skipFinalLaunch -and (Test-Gta5Running)) {
+    $gta5RunningBeforeFinalLaunch = $true
+    $skipFinalLaunch = $true
+    Write-Host 'GTA5 started during packaging; automatic package launch is now disabled.'
+  }
+  if (-not $skipFinalLaunch) {
     Write-Host '== Launch extracted beta version =='
     $normalizedOutputRoot = [IO.Path]::GetFullPath($OutputRoot).TrimEnd('\') + '\'
     Get-Process -Name 'wristload' -ErrorAction SilentlyContinue |
@@ -238,6 +285,8 @@ try {
     if ($finalProcess.HasExited) {
       throw "Extracted beta application exited immediately with code $($finalProcess.ExitCode)."
     }
+  } elseif ($gta5RunningBeforeFinalLaunch) {
+    Write-Host '== Automatic package launch skipped: GTA5 is running =='
   }
 
   Write-Host "Beta version: $betaVersion"

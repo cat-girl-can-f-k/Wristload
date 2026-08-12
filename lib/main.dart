@@ -17,6 +17,7 @@ import 'domain/install_preference_store.dart';
 import 'domain/install_task.dart';
 import 'domain/oobe_store.dart';
 import 'presentation/device_info_page.dart';
+import 'presentation/connection_warning_dialog.dart';
 import 'presentation/firmware_inspection_dialog.dart';
 import 'presentation/floating_install_window_app.dart';
 import 'presentation/home_widgets.dart';
@@ -251,10 +252,76 @@ class AppShell extends StatefulWidget {
 
 class _AppShellState extends State<AppShell> {
   int _selectedIndex = 0;
+  int? _scheduledConnectionIssueId;
+  int? _visibleConnectionIssueId;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_handleConnectionIssue);
+    _handleConnectionIssue();
+  }
+
+  @override
+  void didUpdateWidget(covariant AppShell oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller == widget.controller) return;
+    oldWidget.controller.removeListener(_handleConnectionIssue);
+    widget.controller.addListener(_handleConnectionIssue);
+    _scheduledConnectionIssueId = null;
+    _visibleConnectionIssueId = null;
+    _handleConnectionIssue();
+  }
+
+  void _handleConnectionIssue() {
+    final issue = widget.controller.pendingConnectionIssue;
+    if (!mounted ||
+        issue == null ||
+        issue.id == _scheduledConnectionIssueId ||
+        issue.id == _visibleConnectionIssueId) {
+      return;
+    }
+    _scheduledConnectionIssueId = issue.id;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      unawaited(_showPendingConnectionIssue(issue.id));
+    });
+  }
+
+  Future<void> _showPendingConnectionIssue(int issueId) async {
+    if (_visibleConnectionIssueId != null) return;
+    final issue = widget.controller.pendingConnectionIssue;
+    if (issue == null || issue.id != issueId) {
+      if (_scheduledConnectionIssueId == issueId) {
+        _scheduledConnectionIssueId = null;
+      }
+      _handleConnectionIssue();
+      return;
+    }
+    _scheduledConnectionIssueId = null;
+    _visibleConnectionIssueId = issueId;
+    try {
+      await showConnectionIssueWarning(
+        context: context,
+        issue: issue,
+        onReconnect: widget.controller.reconnect,
+      );
+    } finally {
+      widget.controller.dismissConnectionIssue(issueId);
+      _visibleConnectionIssueId = null;
+      _handleConnectionIssue();
+    }
+  }
 
   void showHome() {
     if (_selectedIndex == 0 || !mounted) return;
     setState(() => _selectedIndex = 0);
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_handleConnectionIssue);
+    super.dispose();
   }
 
   @override
@@ -677,6 +744,8 @@ class HomePage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final device = controller.connectedDevice;
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
     final battery = controller.batteryPercent;
     final hasBattery = battery != null && battery >= 0 && battery <= 100;
     final storageUsed = controller.storageUsedBytes;
@@ -706,17 +775,16 @@ class HomePage extends StatelessWidget {
                                   device == null
                                       ? '尚未连接设备'
                                       : '已连接：${controller.connectedDeviceName ?? controller.connectedProfile?.displayName ?? '未知设备'}',
-                                  style:
-                                      Theme.of(context).textTheme.titleLarge),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: theme.textTheme.titleMedium),
                             ),
                             if (device != null)
                               IconButton(
                                 tooltip: '查看设备信息',
                                 style: IconButton.styleFrom(
                                   side: BorderSide(
-                                    color: Theme.of(context)
-                                        .colorScheme
-                                        .outlineVariant,
+                                    color: colors.outlineVariant,
                                   ),
                                 ),
                                 icon: const Icon(Icons.chevron_right),
@@ -725,6 +793,53 @@ class HomePage extends StatelessWidget {
                               ),
                           ],
                         ),
+                        if (device != null) ...[
+                          const SizedBox(height: 10),
+                          Row(
+                            children: [
+                              Container(
+                                width: 8,
+                                height: 8,
+                                decoration: BoxDecoration(
+                                  color: colors.tertiary,
+                                  shape: BoxShape.circle,
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              Text('已连接', style: theme.textTheme.bodyMedium),
+                              if (hasBattery) ...[
+                                const SizedBox(width: 14),
+                                Icon(
+                                  Icons.battery_std,
+                                  size: 18,
+                                  color: battery < 20
+                                      ? colors.error
+                                      : colors.onSurfaceVariant,
+                                ),
+                                const SizedBox(width: 4),
+                                Text(
+                                  '电量 $battery%',
+                                  style: theme.textTheme.bodyMedium?.copyWith(
+                                    color: battery < 20 ? colors.error : null,
+                                  ),
+                                ),
+                              ],
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Text(
+                                  device.uuid.toString(),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  textAlign: TextAlign.end,
+                                  style: theme.textTheme.bodySmall?.copyWith(
+                                    color: colors.onSurfaceVariant,
+                                    fontFamily: 'monospace',
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
                         if (device != null && (hasBattery || hasStorage)) ...[
                           const SizedBox(height: 12),
                           Row(
@@ -736,9 +851,8 @@ class HomePage extends StatelessWidget {
                                     value: '$battery%',
                                     detail: '电量',
                                     progress: battery / 100,
-                                    progressColor: battery < 20
-                                        ? Theme.of(context).colorScheme.error
-                                        : null,
+                                    progressColor:
+                                        battery < 20 ? colors.error : null,
                                   ),
                                 ),
                               if (hasBattery && hasStorage)
@@ -758,22 +872,70 @@ class HomePage extends StatelessWidget {
                         ],
                         const SizedBox(height: 12),
                         if (device == null)
-                          FilledButton.icon(
-                            onPressed: controller.isScanning
-                                ? controller.stopScan
-                                : controller.beginScan,
-                            icon: Icon(controller.isScanning
-                                ? Icons.stop_circle_outlined
-                                : Icons.bluetooth_searching),
-                            label: Text(
-                              controller.isScanning ? '停止扫描' : '扫描附近设备',
-                            ),
-                          )
+                          if (controller.isScanning)
+                            Row(
+                              children: [
+                                const ScanningPulseIndicator(),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        '正在扫描附近的设备…',
+                                        style: theme.textTheme.bodyMedium,
+                                      ),
+                                      Text(
+                                        '找到 ${controller.scanResults.where(isInstallableDiscovery).length} 个可安装设备',
+                                        style:
+                                            theme.textTheme.bodySmall?.copyWith(
+                                          color: colors.onSurfaceVariant,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                OutlinedButton.icon(
+                                  onPressed: controller.stopScan,
+                                  icon: const Icon(Icons.stop_circle_outlined),
+                                  label: const Text('停止扫描'),
+                                ),
+                              ],
+                            )
+                          else
+                            FilledButton.icon(
+                              onPressed: controller.beginScan,
+                              icon: const Icon(Icons.bluetooth_searching),
+                              label: const Text('开始扫描'),
+                            )
                         else
-                          OutlinedButton.icon(
-                            onPressed: controller.disconnect,
-                            icon: const Icon(Icons.link_off),
-                            label: const Text('断开连接'),
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            children: [
+                              FilledButton.icon(
+                                onPressed: controller.sppConnecting
+                                    ? null
+                                    : controller.reconnect,
+                                icon: controller.sppConnecting
+                                    ? const SizedBox.square(
+                                        dimension: 16,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                        ),
+                                      )
+                                    : const Icon(Icons.refresh),
+                                label: Text(
+                                    controller.sppConnecting ? '正在连接' : '重新连接'),
+                              ),
+                              OutlinedButton.icon(
+                                onPressed: controller.disconnect,
+                                icon: const Icon(Icons.link_off),
+                                label: const Text('断开连接'),
+                              ),
+                            ],
                           ),
                       ]),
                 ),
@@ -786,28 +948,14 @@ class HomePage extends StatelessWidget {
                             color: Theme.of(context).colorScheme.error))),
               if (device == null) ...[
                 const SizedBox(height: 12),
-                Text('发现的设备', style: Theme.of(context).textTheme.titleMedium),
-                for (final result in controller.scanResults)
-                  ExcludeSemantics(
-                    key: ValueKey(result.peripheral.uuid.toString()),
-                    child: ScanTile(
-                      result: result,
-                      onConnect: () => _connectWithAuthKey(context, result),
-                    ),
-                  ),
+                ScanResultsList(
+                  results: controller.scanResults,
+                  onConnect: (result) => _connectWithAuthKey(context, result),
+                ),
               ] else ...[
                 const SizedBox(height: 12),
-                if (!controller.sessionReady && !controller.sppConnecting) ...[
-                  const SizedBox(height: 8),
-                  OutlinedButton.icon(
-                    onPressed: controller.connectSpp,
-                    icon: const Icon(Icons.refresh),
-                    label: const Text('重新建立 SPP 会话'),
-                  ),
-                ],
-                const SizedBox(height: 12),
                 Text('安装', style: Theme.of(context).textTheme.titleMedium),
-                const Text('连接与鉴权只执行一次；会话保持期间可连续安装多个文件。'),
+                const Text('完成设备验证后，可连续安装多个文件。'),
                 const SizedBox(height: 8),
                 InstallSplitButton(
                   preferredTarget: preferredInstallTarget,

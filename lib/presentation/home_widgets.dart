@@ -88,41 +88,329 @@ class LogPanel extends StatelessWidget {
   }
 }
 
+bool isInstallableDiscovery(DiscoveredEventArgs result) {
+  final name = (result.advertisement.name ?? '').trim();
+  return DeviceProfile.matchAdvertisementName(name)?.generation ==
+      ProtocolGeneration.v2Vela;
+}
+
+class ScanResultsList extends StatefulWidget {
+  const ScanResultsList({
+    required this.results,
+    required this.onConnect,
+    super.key,
+  });
+
+  final List<DiscoveredEventArgs> results;
+  final ValueChanged<DiscoveredEventArgs> onConnect;
+
+  @override
+  State<ScanResultsList> createState() => _ScanResultsListState();
+}
+
+class _ScanResultsListState extends State<ScanResultsList> {
+  bool _showOtherDevices = true;
+
+  @override
+  Widget build(BuildContext context) {
+    final installable = widget.results
+        .where(isInstallableDiscovery)
+        .toList(growable: false);
+    final other = widget.results
+        .where((result) => !isInstallableDiscovery(result))
+        .toList(growable: false);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _ScanGroupHeader(label: '可安装的设备 · ${installable.length}'),
+        for (final result in installable)
+          ScanTile(
+            key: ValueKey(result.peripheral.uuid.toString()),
+            result: result,
+            installable: true,
+            onConnect: () => widget.onConnect(result),
+          ),
+        const SizedBox(height: 8),
+        _ScanGroupHeader(
+          label: '其他设备 · ${other.length}（不支持安装）',
+          expanded: _showOtherDevices,
+          onToggle: () => setState(() {
+            _showOtherDevices = !_showOtherDevices;
+          }),
+        ),
+        if (_showOtherDevices)
+          for (final result in other)
+            ScanTile(
+              key: ValueKey(result.peripheral.uuid.toString()),
+              result: result,
+              installable: false,
+              onConnect: null,
+            ),
+      ],
+    );
+  }
+}
+
+class _ScanGroupHeader extends StatelessWidget {
+  const _ScanGroupHeader({
+    required this.label,
+    this.expanded,
+    this.onToggle,
+  });
+
+  final String label;
+  final bool? expanded;
+  final VoidCallback? onToggle;
+
+  @override
+  Widget build(BuildContext context) {
+    final title = Text(label, style: Theme.of(context).textTheme.titleMedium);
+    if (onToggle == null) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(4, 8, 4, 4),
+        child: title,
+      );
+    }
+    return InkWell(
+      borderRadius: BorderRadius.circular(8),
+      onTap: onToggle,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(4, 4, 0, 4),
+        child: Row(
+          children: [
+            Expanded(child: title),
+            Icon(expanded == true ? Icons.expand_less : Icons.expand_more),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class ScanTile extends StatelessWidget {
   const ScanTile({
     required this.result,
+    required this.installable,
     required this.onConnect,
     super.key,
   });
 
   final DiscoveredEventArgs result;
-  final VoidCallback onConnect;
+  final bool installable;
+  final VoidCallback? onConnect;
 
   @override
   Widget build(BuildContext context) {
-    final name = result.advertisement.name ?? '';
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
+    final name = (result.advertisement.name ?? '').trim();
     final profile = DeviceProfile.matchAdvertisementName(name);
-    final subtitle =
-        StringBuffer('${result.peripheral.uuid} · RSSI ${result.rssi}');
-    if (profile != null) {
-      subtitle.write(
-          '\n识别：${profile.displayName}（${_generationLabel(profile.generation)}）');
-    }
-    return Card(
-      child: ListTile(
-        leading: const Icon(Icons.watch_outlined),
-        title: Text(name.isEmpty ? '未命名 BLE 设备' : name),
-        subtitle: Text(subtitle.toString()),
-        trailing: FilledButton(onPressed: onConnect, child: const Text('连接')),
+    final card = Card(
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      elevation: 0,
+      clipBehavior: Clip.antiAlias,
+      color: colors.surfaceContainerLow,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(12),
+        side: installable
+            ? BorderSide(
+                color: colors.primary.withValues(alpha: .55),
+                width: 1.5,
+              )
+            : BorderSide(color: colors.outlineVariant),
+      ),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: installable
+              ? LinearGradient(
+                  colors: [
+                    colors.primaryContainer.withValues(alpha: .48),
+                    colors.surfaceContainerLow,
+                  ],
+                )
+              : null,
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Row(
+            children: [
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: installable
+                      ? colors.primaryContainer
+                      : colors.surfaceContainerHigh,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(
+                  installable ? Icons.watch_outlined : Icons.bluetooth,
+                  color: installable ? colors.primary : colors.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      name.isEmpty ? '未命名设备' : name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.titleSmall,
+                    ),
+                    if (installable && profile != null) ...[
+                      const SizedBox(height: 6),
+                      Wrap(
+                        spacing: 6,
+                        runSpacing: 6,
+                        children: [
+                          _DeviceLabel(
+                            label: profile.displayName,
+                            backgroundColor: colors.secondaryContainer,
+                            foregroundColor: colors.onSecondaryContainer,
+                          ),
+                          _DeviceLabel(
+                            label: '✓ 可安装',
+                            foregroundColor: colors.tertiary,
+                            borderColor: colors.tertiary,
+                          ),
+                        ],
+                      ),
+                    ],
+                    const SizedBox(height: 6),
+                    Text(
+                      result.peripheral.uuid.toString(),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: colors.onSurfaceVariant,
+                        fontFamily: 'monospace',
+                      ),
+                    ),
+                    if (result.rssi > 0)
+                      Text(
+                        'RSSI ${result.rssi}',
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: colors.onSurfaceVariant,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 12),
+              if (installable)
+                FilledButton(
+                  onPressed: onConnect,
+                  child: const Text('连接'),
+                )
+              else
+                _DeviceLabel(
+                  label: '非手环设备',
+                  foregroundColor: colors.onSurfaceVariant,
+                  borderColor: colors.outline,
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+    return installable ? card : Opacity(opacity: .58, child: card);
+  }
+}
+
+class _DeviceLabel extends StatelessWidget {
+  const _DeviceLabel({
+    required this.label,
+    required this.foregroundColor,
+    this.backgroundColor,
+    this.borderColor,
+  });
+
+  final String label;
+  final Color foregroundColor;
+  final Color? backgroundColor;
+  final Color? borderColor;
+
+  @override
+  Widget build(BuildContext context) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(
+          color: backgroundColor,
+          borderRadius: BorderRadius.circular(8),
+          border: borderColor == null ? null : Border.all(color: borderColor!),
+        ),
+        child: Text(
+          label,
+          style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                color: foregroundColor,
+              ),
+        ),
+      );
+}
+
+class ScanningPulseIndicator extends StatefulWidget {
+  const ScanningPulseIndicator({super.key});
+
+  @override
+  State<ScanningPulseIndicator> createState() =>
+      _ScanningPulseIndicatorState();
+}
+
+class _ScanningPulseIndicatorState extends State<ScanningPulseIndicator>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1200),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final primary = Theme.of(context).colorScheme.primary;
+    return SizedBox.square(
+      dimension: 38,
+      child: AnimatedBuilder(
+        animation: _controller,
+        builder: (context, _) => Stack(
+          alignment: Alignment.center,
+          children: [
+            Transform.scale(
+              scale: .55 + (_controller.value * .75),
+              child: Opacity(
+                opacity: 1 - _controller.value,
+                child: Container(
+                  width: 30,
+                  height: 30,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: primary.withValues(alpha: .7),
+                      width: 2,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            DecoratedBox(
+              decoration: BoxDecoration(color: primary, shape: BoxShape.circle),
+              child: const SizedBox.square(dimension: 8),
+            ),
+          ],
+        ),
       ),
     );
   }
-
-  String _generationLabel(ProtocolGeneration generation) =>
-      switch (generation) {
-        ProtocolGeneration.v2Vela => 'V2 传输 · 目标支持',
-        ProtocolGeneration.v1Vela => 'V1 传输 · 暂不支持',
-        ProtocolGeneration.huamiZepp => 'Huami/Zepp · 独立适配',
-        ProtocolGeneration.unknown => '未确认',
-      };
 }
