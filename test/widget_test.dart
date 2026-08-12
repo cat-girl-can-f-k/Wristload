@@ -208,6 +208,16 @@ void main() {
 
     await pump(InstallKind.watchface);
     expect(find.text('安装表盘 .bin / .face'), findsOneWidget);
+    final popup = tester.widget<PopupMenuButton<InstallKind>>(
+      find.byKey(const ValueKey('install-menu-popup')),
+    );
+    expect(
+      popup.borderRadius,
+      const BorderRadius.horizontal(
+        left: Radius.circular(6),
+        right: Radius.circular(28),
+      ),
+    );
     await tester.tap(find.byKey(const ValueKey('preferred-install-button')));
     expect(installed, InstallKind.watchface);
 

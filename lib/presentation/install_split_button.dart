@@ -90,6 +90,10 @@ class _InstallSplitButtonState extends State<InstallSplitButton> {
             enabled: widget.enabled,
             tooltip: '选择另一种安装文件',
             padding: EdgeInsets.zero,
+            borderRadius: const BorderRadius.horizontal(
+              left: Radius.circular(6),
+              right: Radius.circular(28),
+            ),
             offset: const Offset(0, 8),
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(16),
