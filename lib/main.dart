@@ -737,6 +737,17 @@ class _AuthKeyEditDialogState extends State<_AuthKeyEditDialog> {
     super.initState();
     _field = TextEditingController(text: widget.initialValue ?? '');
     _focusNode = FocusNode();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _focusNode.requestFocus();
+      if (_field.text.isNotEmpty) {
+        _field.selection = TextSelection(
+          baseOffset: 0,
+          extentOffset: _field.text.length,
+        );
+        _selectedInitialValue = true;
+      }
+    });
   }
 
   @override
@@ -747,6 +758,7 @@ class _AuthKeyEditDialogState extends State<_AuthKeyEditDialog> {
   }
 
   void _selectInitialValue() {
+    _focusNode.requestFocus();
     if (_selectedInitialValue || !_field.text.isNotEmpty) return;
     _selectedInitialValue = true;
     _field.selection = TextSelection(
@@ -773,21 +785,30 @@ class _AuthKeyEditDialogState extends State<_AuthKeyEditDialog> {
           child: TextFormField(
             controller: _field,
             focusNode: _focusNode,
-            autofocus: false,
+            autofocus: true,
             readOnly: false,
             enableInteractiveSelection: true,
             onTap: _selectInitialValue,
-            selectAllOnFocus: false,
+            selectAllOnFocus: true,
             keyboardType: TextInputType.visiblePassword,
             textInputAction: TextInputAction.done,
             maxLength: 32,
             autocorrect: false,
             enableSuggestions: false,
-            decoration: const InputDecoration(
+            decoration: InputDecoration(
               labelText: 'authkey',
               hintText: '32 位十六进制',
               counterText: '',
-              border: OutlineInputBorder(),
+              border: const OutlineInputBorder(),
+              suffixIcon: IconButton(
+                tooltip: '清空 authkey',
+                onPressed: () {
+                  _field.clear();
+                  _selectedInitialValue = true;
+                  _focusNode.requestFocus();
+                },
+                icon: const Icon(Icons.clear),
+              ),
             ),
             validator: (text) =>
                 RegExp(r'^[0-9a-fA-F]{32}$').hasMatch(text?.trim() ?? '')
