@@ -284,12 +284,22 @@ class _AppShellState extends State<AppShell> {
   int _selectedIndex = 0;
   int? _scheduledConnectionIssueId;
   int? _visibleConnectionIssueId;
+  bool _initialScanScheduled = false;
 
   @override
   void initState() {
     super.initState();
     widget.controller.addListener(_handleConnectionIssue);
     _handleConnectionIssue();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _initialScanScheduled) return;
+      _initialScanScheduled = true;
+      if (_selectedIndex == 0 &&
+          !widget.controller.isConnected &&
+          !widget.controller.isScanning) {
+        unawaited(widget.controller.beginScan());
+      }
+    });
   }
 
   @override

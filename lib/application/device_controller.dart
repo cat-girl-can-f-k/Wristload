@@ -451,39 +451,39 @@ class DeviceController extends ChangeNotifier {
     _scanResultsFlushTimer = null;
     _isScanning = true;
     _log('开始 BLE 扫描…');
-    await _scanSubscription?.cancel();
-    _scanSubscription = _transport.discoveries.listen((result) {
-      if (!_isScanning) return;
-      final name = (result.advertisement.name ?? '').trim();
-      if (name.isEmpty) return;
-      final id = result.peripheral.uuid.toString();
-      final pending = _pendingScanResults[id];
-      DiscoveredEventArgs? published;
-      for (final item in scanResults) {
-        if (item.peripheral.uuid.toString() == id) {
-          published = item;
-          break;
-        }
-      }
-      final previous = pending ?? published;
-      final previousName = (previous?.advertisement.name ?? '').trim();
-      // RSSI changes arrive many times per second. Only rebuild when a device
-      // is new or a later scan response provides a different/better name.
-      if (previous != null && previousName == name) return;
-      _pendingScanResults[id] = result;
-      _scanResultsFlushTimer ??= Timer(
-        const Duration(milliseconds: 250),
-        _flushScanResults,
-      );
-    }, onError: (Object value) {
-      _isScanning = false;
-      _scanResultsFlushTimer?.cancel();
-      _scanResultsFlushTimer = null;
-      error = '扫描失败：$value';
-      _log('扫描失败：$value');
-      notifyListeners();
-    });
     try {
+      await _scanSubscription?.cancel();
+      _scanSubscription = _transport.discoveries.listen((result) {
+        if (!_isScanning) return;
+        final name = (result.advertisement.name ?? '').trim();
+        if (name.isEmpty) return;
+        final id = result.peripheral.uuid.toString();
+        final pending = _pendingScanResults[id];
+        DiscoveredEventArgs? published;
+        for (final item in scanResults) {
+          if (item.peripheral.uuid.toString() == id) {
+            published = item;
+            break;
+          }
+        }
+        final previous = pending ?? published;
+        final previousName = (previous?.advertisement.name ?? '').trim();
+        // RSSI changes arrive many times per second. Only rebuild when a device
+        // is new or a later scan response provides a different/better name.
+        if (previous != null && previousName == name) return;
+        _pendingScanResults[id] = result;
+        _scanResultsFlushTimer ??= Timer(
+          const Duration(milliseconds: 250),
+          _flushScanResults,
+        );
+      }, onError: (Object value) {
+        _isScanning = false;
+        _scanResultsFlushTimer?.cancel();
+        _scanResultsFlushTimer = null;
+        error = '扫描失败：$value';
+        _log('扫描失败：$value');
+        notifyListeners();
+      });
       await _transport.startScan();
       if (!_isScanning) {
         await _transport.stopScan();
@@ -494,6 +494,8 @@ class DeviceController extends ChangeNotifier {
           : '扫描已启动（点击连接将先读取 GATT 版本）。');
     } catch (exception) {
       _isScanning = false;
+      _scanResultsFlushTimer?.cancel();
+      _scanResultsFlushTimer = null;
       error = '启动扫描失败：$exception';
       _log(error!);
       notifyListeners();
