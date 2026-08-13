@@ -10,6 +10,7 @@ import 'package:window_manager/window_manager.dart';
 import 'application/device_controller.dart';
 import 'application/floating_window_coordinator.dart';
 import 'application/theme_controller.dart';
+import 'domain/auth_key_binding.dart';
 import 'domain/firmware_package_inspector.dart';
 import 'domain/install_models.dart';
 import 'domain/install_preference_store.dart';
@@ -370,43 +371,27 @@ class _AppShellState extends State<AppShell> {
   Future<void> _editAuthKey({bool showHistory = true}) async {
     if (!mounted) return;
     final controller = widget.controller;
-    String? selectedId;
+    AuthKeyBinding? selectedBinding;
     if (showHistory && controller.authKeyBindings.isNotEmpty) {
-      selectedId = await showDialog<String>(
+      selectedBinding = await showDialog<AuthKeyBinding>(
         context: context,
-        builder: (dialogContext) => AlertDialog(
-          title: const Text('历史绑定设备'),
-          content: SizedBox(
-            width: 420,
-            child: ListView(
-              shrinkWrap: true,
-              children: controller.authKeyBindings
-                  .map((binding) => ListTile(
-                        leading: const Icon(Icons.watch_outlined),
-                        title: Text(binding.name),
-                        subtitle: Text(binding.uuid),
-                        trailing: const Icon(Icons.chevron_right),
-                        onTap: () =>
-                            Navigator.of(dialogContext).pop(binding.id),
-                      ))
-                  .toList(growable: false),
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(dialogContext).pop(),
-              child: const Text('取消'),
-            ),
-          ],
+        builder: (_) => _AuthKeyBindingPicker(
+          bindings: controller.authKeyBindings,
         ),
       );
-      if (selectedId == null) return;
+      if (selectedBinding == null) return;
     }
-    selectedId ??= controller.connectedDevice?.uuid.toString();
+    final selectedId = selectedBinding?.id ??
+        controller.connectedDevice?.uuid.toString();
     if (selectedId == null || !mounted) return;
-    String? selectedName;
-    for (final binding in controller.authKeyBindings) {
-      if (binding.id == selectedId) selectedName = binding.name;
+    String? selectedName = selectedBinding?.name;
+    if (selectedName == null) {
+      for (final binding in controller.authKeyBindings) {
+        if (binding.id == selectedId) {
+          selectedName = binding.name;
+          break;
+        }
+      }
     }
     final initial = !showHistory
         ? null
@@ -536,6 +521,54 @@ class _AppShellState extends State<AppShell> {
             ],
           ),
         ),
+      );
+}
+
+class _AuthKeyBindingPicker extends StatefulWidget {
+  const _AuthKeyBindingPicker({required this.bindings});
+
+  final List<AuthKeyBinding> bindings;
+
+  @override
+  State<_AuthKeyBindingPicker> createState() => _AuthKeyBindingPickerState();
+}
+
+class _AuthKeyBindingPickerState extends State<_AuthKeyBindingPicker> {
+  AuthKeyBinding? _selected;
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+        title: const Text('历史绑定设备'),
+        content: SizedBox(
+          width: 420,
+          child: ListView(
+            shrinkWrap: true,
+            children: widget.bindings
+                .map(
+                  (binding) => RadioListTile<AuthKeyBinding>(
+                    value: binding,
+                    groupValue: _selected,
+                    onChanged: (value) => setState(() => _selected = value),
+                    secondary: const Icon(Icons.watch_outlined),
+                    title: Text(binding.name),
+                    subtitle: Text(binding.uuid),
+                  ),
+                )
+                .toList(growable: false),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: _selected == null
+                ? null
+                : () => Navigator.of(context).pop(_selected),
+            child: const Text('修改'),
+          ),
+        ],
       );
 }
 
