@@ -728,24 +728,17 @@ class _AuthKeyEditDialog extends StatefulWidget {
 
 class _AuthKeyEditDialogState extends State<_AuthKeyEditDialog> {
   late final TextEditingController _field;
-  late final FocusNode _focusNode;
   final _formKey = GlobalKey<FormState>();
 
   @override
   void initState() {
     super.initState();
     _field = TextEditingController(text: widget.initialValue ?? '');
-    _focusNode = FocusNode();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      _field.selection = TextSelection.collapsed(offset: _field.text.length);
-    });
   }
 
   @override
   void dispose() {
     _field.dispose();
-    _focusNode.dispose();
     super.dispose();
   }
 
@@ -766,31 +759,17 @@ class _AuthKeyEditDialogState extends State<_AuthKeyEditDialog> {
           key: _formKey,
           child: TextFormField(
             controller: _field,
-            focusNode: _focusNode,
-            autofocus: true,
-            readOnly: false,
-            enableInteractiveSelection: true,
-            showCursor: true,
-            cursorColor: Theme.of(context).colorScheme.primary,
-            selectAllOnFocus: false,
             keyboardType: TextInputType.visiblePassword,
             textInputAction: TextInputAction.done,
             maxLength: 32,
             autocorrect: false,
             enableSuggestions: false,
+            onFieldSubmitted: (_) => _save(),
             decoration: InputDecoration(
               labelText: 'authkey',
               hintText: '32 位十六进制',
               counterText: '',
               border: const OutlineInputBorder(),
-              suffixIcon: IconButton(
-                tooltip: '清空 authkey',
-                onPressed: () {
-                  _field.clear();
-                  _focusNode.requestFocus();
-                },
-                icon: const Icon(Icons.clear),
-              ),
             ),
             validator: (text) =>
                 RegExp(r'^[0-9a-fA-F]{32}$').hasMatch(text?.trim() ?? '')
