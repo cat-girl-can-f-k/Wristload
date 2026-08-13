@@ -1,0 +1,12 @@
+# TUI package analysis options.
+# The root analysis_options.yaml references package:flutter_lints, which is not
+# a dependency of this standalone Dart package. This file keeps analyzer lints
+# self-contained for the TUI workspace.
+
+analyzer:
+  errors:
+    missing_required_param: error
+    missing_return: error
+    invalid_assignment: error
+  exclude:
+    - macos_bridge/**
