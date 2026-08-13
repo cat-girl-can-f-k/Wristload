@@ -262,6 +262,23 @@ void main() {
   });
 
   group('zau', () {
+    test('调试清理状态查询使用 13/6 并解析直接或嵌套状态', () {
+      expect(
+        Zau(
+          command: ZauCommand.debugTransfer,
+          sub: ZauCommand.debugTransferStatusSub,
+        ).encode(),
+        [0x08, 0x0d, 0x10, 0x06],
+      );
+
+      final direct = ProtoWriter()..writeInt(1, 1);
+      final nested = ProtoWriter()..writeMessage(1, direct.bytes);
+      expect(DebugCleanupStatusPayload.parse((4, direct.bytes)), 1);
+      expect(DebugCleanupStatusPayload.parse((4, nested.bytes)), 1);
+      expect(DebugCleanupStatusPayload.parse(null), isNull);
+      expect(DebugCleanupStatusPayload.parse((4, const [])), isNull);
+    });
+
     test('官方 V2 电量查询请求与 protobuf 字节向量一致', () {
       expect(
         Zau(command: ZauCommand.basicStatus, sub: 1).encode(),

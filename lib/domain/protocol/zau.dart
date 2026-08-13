@@ -25,6 +25,12 @@ import 'proto_wire.dart';
 
 /// 表盘 / RPK / Mass 命令号（zau.e）。
 abstract final class ZauCommand {
+  /// Debug transfer cleanup status query. The device returns status 1 while
+  /// the previous transfer is still being disposed.
+  static const int debugTransfer = 13;
+  static const int debugTransferStatusSub = 6;
+  static const int debugTransferControlSub = 7;
+
   static const int appList = 20;
   static const int appListSub = 0;
   static const int uninstallAppSub = 3;
@@ -40,6 +46,38 @@ abstract final class ZauCommand {
   static const int setFace = 4; // 表盘：预装(f=4) / setFace(f=1)
   static const int prepareInstallApp = 20; // RPK 预装
   static const int massTransfer = 22; // Mass 文件传输（MassPrepare/MassData 控制）
+}
+
+/// Parses the status response used by the debug transfer-cleanup probe.
+///
+/// Firmware revisions wrap this value in different protobuf messages, so the
+/// parser accepts a direct varint or a bounded chain of embedded messages and
+/// returns the first status-like integer. Missing/invalid responses stay null.
+abstract final class DebugCleanupStatusPayload {
+  static int? parse((int, List<int>)? payload) {
+    if (payload == null) return null;
+    return _firstVarint(payload.$2, 0);
+  }
+
+  static int? _firstVarint(List<int> bytes, int depth) {
+    if (depth > 4) return null;
+    try {
+      final reader = ProtoReader(bytes);
+      while (!reader.isAtEnd) {
+        final (field, wire) = reader.readFieldHeader();
+        if (wire == 0) return reader.readVarint();
+        if (wire == 2) {
+          final nested = _firstVarint(reader.readBytes(), depth + 1);
+          if (nested != null) return nested;
+        } else {
+          reader.skipField(wire);
+        }
+      }
+    } on FormatException {
+      return null;
+    }
+    return null;
+  }
 }
 
 /// Parses the battery percentage returned by the official V2 basic-status

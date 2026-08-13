@@ -11,6 +11,9 @@ include: package:flutter_lints/flutter.yaml
 
 analyzer:
   exclude:
+    # macOS TUI is an independent Dart package with its own pubspec and
+    # dependency graph; do not analyze it as part of the Flutter app.
+    - tui/**
     # 本地 fork 的 Windows BLE 插件：根目录 api.dart 是 Pigeon 生成器输入
     # （需 `dart run pigeon` 生成，非直接可编译），排除以免 analyze 误报。
     # 插件 lib/ 仍参与分析（含我们的 included-services 容错改动）。

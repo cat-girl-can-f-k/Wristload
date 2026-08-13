@@ -1063,7 +1063,10 @@ class DeviceController extends ChangeNotifier {
       }
 
       final source = ScopedFileRef(
-        path: File(lease.file.path).absolute.path,
+        // The platform lease already returns the resolved native path.
+        // Re-normalizing it with the host OS would corrupt macOS paths when
+        // this state machine is exercised from a different test host.
+        path: lease.file.path,
         bookmark: lease.file.bookmark,
       );
       final request = InstallRequest(
@@ -1863,6 +1866,7 @@ class DeviceController extends ChangeNotifier {
   bool debugCleanupPolling = false;
   DebugCleanupReport? debugCleanupReport;
   String? debugError;
+  Future<void>? _debugCleanupFuture;
 
   bool get debugInstallInProgress => _debugInstallInProgress;
 
@@ -1871,6 +1875,7 @@ class DeviceController extends ChangeNotifier {
     _debugInstallInProgress = true;
     debugError = null;
     debugCleanupReport = null;
+    debugCleanupPolling = false;
     notifyListeners();
     try {
       await startInstall(request);
@@ -1884,6 +1889,75 @@ class DeviceController extends ChangeNotifier {
 
   Future<void> cancelDebugInstall() async {
     await cancelInstall();
+    // startInstall publishes the cancelled task and releases its cancellation
+    // completer in finally. Wait for that boundary before issuing a new
+    // business request, otherwise the cleanup query would be cancelled too.
+    final deadline = DateTime.now().add(const Duration(seconds: 5));
+    while (_installInProgress && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    if (_debugCleanupFuture != null) return;
+    _debugCleanupFuture = _pollDebugCleanup();
+    try {
+      await _debugCleanupFuture;
+    } finally {
+      _debugCleanupFuture = null;
+    }
+  }
+
+  Future<void> _pollDebugCleanup() async {
+    final startedAt = DateTime.now();
+    var pollCount = 0;
+    int? finalStatus;
+    debugCleanupPolling = true;
+    debugCleanupReport = null;
+    debugError = null;
+    notifyListeners();
+    try {
+      while (true) {
+        if (pollCount > 0) {
+          await Future<void>.delayed(const Duration(seconds: 8));
+        }
+        if (_disposed) return;
+        if (!sessionReady || _sessionCipher == null) {
+          throw StateError('设备鉴权会话已失效，无法查询清理状态');
+        }
+        final response = await _requestBusiness(
+          Zau(
+            command: ZauCommand.debugTransfer,
+            sub: ZauCommand.debugTransferStatusSub,
+          ),
+          ZauCommand.debugTransfer,
+          ZauCommand.debugTransferStatusSub,
+        );
+        finalStatus = DebugCleanupStatusPayload.parse(response.payload);
+        pollCount++;
+        if (finalStatus == null) {
+          throw const FormatException('设备清理状态响应缺少状态码');
+        }
+        _log('调试清理状态查询：status=$finalStatus（第 $pollCount 次）');
+        if (finalStatus != 1) break;
+      }
+      debugCleanupReport = DebugCleanupReport(
+        startedAt: startedAt,
+        finishedAt: DateTime.now(),
+        pollCount: pollCount,
+        finalStatus: finalStatus,
+      );
+    } on Object catch (exception) {
+      debugError = '设备清理状态查询失败：$exception';
+      _log(debugError!);
+      debugCleanupReport = DebugCleanupReport(
+        startedAt: startedAt,
+        finishedAt: DateTime.now(),
+        pollCount: pollCount,
+        finalStatus: finalStatus,
+        error: exception.toString(),
+      );
+    } finally {
+      debugCleanupPolling = false;
+      notifyListeners();
+    }
   }
 
   /// Reads the installed quick-app list from the authenticated device.
@@ -1981,7 +2055,9 @@ class DeviceController extends ChangeNotifier {
         _log('恢复检查失败：源文件已变更，不能使用此检查点续传。');
         return;
       }
-      final resolvedPath = File(lease.file.path).absolute.path;
+      // Keep the path returned by the security-scope provider; it is already
+      // resolved for the platform that owns the lease.
+      final resolvedPath = lease.file.path;
       final resolvedBookmark = lease.file.bookmark;
       final sourceChanged = resolvedPath != checkpoint.path ||
           !listEquals(resolvedBookmark, checkpoint.bookmark);
