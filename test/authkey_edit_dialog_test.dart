@@ -110,4 +110,35 @@ void main() {
     await tester.pumpAndSettle();
     expect((await result)?.id, 'device-b');
   });
+
+  testWidgets('empty history still opens the authkey editor', (tester) async {
+    Future<String?>? result;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (context) => Scaffold(
+            body: TextButton(
+              onPressed: () {
+                result = showDialog<String>(
+                  context: context,
+                  barrierDismissible: false,
+                  builder: (_) => buildAuthKeyEditDialogForTesting(
+                    initialValue: '0123456789abcdef0123456789abcdef',
+                  ),
+                );
+              },
+              child: const Text('修改 authkey'),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('修改 authkey'));
+    await tester.pumpAndSettle();
+    expect(find.byType(TextFormField), findsOneWidget);
+    expect(find.text('0123456789abcdef0123456789abcdef'), findsOneWidget);
+    await tester.tap(find.widgetWithText(TextButton, '取消'));
+    await tester.pumpAndSettle();
+    expect(await result, isNull);
+  });
 }

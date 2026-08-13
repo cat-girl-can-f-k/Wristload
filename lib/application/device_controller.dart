@@ -41,7 +41,7 @@ class DeviceController extends ChangeNotifier {
         _checkpointStore = checkpointStore ?? InstallCheckpointStore(),
         _metadataReader = metadataReader ?? InstallMetadataReader() {
     unawaited(_restoreAuthKey());
-    unawaited(_restoreAuthKeyBindings());
+    _authKeyBindingsRestore = _restoreAuthKeyBindings();
     _transferSettingsReady = _restoreTransferSettings();
     _checkpointRestore = _restoreInstallCheckpoint();
   }
@@ -52,6 +52,7 @@ class DeviceController extends ChangeNotifier {
   final InstallMetadataReader _metadataReader;
   late final Future<void> _transferSettingsReady;
   late final Future<void> _checkpointRestore;
+  late final Future<void> _authKeyBindingsRestore;
   bool _disposed = false;
 
   /// Completes after the persisted install checkpoint has been inspected.
@@ -59,6 +60,8 @@ class DeviceController extends ChangeNotifier {
   /// Restoration only rebuilds local retry state. It never connects to a
   /// device, authenticates, or sends protocol data.
   Future<void> get checkpointRestoreReady => _checkpointRestore;
+
+  Future<void> get authKeyBindingsReady => _authKeyBindingsRestore;
   StreamSubscription<DiscoveredEventArgs>? _scanSubscription;
   bool _isScanning = false;
   Timer? _scanResultsFlushTimer;
@@ -964,10 +967,18 @@ class DeviceController extends ChangeNotifier {
         _ => '当前平台',
       };
       _log('  $platformName 的 BLE 连接不等于经典蓝牙 SPP 配对；若手环弹出请求，请在手环上确认。');
-      final classicAddress = await _transport.connectRfcomm(
-        device.uuid,
-        advertisedName: connectedDeviceName,
-      );
+      final classicAddress = await _transport
+          .connectRfcomm(
+            device.uuid,
+            advertisedName: connectedDeviceName,
+          )
+          .timeout(
+            const Duration(seconds: 2),
+            onTimeout: () => throw TimeoutException(
+              'RFCOMM 2 秒内设备未响应',
+              const Duration(seconds: 2),
+            ),
+          );
       if (!_isCurrentSppConnection(connectionEpoch)) return;
       connectedClassicAddress = classicAddress ?? connectedClassicAddress;
       _connectionIssues.connectionSucceeded();
@@ -987,7 +998,13 @@ class DeviceController extends ChangeNotifier {
           connectionEpoch,
         );
       }
-      _connectionIssues.recordConnectionFailure(exception);
+      if (exception is TimeoutException &&
+          exception.duration == const Duration(seconds: 2)) {
+        _connectionIssues.recordRfcommTimeout();
+        _log('SPP 超时：2 秒内设备未响应，已停止等待 RFCOMM 建链。$exception');
+      } else {
+        _connectionIssues.recordConnectionFailure(exception);
+      }
       _log('SPP 连接失败：$exception');
       notifyListeners();
     }

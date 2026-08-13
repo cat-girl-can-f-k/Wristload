@@ -5,6 +5,7 @@ import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:wristload/application/device_controller.dart';
+import 'package:wristload/domain/connection_issue.dart';
 import 'package:wristload/domain/protocol/auth_handshake.dart';
 import 'package:wristload/domain/protocol/proto_wire.dart';
 import 'package:wristload/domain/protocol/spp_protocol.dart';
@@ -32,6 +33,21 @@ void main() {
     expect(transport.calls, ['listen', 'connect', 'disconnect']);
     expect(controller.sppConnecting, isFalse);
     expect(controller.sessionReady, isFalse);
+  });
+
+  test('RFCOMM connect timeout publishes the two-second connection issue',
+      () async {
+    final transport = _FakeBleTransport(
+      connectDelay: const Duration(seconds: 3),
+    );
+    final controller = _controllerWithDevice(transport);
+
+    await controller.connectSpp();
+
+    expect(controller.pendingConnectionIssue?.kind,
+        ConnectionIssueKind.rfcommTimeout);
+    expect(controller.sppConnecting, isFalse);
+    expect(transport.calls, contains('disconnect'));
   });
 
   test('L1START write failure closes the connected RFCOMM channel', () async {
@@ -397,6 +413,7 @@ final class _TestPeripheral implements Peripheral {
 final class _FakeBleTransport extends BleTransport {
   _FakeBleTransport({
     this.connectError,
+    this.connectDelay,
     this.writeError,
     this.disconnectError,
     this.disconnectGate,
@@ -404,6 +421,7 @@ final class _FakeBleTransport extends BleTransport {
   });
 
   final Object? connectError;
+  final Duration? connectDelay;
   final Object? writeError;
   final Object? disconnectError;
   final Completer<void>? disconnectGate;
@@ -429,6 +447,7 @@ final class _FakeBleTransport extends BleTransport {
     String? advertisedName,
   }) async {
     calls.add('connect');
+    if (connectDelay != null) await Future<void>.delayed(connectDelay!);
     final error = connectError;
     if (error != null) throw error;
     return 'AA:BB:CC:DD:EE:FF';

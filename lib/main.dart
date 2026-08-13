@@ -372,6 +372,10 @@ class _AppShellState extends State<AppShell> {
     if (!mounted) return;
     final controller = widget.controller;
     AuthKeyBinding? selectedBinding;
+    if (showHistory) {
+      await controller.authKeyBindingsReady;
+      if (!mounted) return;
+    }
     if (showHistory && controller.authKeyBindings.isNotEmpty) {
       selectedBinding = await showDialog<AuthKeyBinding>(
         context: context,
@@ -383,7 +387,10 @@ class _AppShellState extends State<AppShell> {
     }
     final selectedId = selectedBinding?.id ??
         controller.connectedDevice?.uuid.toString();
-    if (selectedId == null || !mounted) return;
+    // A fresh install may have a global authkey but no per-device metadata
+    // yet. Keep the settings action useful by opening the editor directly;
+    // the binding record is created later when a device id is available.
+    if (!mounted) return;
     String? selectedName = selectedBinding?.name;
     if (selectedName == null) {
       for (final binding in controller.authKeyBindings) {
@@ -393,11 +400,11 @@ class _AppShellState extends State<AppShell> {
         }
       }
     }
-    final initial = !showHistory
-        ? null
-        : selectedId == controller.connectedDevice?.uuid.toString()
-            ? controller.authKey
-            : await controller.readAuthKeyFor(selectedId);
+    final initial = !showHistory ||
+            selectedId == null ||
+            selectedId == controller.connectedDevice?.uuid.toString()
+        ? controller.authKey
+        : await _readAuthKeyForEditor(controller, selectedId);
     if (!mounted) return;
     final value = await showDialog<String>(
       context: context,
@@ -413,9 +420,25 @@ class _AppShellState extends State<AppShell> {
         controller.connectedDeviceName ??
         controller.connectedProfile?.displayName ??
         '当前设备';
-    await controller.rememberAuthKeyBinding(
-        id: selectedId, name: name, key: value);
+    if (selectedId != null) {
+      await controller.rememberAuthKeyBinding(
+          id: selectedId, name: name, key: value);
+    }
     if (controller.isConnected) await controller.reconnect();
+  }
+
+  Future<String?> _readAuthKeyForEditor(
+    DeviceController controller,
+    String id,
+  ) async {
+    try {
+      return await controller
+          .readAuthKeyFor(id)
+          .timeout(const Duration(milliseconds: 600));
+    } on Object {
+      // Opening the editor must not depend on a platform secure-store call.
+      return controller.authKey;
+    }
   }
 
   @override
@@ -514,7 +537,9 @@ class _AppShellState extends State<AppShell> {
                       onPreferredInstallTargetChanged:
                           widget.onPreferredInstallTargetChanged,
                       onReplayOobe: widget.onReplayOobe,
-                      onEditAuthKey: _editAuthKey,
+                      onEditAuthKey: () {
+                        unawaited(_editAuthKey());
+                      },
                     ),
                 },
               ),
