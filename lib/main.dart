@@ -728,18 +728,31 @@ class _AuthKeyEditDialog extends StatefulWidget {
 
 class _AuthKeyEditDialogState extends State<_AuthKeyEditDialog> {
   late final TextEditingController _field;
+  late final FocusNode _focusNode;
   final _formKey = GlobalKey<FormState>();
+  bool _selectedInitialValue = false;
 
   @override
   void initState() {
     super.initState();
     _field = TextEditingController(text: widget.initialValue ?? '');
+    _focusNode = FocusNode();
   }
 
   @override
   void dispose() {
     _field.dispose();
+    _focusNode.dispose();
     super.dispose();
+  }
+
+  void _selectInitialValue() {
+    if (_selectedInitialValue || !_field.text.isNotEmpty) return;
+    _selectedInitialValue = true;
+    _field.selection = TextSelection(
+      baseOffset: 0,
+      extentOffset: _field.text.length,
+    );
   }
 
   void _save() {
@@ -759,8 +772,14 @@ class _AuthKeyEditDialogState extends State<_AuthKeyEditDialog> {
           key: _formKey,
           child: TextFormField(
             controller: _field,
-            autofocus: true,
+            focusNode: _focusNode,
+            autofocus: false,
+            readOnly: false,
+            enableInteractiveSelection: true,
+            onTap: _selectInitialValue,
             selectAllOnFocus: false,
+            keyboardType: TextInputType.visiblePassword,
+            textInputAction: TextInputAction.done,
             maxLength: 32,
             autocorrect: false,
             enableSuggestions: false,
