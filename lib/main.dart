@@ -373,7 +373,13 @@ class _AppShellState extends State<AppShell> {
     final controller = widget.controller;
     AuthKeyBinding? selectedBinding;
     if (showHistory) {
-      await controller.authKeyBindingsReady;
+      try {
+        await controller.authKeyBindingsReady.timeout(
+          const Duration(milliseconds: 800),
+        );
+      } on Object {
+        // Do not block the settings action on a platform preference read.
+      }
       if (!mounted) return;
     }
     if (showHistory && controller.authKeyBindings.isNotEmpty) {
@@ -381,6 +387,7 @@ class _AppShellState extends State<AppShell> {
         context: context,
         builder: (_) => _AuthKeyBindingPicker(
           bindings: controller.authKeyBindings,
+          onDelete: controller.removeAuthKeyBinding,
         ),
       );
       if (selectedBinding == null) return;
@@ -550,16 +557,61 @@ class _AppShellState extends State<AppShell> {
 }
 
 class _AuthKeyBindingPicker extends StatefulWidget {
-  const _AuthKeyBindingPicker({required this.bindings});
+  const _AuthKeyBindingPicker({required this.bindings, this.onDelete});
 
   final List<AuthKeyBinding> bindings;
+  final Future<void> Function(String id)? onDelete;
 
   @override
   State<_AuthKeyBindingPicker> createState() => _AuthKeyBindingPickerState();
 }
 
 class _AuthKeyBindingPickerState extends State<_AuthKeyBindingPicker> {
-  AuthKeyBinding? _selected;
+  late final List<AuthKeyBinding> _bindings =
+      List<AuthKeyBinding>.of(widget.bindings);
+  String? _selectedId;
+  final Set<String> _deleting = <String>{};
+
+  AuthKeyBinding? get _selected {
+    final id = _selectedId;
+    if (id == null) return null;
+    for (final binding in _bindings) {
+      if (binding.id == id) return binding;
+    }
+    return null;
+  }
+
+  Future<void> _delete(AuthKeyBinding binding) async {
+    if (_deleting.contains(binding.id)) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('删除历史绑定？'),
+        content: Text('删除“${binding.name}”后，需要重新输入该设备的 authkey。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || confirmed != true) return;
+    setState(() {
+      _deleting.add(binding.id);
+      _bindings.removeWhere((item) => item.id == binding.id);
+      if (_selectedId == binding.id) _selectedId = null;
+    });
+    try {
+      await widget.onDelete?.call(binding.id);
+    } finally {
+      if (mounted) setState(() => _deleting.remove(binding.id));
+    }
+  }
 
   @override
   Widget build(BuildContext context) => AlertDialog(
@@ -568,32 +620,44 @@ class _AuthKeyBindingPickerState extends State<_AuthKeyBindingPicker> {
           width: 420,
           child: ListView(
             shrinkWrap: true,
-            children: widget.bindings
+            children: _bindings
                 .map(
-                  (binding) => ListTile(
-                    leading: Radio<AuthKeyBinding>(
-                      value: binding,
-                      groupValue: _selected,
-                      onChanged: (value) =>
-                          setState(() => _selected = value),
-                    ),
+                  (binding) => RadioListTile<AuthKeyBinding>(
+                    value: binding,
+                    groupValue: _selected,
+                    onChanged: _deleting.contains(binding.id)
+                        ? null
+                        : (value) =>
+                            setState(() => _selectedId = value?.id),
                     title: Text(binding.name),
                     subtitle: Text(binding.uuid),
-                    trailing: const Icon(Icons.chevron_right),
-                    selected: identical(_selected, binding),
-                    onTap: () => setState(() => _selected = binding),
+                    secondary: IconButton(
+                      tooltip: '删除历史绑定',
+                      onPressed: _deleting.contains(binding.id)
+                          ? null
+                          : () => _delete(binding),
+                      icon: const Icon(Icons.delete_outline),
+                    ),
+                    selected: _selectedId == binding.id,
                   ),
                 )
                 .toList(growable: false),
           ),
         ),
         actions: [
+          TextButton.icon(
+            onPressed: _selected == null || _deleting.isNotEmpty
+                ? null
+                : () => _delete(_selected!),
+            icon: const Icon(Icons.delete_outline),
+            label: const Text('删除'),
+          ),
           TextButton(
             onPressed: () => Navigator.of(context).pop(),
             child: const Text('取消'),
           ),
           FilledButton(
-            onPressed: _selected == null
+            onPressed: _selected == null || _deleting.isNotEmpty
                 ? null
                 : () => Navigator.of(context).pop(_selected),
             child: const Text('修改'),
@@ -738,7 +802,8 @@ Widget buildAuthKeyEditDialogForTesting({
 
 Widget buildAuthKeyBindingPickerForTesting({
   required List<AuthKeyBinding> bindings,
-}) => _AuthKeyBindingPicker(bindings: bindings);
+  Future<void> Function(String id)? onDelete,
+}) => _AuthKeyBindingPicker(bindings: bindings, onDelete: onDelete);
 
 class HomePage extends StatelessWidget {
   const HomePage({

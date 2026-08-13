@@ -141,4 +141,60 @@ void main() {
     await tester.pumpAndSettle();
     expect(await result, isNull);
   });
+
+  testWidgets('selected history binding can be deleted without closing picker',
+      (tester) async {
+    final bindings = [
+      AuthKeyBinding(
+        id: 'device-a',
+        name: '设备 A',
+        uuid: 'device-a',
+        updatedAt: DateTime(2026, 1, 1),
+      ),
+      AuthKeyBinding(
+        id: 'device-b',
+        name: '设备 B',
+        uuid: 'device-b',
+        updatedAt: DateTime(2026, 1, 2),
+      ),
+    ];
+    String? deletedId;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (context) => Scaffold(
+            body: TextButton(
+              onPressed: () {
+                showDialog<AuthKeyBinding>(
+                  context: context,
+                  barrierDismissible: false,
+                  builder: (_) => buildAuthKeyBindingPickerForTesting(
+                    bindings: bindings,
+                    onDelete: (id) async => deletedId = id,
+                  ),
+                );
+              },
+              child: const Text('打开列表'),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('打开列表'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('设备 B'));
+    await tester.pump();
+    await tester.tap(find.widgetWithText(TextButton, '删除'));
+    await tester.pumpAndSettle();
+    expect(find.text('删除历史绑定？'), findsOneWidget);
+    await tester.tap(find.widgetWithText(FilledButton, '删除'));
+    await tester.pumpAndSettle();
+
+    expect(deletedId, 'device-b');
+    expect(find.text('设备 A'), findsOneWidget);
+    expect(find.text('设备 B'), findsNothing);
+    expect(find.text('历史绑定设备'), findsOneWidget);
+  });
 }

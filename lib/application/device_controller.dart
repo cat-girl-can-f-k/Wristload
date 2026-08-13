@@ -432,6 +432,27 @@ class DeviceController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> removeAuthKeyBinding(String id) async {
+    final next = authKeyBindings.where((binding) => binding.id != id).toList();
+    if (next.length == authKeyBindings.length) return;
+    try {
+      await _secureStorage.deleteFor(id).timeout(
+            const Duration(milliseconds: 600),
+          );
+    } on Object {
+      // Metadata removal remains useful even when secure storage is unavailable.
+    }
+    authKeyBindings = next;
+    try {
+      await _authKeyBindingStore.write(next).timeout(
+            const Duration(milliseconds: 600),
+          );
+    } on Object {
+      // Keep the in-memory list authoritative for the current session.
+    }
+    notifyListeners();
+  }
+
   bool get installInProgress => _installInProgress;
 
   bool get timeSyncInProgress => _timeSyncInProgress;
