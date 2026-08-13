@@ -356,11 +356,21 @@ class _ThemeColorPreview extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 26),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(3),
-            child: SizedBox(
+          Semantics(
+            label: '传输进度 70%，设备确认 43/82 片',
+            child: Container(
               key: const ValueKey('theme-preview-progress-track'),
-              height: 6,
+              width: double.infinity,
+              height: 8,
+              clipBehavior: Clip.antiAlias,
+              decoration: BoxDecoration(
+                color: colors.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(4),
+                border: Border.all(
+                  color: colors.outlineVariant,
+                  width: 0.5,
+                ),
+              ),
               child: Row(
                 children: [
                   Expanded(
@@ -377,13 +387,7 @@ class _ThemeColorPreview extends StatelessWidget {
                       color: colors.primaryContainer,
                     ),
                   ),
-                  Expanded(
-                    flex: 30,
-                    child: ColoredBox(
-                      key: const ValueKey('theme-preview-track'),
-                      color: colors.surfaceContainerHighest,
-                    ),
-                  ),
+                  const Spacer(flex: 30),
                 ],
               ),
             ),
