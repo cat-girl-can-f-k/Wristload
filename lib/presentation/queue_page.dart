@@ -1,11 +1,12 @@
 import 'package:desktop_drop/desktop_drop.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../application/device_controller.dart';
 import '../domain/install_models.dart';
 import '../domain/install_task.dart';
 import '../domain/queue_file_importer.dart';
+import '../platform/scoped_file_picker.dart';
+import '../platform/security_scoped_file_access.dart';
 
 class QueuePage extends StatefulWidget {
   const QueuePage({required this.controller, super.key});
@@ -23,16 +24,15 @@ class _QueuePageState extends State<QueuePage> {
   DeviceController get controller => widget.controller;
 
   Future<void> _pickFiles() async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
+    final files = await ScopedFilePicker.pickFiles(
       allowedExtensions: const ['bin', 'face', 'rpk'],
       allowMultiple: true,
     );
-    if (!mounted || result == null) return;
-    await _addPaths(result.files.map((file) => file.path).whereType<String>());
+    if (!mounted || files == null) return;
+    await _addPaths(files);
   }
 
-  Future<void> _addPaths(Iterable<String> paths) async {
+  Future<void> _addPaths(Iterable<Object> paths) async {
     final imported = await QueueFileImporter().prepare(
       paths,
       existingPaths: controller.installQueue.map((entry) => entry.request.path),
@@ -84,7 +84,15 @@ class _QueuePageState extends State<QueuePage> {
       onDragExited: (_) => _setDragging(false),
       onDragDone: (details) {
         _setDragging(false);
-        _addPaths(details.files.map((file) => file.path));
+        for (final error in details.errors) {
+          controller.reportError('无法拖入文件：${error.message}');
+        }
+        _addPaths(details.files.map(
+          (file) => ScopedFileRef(
+            path: file.path,
+            bookmark: file.extraAppleBookmark,
+          ),
+        ));
       },
       child: SafeArea(
         child: Stack(

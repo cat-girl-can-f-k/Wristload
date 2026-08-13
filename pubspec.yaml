@@ -4,14 +4,15 @@ publish_to: none
 version: 0.1.0+1
 
 environment:
-  sdk: ">=3.3.0 <4.0.0"
+  sdk: ">=3.9.2 <4.0.0"
 
 dependencies:
   flutter:
     sdk: flutter
   file_picker: ^8.1.2
   desktop_drop: ^0.5.0
-  # Windows-first BLE central API. It also has Android and Linux backends.
+  # Cross-platform BLE central API; Darwin discovery is paired with the
+  # macOS Runner's native IOBluetooth RFCOMM bridge.
   bluetooth_low_energy: ^6.2.1
   path_provider: ^2.1.4
   crypto: ^3.0.3

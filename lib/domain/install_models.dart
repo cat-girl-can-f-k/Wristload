@@ -3,8 +3,12 @@
 /// 模型不包含 authkey、会话密钥或文件副本，因此可安全用于可恢复检查点。
 library;
 
+import 'dart:convert';
+import 'dart:typed_data';
+
 import 'install_task.dart';
 import 'device_profile.dart';
+import '../platform/security_scoped_file_access.dart';
 
 /// The official install API carries versionCode as a signed 32-bit integer.
 const int maxRpkVersionCode = 0x7fffffff;
@@ -54,6 +58,7 @@ class InstallRequest {
     required this.kind,
     required this.path,
     required this.metadata,
+    this.source,
     this.unsupportedLuaConfirmed = false,
     this.watchfaceResolutionConfirmed = false,
   });
@@ -61,8 +66,27 @@ class InstallRequest {
   final InstallKind kind;
   final String path;
   final InstallMetadata metadata;
+  final ScopedFileRef? source;
   final bool unsupportedLuaConfirmed;
   final bool watchfaceResolutionConfirmed;
+
+  /// Updates interactive install choices without discarding the resolved
+  /// path and persistent file-access bookmark.
+  InstallRequest copyWith({
+    InstallMetadata? metadata,
+    bool? unsupportedLuaConfirmed,
+    bool? watchfaceResolutionConfirmed,
+  }) =>
+      InstallRequest(
+        kind: kind,
+        path: path,
+        metadata: metadata ?? this.metadata,
+        source: source,
+        unsupportedLuaConfirmed:
+            unsupportedLuaConfirmed ?? this.unsupportedLuaConfirmed,
+        watchfaceResolutionConfirmed:
+            watchfaceResolutionConfirmed ?? this.watchfaceResolutionConfirmed,
+      );
 }
 
 /// 只保存已确认状态，用于断线后重新协商断点；绝不保存密钥或文件内容。
@@ -79,6 +103,7 @@ class InstallCheckpoint {
     this.faceId,
     this.packageName,
     this.versionCode,
+    this.bookmark,
   });
 
   final InstallKind kind;
@@ -92,6 +117,7 @@ class InstallCheckpoint {
   final String? faceId;
   final String? packageName;
   final int? versionCode;
+  final Uint8List? bookmark;
 
   Map<String, Object?> toJson() => {
         'kind': kind == InstallKind.watchface ? 'watchface' : 'quickapp',
@@ -105,46 +131,75 @@ class InstallCheckpoint {
         'faceId': faceId,
         'packageName': packageName,
         'versionCode': versionCode,
+        if (bookmark != null) 'bookmark': base64Encode(bookmark!),
       };
 
   /// 解析检查点 JSON；字段缺失或越界时返回 null（不可恢复）。
   static InstallCheckpoint? fromJson(Map<String, Object?> value) {
-    final kindValue = value['kind'] as String? ?? 'watchface';
-    final md5Value = value['md5Hex'] as String?;
-    final sha256Value = value['sha256Hex'] as String?;
-    final pathValue =
-        (value['path'] as String?) ?? (value['fileName'] as String?);
-    final fileSizeValue = (value['fileSize'] as num?)?.toInt();
-    final dataTypeValue = (value['dataType'] as num?)?.toInt();
-    final segmentValue = (value['lastAcknowledgedSegment'] as num?)?.toInt();
-    final phaseValue = value['phase'] as String?;
-    if (md5Value == null ||
-        sha256Value == null ||
-        pathValue == null ||
-        fileSizeValue == null ||
-        fileSizeValue < 0 ||
-        dataTypeValue == null ||
-        dataTypeValue < 0 ||
-        dataTypeValue > 0x40 ||
-        segmentValue == null ||
+    final kind = switch (value['kind']) {
+      'watchface' => InstallKind.watchface,
+      'quickapp' || 'quickApp' => InstallKind.quickApp,
+      _ => null,
+    };
+    final pathValue = value['path'];
+    final fileSizeValue = value['fileSize'];
+    final md5Value = value['md5Hex'];
+    final sha256Value = value['sha256Hex'];
+    final dataTypeValue = value['dataType'];
+    final segmentValue = value['lastAcknowledgedSegment'];
+    final phaseValue = value['phase'];
+    final faceIdValue = value['faceId'];
+    final packageNameValue = value['packageName'];
+    final versionCodeValue = value['versionCode'];
+    final expectedDataType = kind == InstallKind.watchface ? 0x10 : 0x40;
+    if (kind == null ||
+        pathValue is! String ||
+        pathValue.isEmpty ||
+        fileSizeValue is! int ||
+        fileSizeValue <= 0 ||
+        md5Value is! String ||
+        !RegExp(r'^[0-9a-fA-F]{32}$').hasMatch(md5Value) ||
+        sha256Value is! String ||
+        !RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(sha256Value) ||
+        dataTypeValue is! int ||
+        dataTypeValue != expectedDataType ||
+        segmentValue is! int ||
         segmentValue < 0 ||
-        phaseValue == null) {
+        phaseValue is! String ||
+        (phaseValue != 'transferring' && phaseValue != 'awaitingDevice') ||
+        (faceIdValue != null && faceIdValue is! String) ||
+        (packageNameValue != null && packageNameValue is! String) ||
+        (versionCodeValue != null && versionCodeValue is! int)) {
       return null;
     }
+    Uint8List? bookmark;
+    final encodedBookmark = value['bookmark'];
+    if (encodedBookmark != null) {
+      if (encodedBookmark is! String ||
+          encodedBookmark.length > maxSecurityScopedBookmarkBytes * 2) {
+        return null;
+      }
+      try {
+        bookmark = Uint8List.fromList(base64Decode(encodedBookmark));
+      } on FormatException {
+        return null;
+      }
+      if (bookmark.isEmpty ||
+          bookmark.length > maxSecurityScopedBookmarkBytes) return null;
+    }
     return InstallCheckpoint(
-      kind: kindValue == 'quickapp'
-          ? InstallKind.quickApp
-          : InstallKind.watchface,
+      kind: kind,
       path: pathValue,
       fileSize: fileSizeValue,
-      md5Hex: md5Value,
-      sha256Hex: sha256Value,
+      md5Hex: md5Value.toLowerCase(),
+      sha256Hex: sha256Value.toLowerCase(),
       dataType: dataTypeValue,
       lastAcknowledgedSegment: segmentValue,
       phase: phaseValue,
-      faceId: value['faceId'] as String?,
-      packageName: value['packageName'] as String?,
-      versionCode: (value['versionCode'] as num?)?.toInt(),
+      faceId: faceIdValue as String?,
+      packageName: packageNameValue as String?,
+      versionCode: versionCodeValue as int?,
+      bookmark: bookmark,
     );
   }
 }

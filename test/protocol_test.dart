@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:archive/archive.dart';
 import 'package:wristload/domain/protocol/auth_handshake.dart';
@@ -24,6 +25,16 @@ import 'package:wristload/domain/install_task.dart';
 import 'package:wristload/domain/mass_ack_idle_timeout.dart';
 
 void main() {
+  setUp(() {
+    // Metadata parsing is platform-independent. Use a non-sandboxed target so
+    // these parser fixtures do not bypass or mock macOS security bookmarks.
+    debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+  });
+
+  tearDown(() {
+    debugDefaultTargetPlatformOverride = null;
+  });
+
   test('OTA channel is reserved separately from Mass transfers', () {
     expect(SppProtocol.channelOta, 6);
     expect(SppProtocol.channelOta, isNot(SppProtocol.channelMass));
@@ -191,6 +202,18 @@ void main() {
     };
     expect(InstallCheckpoint.fromJson(valid), isNotNull);
     expect(InstallCheckpoint.fromJson({...valid}..remove('sha256Hex')), isNull);
+    expect(InstallCheckpoint.fromJson({...valid}..remove('kind')), isNull);
+    expect(InstallCheckpoint.fromJson({...valid}..remove('path')), isNull);
+    expect(InstallCheckpoint.fromJson({...valid, 'kind': 'other'}), isNull);
+    expect(InstallCheckpoint.fromJson({...valid, 'phase': 'done'}), isNull);
+    expect(
+      InstallCheckpoint.fromJson({...valid, 'dataType': 0x10}),
+      isNull,
+    );
+    expect(
+      InstallCheckpoint.fromJson({...valid, 'md5Hex': 'not-a-digest'}),
+      isNull,
+    );
     expect(InstallCheckpoint.fromJson({...valid, 'dataType': 0x7f}), isNull);
     expect(InstallCheckpoint.fromJson({...valid, 'fileSize': -1}), isNull);
   });

@@ -2,10 +2,11 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:typed_data';
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../domain/protocol/hci_decoder.dart';
+import '../platform/scoped_file_picker.dart';
+import '../platform/security_scoped_file_access.dart';
 
 /// 只能包含可跨 Isolate 发送的数据；不要把 Widget、BuildContext 或闭包带入 worker。
 class _HciDecodeInput {
@@ -69,6 +70,7 @@ class HciDecoderPage extends StatefulWidget {
 class _HciDecoderPageState extends State<HciDecoderPage> {
   final _authKey = TextEditingController();
   String? _filePath;
+  ScopedFileRef? _fileSource;
   HciDecodeReport? _report;
   String? _error;
   bool _running = false;
@@ -80,14 +82,13 @@ class _HciDecoderPageState extends State<HciDecoderPage> {
   }
 
   Future<void> _pickFile() async {
-    final selected = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: const ['log'],
-    );
-    final path = selected?.files.single.path;
+    final selected = await ScopedFilePicker.pickFiles(allowedExtensions: const ['log']);
+    final source = selected?.single;
+    final path = source?.path;
     if (path != null && mounted) {
       setState(() {
         _filePath = path;
+        _fileSource = source;
         _report = null;
         _error = null;
       });
@@ -107,12 +108,17 @@ class _HciDecoderPageState extends State<HciDecoderPage> {
       _report = null;
     });
     try {
-      final file = File(path);
-      final length = await file.length();
-      if (length <= 0 || length > maxHciCaptureBytes) {
-        throw const FormatException('HCI 文件为空或超过 512 MB 安全上限');
-      }
-      final bytes = Uint8List.fromList(await file.readAsBytes());
+      final bytes = await SecurityScopedFileAccess.instance.withAccess(
+        _fileSource ?? ScopedFileRef(path: path),
+        (resolved) async {
+          final file = File(resolved.path);
+          final length = await file.length();
+          if (length <= 0 || length > maxHciCaptureBytes) {
+            throw const FormatException('HCI 文件为空或超过 512 MB 安全上限');
+          }
+          return Uint8List.fromList(await file.readAsBytes());
+        },
+      );
       final report = await _runHciDecode(_HciDecodeInput(
         TransferableTypedData.fromList([bytes]),
         authKey,

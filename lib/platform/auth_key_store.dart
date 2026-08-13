@@ -1,9 +1,9 @@
 /// authkey 的平台安全存储边界。
-/// Windows 使用 DPAPI，Android 使用 Android Keystore；不会降级为普通文本文件。
+/// Windows 使用 DPAPI，Android 使用 Android Keystore，macOS 使用 Keychain；
+/// 不会降级为普通文本文件。
 library;
 
-import 'dart:io';
-
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 class AuthKeyStore {
@@ -24,5 +24,11 @@ class AuthKeyStore {
     await _channel.invokeMethod<void>('delete');
   }
 
-  bool get _supported => Platform.isWindows || Platform.isAndroid;
+  bool get _supported => switch (defaultTargetPlatform) {
+        TargetPlatform.windows ||
+        TargetPlatform.android ||
+        TargetPlatform.macOS =>
+          true,
+        _ => false,
+      };
 }

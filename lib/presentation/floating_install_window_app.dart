@@ -8,6 +8,7 @@ import 'package:window_manager/window_manager.dart';
 import '../application/floating_window_coordinator.dart';
 import '../application/theme_controller.dart';
 import '../domain/floating_install_snapshot.dart';
+import '../platform/security_scoped_file_access.dart';
 import 'floating_install_window.dart';
 
 /// Secondary-engine host for the compact Windows installation window.
@@ -119,12 +120,18 @@ class _FloatingInstallWindowAppState extends State<FloatingInstallWindowApp>
     await windowManager.setAlwaysOnTop(arguments['alwaysOnTop'] == true);
   }
 
-  Future<void> _addFiles(List<String> paths) async {
+  Future<void> _addFiles(List<ScopedFileRef> files) async {
     Map<Object?, Object?>? result;
     try {
       result = await _channel.invokeMethod<Map<Object?, Object?>>(
         'addFiles',
-        {'paths': paths},
+        {'files': [
+          for (final file in files)
+            {
+              'path': file.path,
+              if (file.bookmark != null) 'bookmark': file.bookmark,
+            },
+        ]},
       );
     } on Object {
       if (mounted) _showNotice('无法连接主窗口，请稍后重试', error: true);

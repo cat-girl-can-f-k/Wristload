@@ -1,5 +1,4 @@
-import 'dart:io';
-
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 class SystemTimeInfo {
@@ -25,7 +24,9 @@ class SystemTimeInfoSource {
 
   Future<SystemTimeInfo> read() async {
     final now = DateTime.now();
-    if (!Platform.isWindows) {
+    final nativePlatform = defaultTargetPlatform == TargetPlatform.windows ||
+        defaultTargetPlatform == TargetPlatform.macOS;
+    if (!nativePlatform) {
       return SystemTimeInfo(
         localTime: now,
         standardOffsetMinutes: now.timeZoneOffset.inMinutes,
@@ -38,7 +39,7 @@ class SystemTimeInfoSource {
     if (values == null) {
       throw PlatformException(
         code: 'system_time',
-        message: 'Windows system time information is unavailable',
+        message: 'Native system time information is unavailable',
       );
     }
     final standardOffset = values['standardOffsetMinutes'];
@@ -51,7 +52,7 @@ class SystemTimeInfoSource {
         timezoneId.isEmpty ||
         use24Hour is! bool) {
       throw const FormatException(
-          'Windows returned invalid system time information');
+          'The platform returned invalid system time information');
     }
     return SystemTimeInfo(
       localTime: now,

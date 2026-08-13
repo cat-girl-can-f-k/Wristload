@@ -14,6 +14,7 @@ import 'package:crypto/crypto.dart';
 import 'install_models.dart';
 import 'install_task.dart';
 import 'device_profile.dart';
+import '../platform/security_scoped_file_access.dart';
 
 class InstallMetadataReader {
   /// Wearable packages are normally far smaller. A hard upper bound prevents
@@ -28,7 +29,30 @@ class InstallMetadataReader {
   static final _packageName =
       RegExp(r'^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$');
 
-  Future<InstallMetadata> read(InstallKind kind, String path) async {
+  Future<InstallMetadata> read(
+    InstallKind kind,
+    String path, {
+    ScopedFileRef? source,
+  }) =>
+      SecurityScopedFileAccess.instance.withAccess(
+        source ?? ScopedFileRef(path: path),
+        (resolved) => _readResolved(kind, resolved.path),
+      );
+
+  /// Reads metadata while the caller keeps [lease] open.
+  ///
+  /// This avoids a nested macOS security-scope acquisition when a higher-level
+  /// importer already needs the resolved path for validation and deduplication.
+  Future<InstallMetadata> readWithLease(
+    InstallKind kind,
+    SecurityScopedFileLease lease,
+  ) =>
+      _readResolved(kind, lease.file.path);
+
+  Future<InstallMetadata> _readResolved(
+    InstallKind kind,
+    String path,
+  ) async {
     final value = await Isolate.run<Map<String, Object?>>(
       () => _readMetadataInWorker(kind.index, path),
     );

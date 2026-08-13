@@ -647,6 +647,38 @@ void main() {
     expect(replayCalls, 1);
   });
 
+  testWidgets('桌面集成不可用时禁用悬浮安装窗', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: TransferSettingsPage(
+            connectionMode: ConnectionMode.modern,
+            preferredInstallTarget: InstallPreference.watchface,
+            connectionModeEnabled: true,
+            segmentIntervalMs: 5,
+            massWindowSize: 3,
+            onConnectionModeChanged: (_) {},
+            onSegmentIntervalChanged: (_) {},
+            onMassWindowSizeChanged: (_) {},
+            onPreferredInstallTargetChanged: (_) {},
+          ),
+        ),
+      ),
+    );
+
+    await tester.scrollUntilVisible(
+      find.text('启用悬浮安装窗'),
+      250,
+      scrollable: find.byType(Scrollable),
+    );
+    final tileFinder = find.ancestor(
+      of: find.text('启用悬浮安装窗'),
+      matching: find.byType(SwitchListTile),
+    );
+    expect(tester.widget<SwitchListTile>(tileFinder).onChanged, isNull);
+    expect(find.text('悬浮安装窗目前仅支持 Windows。'), findsOneWidget);
+  });
+
   testWidgets('Split Button 主区跟随偏好并复用安装回调', (tester) async {
     InstallKind? installed;
 

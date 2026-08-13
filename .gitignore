@@ -12,6 +12,9 @@
 .swiftpm/
 migrate_working_dir/
 
+
+.kimi
+
 # IntelliJ related
 *.iml
 *.ipr
@@ -41,6 +44,14 @@ migrate_working_dir/
 /windows/**/.plugin_symlinks/
 /cmake-build-*/
 *.pdb
+
+# macOS/Xcode build output
+/macos/Flutter/ephemeral/
+/macos/Pods/
+/macos/.symlinks/
+/macos/Podfile.lock
+/macos/Runner.xcworkspace/xcuserdata/
+/macos/Runner.xcodeproj/xcuserdata/
 
 # Android/Gradle build output
 /android/.gradle/

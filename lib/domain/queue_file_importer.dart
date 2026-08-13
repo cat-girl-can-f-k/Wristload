@@ -1,8 +1,11 @@
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
+
 import 'install_metadata_reader.dart';
 import 'install_models.dart';
 import 'install_task.dart';
+import '../platform/security_scoped_file_access.dart';
 
 /// Prepares selected files for appending to an installation queue.
 ///
@@ -16,13 +19,14 @@ typedef InstallMetadataLoader = Future<InstallMetadata> Function(
 
 class QueueFileImporter {
   QueueFileImporter({InstallMetadataLoader? metadataLoader})
-      : _metadataLoader = metadataLoader ?? _readMetadata;
+      : _metadataLoader = metadataLoader;
 
-  final InstallMetadataLoader _metadataLoader;
+  final InstallMetadataLoader? _metadataLoader;
 
   Future<QueueFileImportResult> prepare(
-    Iterable<String> sourcePaths, {
+    Iterable<Object> sourcePaths, {
     Iterable<String> existingPaths = const [],
+    InstallKind? expectedKind,
   }) async {
     final knownPaths = {
       for (final path in existingPaths) normalizePath(path),
@@ -32,28 +36,92 @@ class QueueFileImporter {
     var duplicateCount = 0;
     var unsupportedCount = 0;
 
-    for (final sourcePath in sourcePaths) {
-      final path = File(sourcePath).absolute.path;
-      final normalizedPath = normalizePath(path);
-      if (knownPaths.contains(normalizedPath)) {
-        duplicateCount++;
-        continue;
-      }
-
-      final kind = kindForPath(path);
-      if (kind == null) {
+    for (final input in sourcePaths) {
+      final source = switch (input) {
+        ScopedFileRef ref => ref,
+        String path => ScopedFileRef(path: path),
+        _ => throw ArgumentError.value(input, 'sourcePaths'),
+      };
+      final selectedPath = File(source.path).absolute.path;
+      final normalizedSource = ScopedFileRef(
+        path: selectedPath,
+        bookmark: source.bookmark,
+      );
+      final sourceKind = kindForPath(selectedPath);
+      final shouldResolveMacBookmark =
+          defaultTargetPlatform == TargetPlatform.macOS &&
+          normalizedSource.hasBookmark;
+      // A macOS bookmark may resolve a stale filename to a file whose current
+      // extension is supported. Defer type filtering until after the lease is
+      // acquired in that case. Unbookmarked external paths remain cheap
+      // unsupported entries instead of prompting for access.
+      if (sourceKind == null && !shouldResolveMacBookmark) {
         unsupportedCount++;
         continue;
       }
-
-      // Reserve before awaiting so duplicate paths from one drop stay unique.
-      knownPaths.add(normalizedPath);
+      var failurePath = selectedPath;
+      InstallRequest? preparedRequest;
       try {
-        final metadata = await _metadataLoader(kind, path);
-        requests
-            .add(InstallRequest(kind: kind, path: path, metadata: metadata));
+        if (defaultTargetPlatform == TargetPlatform.macOS &&
+            !normalizedSource.hasBookmark) {
+          throw StateError('拖入文件缺少 macOS 持久访问权限，请改用文件选择器');
+        }
+        final lease =
+            await SecurityScopedFileAccess.instance.acquire(normalizedSource);
+        try {
+          final resolvedPath = File(lease.file.path).absolute.path;
+          failurePath = resolvedPath;
+          final normalizedPath = normalizePath(resolvedPath);
+          if (knownPaths.contains(normalizedPath)) {
+            duplicateCount++;
+            continue;
+          }
+
+          final kind = kindForPath(resolvedPath);
+          if (kind == null) {
+            unsupportedCount++;
+            continue;
+          }
+          if (expectedKind != null && kind != expectedKind) {
+            throw const FormatException(
+              '解析后的文件类型与当前安装目标不一致，请重新选择文件',
+            );
+          }
+
+          // Reserve before metadata parsing so repeated sources in one import
+          // remain unique while parsing awaits its worker isolate.
+          knownPaths.add(normalizedPath);
+          final loader = _metadataLoader;
+          final metadata = loader == null
+              ? await InstallMetadataReader().readWithLease(kind, lease)
+              : await loader(kind, resolvedPath);
+          final resolvedSource = ScopedFileRef(
+            path: resolvedPath,
+            bookmark: lease.file.bookmark,
+          );
+          preparedRequest = InstallRequest(
+            kind: kind,
+            path: resolvedPath,
+            metadata: metadata,
+            source: resolvedSource,
+          );
+        } finally {
+          try {
+            await lease.close();
+          } on Object catch (error) {
+            // Cleanup failure must not replace the import result. Do not log
+            // paths or opaque bookmark contents.
+            debugPrint(
+              '文件访问权限释放失败（' +
+                  error.runtimeType.toString() +
+                  '），已保留导入结果。',
+            );
+          }
+        }
+        final request = preparedRequest;
+        if (request != null) requests.add(request);
       } on Object catch (error) {
-        failures.add(QueueFileImportFailure(path: path, error: error));
+        failures.add(QueueFileImportFailure(path: failurePath, error: error));
       }
     }
 
@@ -65,6 +133,25 @@ class QueueFileImporter {
     );
   }
 
+  /// Prepares one interactively selected file and fails instead of silently
+  /// returning queue-import counters.
+  Future<InstallRequest> prepareSingle(
+    Object source, {
+    required InstallKind expectedKind,
+  }) async {
+    final result = await prepare([source], expectedKind: expectedKind);
+    if (result.failures.isNotEmpty) {
+      throw result.failures.single.error;
+    }
+    if (result.unsupportedCount != 0) {
+      throw const FormatException('不支持的安装文件类型');
+    }
+    if (result.requests.length != 1) {
+      throw StateError('无法导入所选安装文件');
+    }
+    return result.requests.single;
+  }
+
   static InstallKind? kindForPath(String path) {
     final extension = path.split('.').last.toLowerCase();
     return switch (extension) {
@@ -74,14 +161,12 @@ class QueueFileImporter {
     };
   }
 
-  static String normalizePath(String path) =>
-      File(path).absolute.path.toLowerCase();
-
-  static Future<InstallMetadata> _readMetadata(
-    InstallKind kind,
-    String path,
-  ) =>
-      InstallMetadataReader().read(kind, path);
+  static String normalizePath(String path) {
+    final absolutePath = File(path).absolute.path;
+    return defaultTargetPlatform == TargetPlatform.windows
+        ? absolutePath.toLowerCase()
+        : absolutePath;
+  }
 }
 
 class QueueFileImportResult {

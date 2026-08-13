@@ -6,9 +6,9 @@ import 'package:window_manager/window_manager.dart';
 
 import '../domain/floating_install_snapshot.dart';
 import '../domain/install_task.dart';
-import '../domain/queue_file_importer.dart';
+import '../platform/security_scoped_file_access.dart';
 
-typedef FloatingFilesDropped = FutureOr<void> Function(List<String> paths);
+typedef FloatingFilesDropped = FutureOr<void> Function(List<ScopedFileRef> files);
 
 /// Compact view rendered by the secondary Flutter engine.
 ///
@@ -45,26 +45,19 @@ class _FloatingInstallWindowState extends State<FloatingInstallWindow> {
 
   Future<void> _handleDrop(DropDoneDetails details) async {
     _setDragging(false);
-    final paths = details.files.map((file) => file.path).toList();
-    final supported = paths
-        .where((path) => QueueFileImporter.kindForPath(path) != null)
-        .toList();
-    final unsupportedCount = paths.length - supported.length;
-
-    if (unsupportedCount > 0 && mounted) {
-      final colors = Theme.of(context).colorScheme;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          backgroundColor: colors.error,
-          content: Text(
-            '仅支持 .bin / .face / .rpk 文件',
-            style: TextStyle(color: colors.onError),
-          ),
-        ),
+    if (details.errors.isNotEmpty && mounted) {
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+        SnackBar(content: Text(details.errors.first.message)),
       );
     }
-    if (supported.isNotEmpty) {
-      await widget.onFilesDropped(supported);
+    final files = details.files
+        .map((file) => ScopedFileRef(
+              path: file.path,
+              bookmark: file.extraAppleBookmark,
+            ))
+        .toList();
+    if (files.isNotEmpty) {
+      await widget.onFilesDropped(files);
     }
   }
 

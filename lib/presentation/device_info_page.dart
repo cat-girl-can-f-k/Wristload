@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import '../application/device_controller.dart';
@@ -17,8 +18,11 @@ class DeviceInfoPage extends StatelessWidget {
         listenable: controller,
         builder: (context, _) {
           final device = controller.connectedDevice;
-          final mac =
-              device == null ? null : _formatMac(device.uuid.toString());
+          final isMacOS = defaultTargetPlatform == TargetPlatform.macOS;
+          final identifier = device?.uuid.toString();
+          final classicAddress = controller.connectedClassicAddress;
+          final mac = classicAddress ??
+              (isMacOS || identifier == null ? null : _formatMac(identifier));
           final firmware = controller.connectedFirmwareVersion;
           final model = controller.connectedDeviceName ??
               controller.connectedProfile?.displayName;
@@ -40,9 +44,15 @@ class DeviceInfoPage extends StatelessWidget {
               ),
               ListTile(
                 leading: const Icon(Icons.bluetooth),
-                title: const Text('MAC 地址'),
-                subtitle: Text(mac ?? '未连接'),
+                title: Text(isMacOS ? '设备标识' : 'MAC 地址'),
+                subtitle: Text(isMacOS ? identifier ?? '未连接' : mac ?? '未连接'),
               ),
+              if (isMacOS && classicAddress != null)
+                ListTile(
+                  leading: const Icon(Icons.settings_bluetooth),
+                  title: const Text('经典蓝牙地址'),
+                  subtitle: Text(classicAddress),
+                ),
               const ListTile(
                 leading: Icon(Icons.link),
                 title: Text('连接方式'),

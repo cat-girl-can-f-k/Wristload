@@ -90,6 +90,7 @@ class InstallRequestPreflight {
       kind: request.kind,
       path: request.path,
       metadata: metadata,
+      source: request.source,
       unsupportedLuaConfirmed: luaConfirmed,
       watchfaceResolutionConfirmed: resolutionConfirmed,
     );
