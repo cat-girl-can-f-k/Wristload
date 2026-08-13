@@ -1,0 +1,3 @@
+/Users/ikun_cxkpro/WearableInstall/tui/macos_bridge/build/CMakeFiles/wearable_macos_bridge.dir
+/Users/ikun_cxkpro/WearableInstall/tui/macos_bridge/build/CMakeFiles/edit_cache.dir
+/Users/ikun_cxkpro/WearableInstall/tui/macos_bridge/build/CMakeFiles/rebuild_cache.dir

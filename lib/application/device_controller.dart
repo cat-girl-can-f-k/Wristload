@@ -11,6 +11,7 @@ import '../domain/auth_key_binding.dart';
 import '../domain/connection_issue.dart';
 import '../domain/install_models.dart';
 import '../domain/install_checkpoint_store.dart';
+import '../domain/install_metadata_reader.dart';
 import '../domain/install_task.dart';
 import '../domain/watch_app.dart';
 import '../domain/mass_ack_idle_timeout.dart';
@@ -25,23 +26,39 @@ import '../domain/verification_gate.dart';
 import '../platform/ble_transport.dart';
 import '../platform/auth_key_store.dart';
 import '../platform/system_time_info.dart';
+import '../platform/security_scoped_file_access.dart';
 
 typedef QueueInstallPreparer = Future<InstallRequest?> Function(
   InstallRequest request,
 );
 
 class DeviceController extends ChangeNotifier {
-  DeviceController({BleTransport? transport})
-      : _transport = transport ?? BleTransport() {
+  DeviceController({
+    BleTransport? transport,
+    InstallCheckpointStore? checkpointStore,
+    InstallMetadataReader? metadataReader,
+  })  : _transport = transport ?? BleTransport(),
+        _checkpointStore = checkpointStore ?? InstallCheckpointStore(),
+        _metadataReader = metadataReader ?? InstallMetadataReader() {
     unawaited(_restoreAuthKey());
     unawaited(_restoreAuthKeyBindings());
     _transferSettingsReady = _restoreTransferSettings();
+    _checkpointRestore = _restoreInstallCheckpoint();
   }
 
   final BleTransport _transport;
   final ConnectionIssueTracker _connectionIssues = ConnectionIssueTracker();
+  final InstallCheckpointStore _checkpointStore;
+  final InstallMetadataReader _metadataReader;
   late final Future<void> _transferSettingsReady;
+  late final Future<void> _checkpointRestore;
   bool _disposed = false;
+
+  /// Completes after the persisted install checkpoint has been inspected.
+  ///
+  /// Restoration only rebuilds local retry state. It never connects to a
+  /// device, authenticates, or sends protocol data.
+  Future<void> get checkpointRestoreReady => _checkpointRestore;
   StreamSubscription<DiscoveredEventArgs>? _scanSubscription;
   bool _isScanning = false;
   Timer? _scanResultsFlushTimer;
@@ -50,6 +67,7 @@ class DeviceController extends ChangeNotifier {
   List<DiscoveredEventArgs> scanResults = const [];
   Peripheral? connectedDevice;
   String? connectedDeviceName;
+  String? connectedClassicAddress;
   DeviceProfile? connectedProfile;
   Peripheral? _lastPeripheral;
   List<GATTService> services = const [];
@@ -631,6 +649,7 @@ class DeviceController extends ChangeNotifier {
     }
     _connectionIssues.selectTarget(result.peripheral.uuid.toString());
     connectedDeviceName = advertisedName;
+    connectedClassicAddress = null;
     connectedProfile = profile;
     _log('设备名称校验通过：$advertisedName → ${profile.displayName}。');
     if (defaultTargetPlatform == TargetPlatform.windows &&
@@ -682,6 +701,7 @@ class DeviceController extends ChangeNotifier {
     Peripheral peripheral, {
     bool resetWindowsPairing = false,
   }) async {
+    var ownsGattConnection = false;
     _advanceSessionEpoch();
     error = null;
     sessionReady = false;
@@ -708,6 +728,7 @@ class DeviceController extends ChangeNotifier {
         }
       }
       services = await _transport.connectAndDiscover(peripheral);
+      ownsGattConnection = true;
       connectedDevice = peripheral;
       _lastPeripheral = peripheral;
       _log('GATT 已连接，发现 ${services.length} 个服务：');
@@ -728,27 +749,48 @@ class DeviceController extends ChangeNotifier {
       }
       _log('GATT 链路已建立。应用层 authkey 身份校验尚待真机帧验证，'
           '私有帧仍受安全门控保护，当前未宣称“设备已就绪”。');
-      if (defaultTargetPlatform == TargetPlatform.windows) {
-        _log('正在检查 Windows 系统配对状态…');
+      final desktopPairing =
+          defaultTargetPlatform == TargetPlatform.windows ||
+              defaultTargetPlatform == TargetPlatform.macOS;
+      if (desktopPairing) {
+        final platformName = defaultTargetPlatform == TargetPlatform.macOS
+            ? 'macOS'
+            : 'Windows';
+        _log('正在检查 $platformName 系统配对状态…');
         // Native pairDevice is intentionally idempotent: an existing pairing
         // is reused, while an unpaired but connected LE device enters the one
         // real system pairing flow before any RFCOMM/auth traffic is sent.
-        await _transport.pairDevice(peripheral.uuid);
+        connectedClassicAddress = await _transport.pairDevice(
+          peripheral.uuid,
+          advertisedName: connectedDeviceName,
+        );
         _log('系统配对状态已确认；后续直接复用，不删除设备记录。');
         await Future<void>.delayed(const Duration(milliseconds: 800));
       }
       // 官方 SPP 连接是独立的经典蓝牙主通道。版本读取完成后释放并行 GATT
       // 连接，避免 Windows 同时维持 LE 与 RFCOMM 时回收串口 socket。
       await _transport.disconnect(peripheral);
+      ownsGattConnection = false;
       _log('版本读取完成，已释放临时 GATT 链路；后续保持独立 SPP 长连接。');
       _log('开始自动建立 SPP 与 authkey 会话，无需再次点击。');
       await connectSpp();
     } catch (exception) {
+      if (ownsGattConnection) {
+        try {
+          await _transport.disconnect(peripheral);
+        } on Object {
+          // 保留最初的连接/配对错误；这里仅释放本次建立的临时 GATT。
+        }
+      }
       error = '连接或发现服务失败：$exception';
       _log('连接失败：$exception');
-      _log('提示：GattCommunicationStatus=1 表示设备不可达（Unreachable）——'
-          '常见于 Windows 蓝牙缓存/bonding 损坏。建议：手环亮屏并靠近电脑，'
-          'Windows「设置→蓝牙」删除该设备记录后重新扫描连接，或重启 Windows 蓝牙。');
+      if (defaultTargetPlatform == TargetPlatform.windows) {
+        _log('提示：GattCommunicationStatus=1 表示设备不可达（Unreachable）——'
+            '常见于 Windows 蓝牙缓存/bonding 损坏。建议：手环亮屏并靠近电脑，'
+            'Windows「设置→蓝牙」删除该设备记录后重新扫描连接，或重启 Windows 蓝牙。');
+      } else if (defaultTargetPlatform == TargetPlatform.macOS) {
+        _log('提示：请确认已授予 Wristload 蓝牙权限，并在系统蓝牙设置中完成目标设备配对。');
+      }
       _log('不会在 GATT 失败后回退发送 RFCOMM 协议帧；请先完成 HCI 验证。');
     }
     notifyListeners();
@@ -881,6 +923,8 @@ class DeviceController extends ChangeNotifier {
       _log('SPP 连接被拒绝：未连接设备');
       return;
     }
+    final connectionEpoch = ++_sppConnectionEpoch;
+    _closingFailedSppEpoch = null;
     sessionReady = false;
     sppConnecting = true;
     _authenticatedAt = null;
@@ -892,23 +936,40 @@ class DeviceController extends ChangeNotifier {
     _sppAcc = Accumulator();
     _sppSeq = 0;
     _sppAwaitingAuthConfirm = false;
+    _pendingAuthConfirmEpoch = null;
+    _pendingPhoneNonce = null;
+    _pendingSessionKeys = null;
     if (!_resumeAuthenticatedSession) {
-      _pendingSessionKeys = null;
       _sessionCipher = null;
     }
     try {
+      await _sppSub?.cancel();
+      _sppSub = null;
+      if (!_isCurrentSppConnection(connectionEpoch)) return;
       _transport.listenRfcommData();
-      _sppSub ??= _transport.rfcommData.listen(
-        _handleSppData,
+      _sppSub = _transport.rfcommData.listen(
+        (data) => _handleSppData(data, connectionEpoch),
         onError: (Object exception, StackTrace stackTrace) {
+          if (!_isCurrentSppConnection(connectionEpoch)) return;
           _log('RFCOMM 数据流错误：$exception');
-          _handleRfcommEof();
+          _handleRfcommEof(connectionEpoch);
         },
-        onDone: _handleRfcommEof,
+        onDone: () => _handleRfcommEof(connectionEpoch),
       );
       _log('正在建立经典蓝牙 RFCOMM 链路，并独立检查 SPP 配对状态…');
-      _log('  Windows 的 BLE 配对不等于经典蓝牙 SPP 配对；若手环弹出请求，请在手环上确认。');
-      await _transport.connectRfcomm(device.uuid);
+      final platformName = switch (defaultTargetPlatform) {
+        TargetPlatform.macOS => 'macOS',
+        TargetPlatform.windows => 'Windows',
+        TargetPlatform.android => 'Android',
+        _ => '当前平台',
+      };
+      _log('  $platformName 的 BLE 连接不等于经典蓝牙 SPP 配对；若手环弹出请求，请在手环上确认。');
+      final classicAddress = await _transport.connectRfcomm(
+        device.uuid,
+        advertisedName: connectedDeviceName,
+      );
+      if (!_isCurrentSppConnection(connectionEpoch)) return;
+      connectedClassicAddress = classicAddress ?? connectedClassicAddress;
       _connectionIssues.connectionSucceeded();
       // These V2 targets expose their transport generation through the GATT
       // version characteristic. Repeated device tests show that they do not
@@ -917,13 +978,14 @@ class DeviceController extends ChangeNotifier {
       // fallback path without changing the authenticated protocol.
       _sppAwaitingVersion = false;
       _log('RFCOMM 已连接；目标型号已识别为 V2，直接发送 L1START…');
-      await _sppSendL1Start();
+      await _sppSendL1Start(connectionEpoch, device);
     } catch (exception) {
-      sppConnecting = false;
-      if (_resumeAuthenticatedSession) {
-        _resumeAuthenticatedSession = false;
-        _sessionCipher = null;
-        _log('会话恢复失败；已丢弃旧会话密钥，下次连接将重新鉴权。');
+      if (_isCurrentSppConnection(connectionEpoch)) {
+        await _cleanupFailedSppConnect(
+          device,
+          exception,
+          connectionEpoch,
+        );
       }
       _connectionIssues.recordConnectionFailure(exception);
       _log('SPP 连接失败：$exception');
@@ -940,6 +1002,9 @@ class DeviceController extends ChangeNotifier {
   DateTime? _authenticatedAt;
   int _postAuthReconnectAttempts = 0;
   bool _recoveringPostAuthClose = false;
+  int _sppConnectionEpoch = 0;
+  int? _closingFailedSppEpoch;
+  int? _pendingAuthConfirmEpoch;
   bool _resumeAuthenticatedSession = false;
   SessionKeys? _pendingSessionKeys;
   SessionCipher? _sessionCipher;
@@ -950,7 +1015,6 @@ class DeviceController extends ChangeNotifier {
   final StreamController<Zau> _businessResponses =
       StreamController<Zau>.broadcast();
   final Set<_BusinessWaiter> _completionWaiters = {};
-  final InstallCheckpointStore _checkpointStore = InstallCheckpointStore();
   bool _installCancelled = false;
   bool _installInProgress = false;
   bool _timeSyncInProgress = false;
@@ -966,10 +1030,96 @@ class DeviceController extends ChangeNotifier {
   Duration? _completedTransferElapsed;
   int _transferStartConfirmedBytes = 0;
 
+  /// Restores only a locally verifiable retry record. This deliberately does
+  /// not reconnect, authenticate, or resume transmission: MassPrepare must be
+  /// negotiated with the device again after the user reconnects.
+  Future<void> _restoreInstallCheckpoint() async {
+    final checkpoint = await _checkpointStore.load();
+    if (checkpoint == null || _disposed) return;
+
+    SecurityScopedFileLease? lease;
+    try {
+      lease = await SecurityScopedFileAccess.instance.acquire(
+        ScopedFileRef(path: checkpoint.path, bookmark: checkpoint.bookmark),
+      );
+      if (_disposed) return;
+
+      final expectedDataType = checkpoint.kind == InstallKind.watchface
+          ? MassDataType.watchface
+          : MassDataType.quickAppRpk;
+      if (checkpoint.dataType != expectedDataType) {
+        throw StateError('检查点的数据类型与安装包类型不一致');
+      }
+
+      // Re-read the complete package metadata while this single lease is held.
+      // This validates size and both digests without trusting checkpoint fields
+      // that may have been written by an older app version.
+      final metadata = await _metadataReader.readWithLease(checkpoint.kind, lease);
+      if (_disposed) return;
+      if (metadata.fileSize != checkpoint.fileSize ||
+          metadata.md5Hex != checkpoint.md5Hex ||
+          metadata.sha256Hex != checkpoint.sha256Hex) {
+        throw StateError('源文件已变更，检查点不能恢复');
+      }
+
+      final source = ScopedFileRef(
+        path: File(lease.file.path).absolute.path,
+        bookmark: lease.file.bookmark,
+      );
+      final request = InstallRequest(
+        kind: checkpoint.kind,
+        path: source.path,
+        metadata: metadata,
+        source: source,
+      );
+
+      // Persist the resolved path and a refreshed security-scoped bookmark
+      // before exposing the retry item to the UI.
+      if (_disposed) return;
+      await _checkpointStore.save(InstallCheckpoint(
+        kind: checkpoint.kind,
+        path: source.path,
+        fileSize: metadata.fileSize,
+        md5Hex: metadata.md5Hex,
+        sha256Hex: metadata.sha256Hex,
+        dataType: expectedDataType,
+        lastAcknowledgedSegment: checkpoint.lastAcknowledgedSegment,
+        phase: checkpoint.phase,
+        faceId: metadata.faceId,
+        packageName: metadata.packageName,
+        versionCode: metadata.versionCode,
+        bookmark: source.bookmark,
+      ));
+      if (_disposed) return;
+
+      _lastInstallRequest = request;
+      installQueue.add(QueueEntry(
+        request: request,
+        stage: QueueStage.stateUnknown,
+      )..message = '检测到上次未完成安装；请重新连接设备后手动重试。');
+      _log('已恢复上次安装记录；未自动连接或发送数据。');
+    } on Object catch (exception) {
+      if (!_disposed) {
+        _log('未恢复安装检查点：$exception');
+      }
+    } finally {
+      try {
+        await lease?.close();
+      } on Object catch (exception) {
+        if (!_disposed) _log('恢复检查点后释放文件访问权限失败：$exception');
+      }
+    }
+  }
+
   /// 处理 RFCOMM 收到的字节：先试 SppPacket（版本回包），再增量解析 L1 帧。
-  void _handleSppData(Uint8List data) {
+  bool _isCurrentSppConnection(int connectionEpoch) =>
+      connectionEpoch == _sppConnectionEpoch &&
+      _closingFailedSppEpoch != connectionEpoch;
+
+  void _handleSppData(Uint8List data, int connectionEpoch) {
+    if (!_isCurrentSppConnection(connectionEpoch)) return;
     if (data.isEmpty) {
-      _handleRfcommEof();
+      _handleRfcommEof(connectionEpoch);
       return;
     }
     _log('RFCOMM 收到 ${data.length}B：${_hex(data)}');
@@ -985,10 +1135,10 @@ class DeviceController extends ChangeNotifier {
               .join('.');
           _log('  ★ 设备版本：$connectedFirmwareVersion');
           _log('版本确认。发送 L1START_REQ（L1 CMD 帧）…');
-          unawaited(_sppSendL1Start());
+          unawaited(_sendL1StartFromInboundPacket(connectionEpoch));
         } else {
           _log('  非版本回包（type=$type），仍尝试 L1START…');
-          unawaited(_sppSendL1Start());
+          unawaited(_sendL1StartFromInboundPacket(connectionEpoch));
         }
         return;
       }
@@ -996,12 +1146,15 @@ class DeviceController extends ChangeNotifier {
     _sppAcc.buffer = [..._sppAcc.buffer, ...data];
     final packets = SppProtocol.parse(_sppAcc);
     for (final packet in packets) {
-      _handleSppPacket(packet);
+      _handleSppPacket(packet, connectionEpoch);
     }
   }
 
-  void _handleRfcommEof() {
+  void _handleRfcommEof(int connectionEpoch) {
+    if (!_isCurrentSppConnection(connectionEpoch)) return;
+    _sppConnectionEpoch++;
     sppConnecting = false;
+    _clearSppHandshakeState();
     if (!sessionReady && _sessionCipher == null) {
       _log('RFCOMM 已关闭（EOF）。');
       notifyListeners();
@@ -1038,7 +1191,7 @@ class DeviceController extends ChangeNotifier {
     if (isTransportTransition) {
       _postAuthReconnectAttempts++;
       _log('检测到 f=27 后的 RFCOMM 传输切换；保留已确认会话密钥并自动重建链路。');
-      unawaited(_recoverPostAuthRfcomm());
+      unawaited(_recoverPostAuthRfcomm(_sessionEpoch));
     } else {
       _connectionIssues.recordUnexpectedDisconnect();
       _log('RFCOMM 长连接已被远端关闭；当前鉴权会话失效。');
@@ -1046,9 +1199,13 @@ class DeviceController extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> _recoverPostAuthRfcomm() async {
+  Future<void> _recoverPostAuthRfcomm(int recoverySessionEpoch) async {
     final device = connectedDevice ?? _lastPeripheral;
-    if (device == null || _recoveringPostAuthClose) return;
+    if (device == null ||
+        _recoveringPostAuthClose ||
+        recoverySessionEpoch != _sessionEpoch) {
+      return;
+    }
     _recoveringPostAuthClose = true;
     try {
       try {
@@ -1056,7 +1213,13 @@ class DeviceController extends ChangeNotifier {
       } on Object {
         // 设备已经关闭旧 socket 时，本地清理仍可能返回错误。
       }
+      if (recoverySessionEpoch != _sessionEpoch || connectedDevice == null) {
+        return;
+      }
       await Future<void>.delayed(const Duration(milliseconds: 500));
+      if (recoverySessionEpoch != _sessionEpoch || connectedDevice == null) {
+        return;
+      }
       _log('正在重建持久 SPP 传输；不会重复系统配对或 f=26/f=27。');
       await connectSpp(resumeSession: true);
     } on Object catch (exception) {
@@ -1068,24 +1231,104 @@ class DeviceController extends ChangeNotifier {
     }
   }
 
-  Future<void> _sppSendL1Start() async {
-    final device = connectedDevice ?? _lastPeripheral;
-    if (device == null) return;
+  Future<void> _sppSendL1Start(
+    int connectionEpoch,
+    Peripheral device,
+  ) async {
+    if (!_isCurrentSppConnection(connectionEpoch)) return;
     final start = SppProtocol.buildL1StartRequest();
     _log('  L1START_REQ：${_hex(start)}');
     try {
       await _transport.rfcommWrite(device.uuid, start);
+      if (!_isCurrentSppConnection(connectionEpoch)) return;
       _log('已发送 L1START_REQ，等待设备 L1START_RSP…');
       _sppWatchdog?.cancel();
       _sppWatchdog = Timer(const Duration(seconds: 15), () {
-        _log('SPP 超时：15 秒内无 L1START_RSP');
+        if (!_isCurrentSppConnection(connectionEpoch)) return;
+        unawaited(_cleanupFailedSppConnect(
+          device,
+          TimeoutException('15 秒内无 L1START_RSP'),
+          connectionEpoch,
+        ));
       });
     } catch (exception) {
       _log('L1START 发送失败：$exception');
+      rethrow;
     }
   }
 
-  void _handleSppPacket(SppPacket packet) {
+  Future<void> _sendL1StartFromInboundPacket(int connectionEpoch) async {
+    if (!_isCurrentSppConnection(connectionEpoch)) return;
+    final device = connectedDevice ?? _lastPeripheral;
+    if (device == null) return;
+    try {
+      await _sppSendL1Start(connectionEpoch, device);
+    } on Object catch (exception) {
+      if (_isCurrentSppConnection(connectionEpoch) &&
+          _closingFailedSppEpoch != connectionEpoch) {
+        await _cleanupFailedSppConnect(
+          device,
+          exception,
+          connectionEpoch,
+        );
+      }
+    }
+  }
+
+  Future<void> _cleanupFailedSppConnect(
+    Peripheral device,
+    Object exception,
+    int connectionEpoch,
+  ) async {
+    if (!_isCurrentSppConnection(connectionEpoch) ||
+        _closingFailedSppEpoch == connectionEpoch) {
+      return;
+    }
+    _closingFailedSppEpoch = connectionEpoch;
+    sessionReady = false;
+    _sppAwaitingVersion = false;
+    _clearPendingAuthConfirm();
+    connectedClassicAddress = null;
+    _sppWatchdog?.cancel();
+    _sppWatchdog = null;
+    if (_resumeAuthenticatedSession) {
+      _log('会话恢复失败；已丢弃旧会话密钥，下次连接将重新鉴权。');
+    }
+    _resumeAuthenticatedSession = false;
+    _sessionCipher = null;
+    _log('SPP 连接失败：$exception');
+    try {
+      await _transport.disconnectRfcomm(device.uuid);
+      _log('失败的 RFCOMM 链路已关闭，可以重新连接。');
+    } on Object catch (cleanupError) {
+      _log('RFCOMM 失败清理未完成：$cleanupError');
+    } finally {
+      if (_closingFailedSppEpoch == connectionEpoch) {
+        _closingFailedSppEpoch = null;
+      }
+      if (_isCurrentSppConnection(connectionEpoch)) {
+        sppConnecting = false;
+        notifyListeners();
+      }
+    }
+  }
+
+  void _clearSppHandshakeState() {
+    _sppWatchdog?.cancel();
+    _sppWatchdog = null;
+    _sppAwaitingVersion = false;
+    _clearPendingAuthConfirm();
+  }
+
+  void _clearPendingAuthConfirm() {
+    _sppAwaitingAuthConfirm = false;
+    _pendingAuthConfirmEpoch = null;
+    _pendingPhoneNonce = null;
+    _pendingSessionKeys = null;
+  }
+
+  void _handleSppPacket(SppPacket packet, int connectionEpoch) {
+    if (!_isCurrentSppConnection(connectionEpoch)) return;
     switch (packet.type) {
       case SppProtocol.typeCmd:
         final cmd = packet.payload.isEmpty ? -1 : packet.payload[0];
@@ -1103,15 +1346,15 @@ class DeviceController extends ChangeNotifier {
             notifyListeners();
           } else {
             _log('L1START_RSP 收到——L1 会话建立！发送官方鉴权 f=26（DATA 明文帧）…');
-            unawaited(_sppSendAuthStep1());
+            unawaited(_sppSendAuthStep1(connectionEpoch));
           }
         }
         break;
       case SppProtocol.typeData:
         _log('SPP DATA 帧（seq=${packet.seq}）：payload=${_hex(packet.payload)}');
         // 回 ACK
-        unawaited(_sppSendAck(packet.seq));
-        _handleSppDataPacket(packet);
+        unawaited(_sppSendAck(packet.seq, connectionEpoch));
+        _handleSppDataPacket(packet, connectionEpoch);
         break;
       case SppProtocol.typeAck:
         final massIndex = _pendingMassAckOrder.indexOf(packet.seq);
@@ -1158,7 +1401,8 @@ class DeviceController extends ChangeNotifier {
   }
 
   /// DATA 帧：channel + opCode + data。解析 Command protobuf。
-  void _handleSppDataPacket(SppPacket packet) {
+  void _handleSppDataPacket(SppPacket packet, int connectionEpoch) {
+    if (!_isCurrentSppConnection(connectionEpoch)) return;
     if (packet.payload.length < 2) {
       _log('SPP DATA 帧过短');
       return;
@@ -1167,6 +1411,8 @@ class DeviceController extends ChangeNotifier {
     final opCode = packet.payload[1];
     final data = packet.payload.sublist(2);
     _log('  DATA channel=$channel opCode=$opCode data=${_hex(data)}');
+    final isPlainPbWrite = channel == SppProtocol.channelPb &&
+        opCode == SppProtocol.opCodeWrite;
     if (channel == SppProtocol.channelPb &&
         opCode == SppProtocol.opCodeWriteEnc) {
       _inspectEncryptedBusinessFrame(data);
@@ -1176,35 +1422,70 @@ class DeviceController extends ChangeNotifier {
     if (parsed != null) {
       _log('  Command：type=${parsed.type} subtype=${parsed.subtype} '
           'watchNonce=${parsed.watchNonce != null}');
-      if (parsed.watchNonce != null && _pendingPhoneNonce != null) {
+      if (isPlainPbWrite &&
+          parsed.type == XiaomiAuth.commandType &&
+          parsed.subtype == XiaomiAuth.cmdNonce &&
+          parsed.watchNonce != null &&
+          _pendingPhoneNonce != null &&
+          !_sppAwaitingAuthConfirm &&
+          sppConnecting &&
+          !sessionReady) {
+        _sppAwaitingAuthConfirm = true;
         _log('  收到设备随机数与签名，开始本地验签后自动发送 f=27 sendAppConfirm…');
         unawaited(_sppSendAuthConfirm(
+          connectionEpoch: connectionEpoch,
           phoneNonce: _pendingPhoneNonce!,
           watchNonce: parsed.watchNonce!,
           watchHmac: parsed.watchHmac ?? const [],
         ));
-      } else if (parsed.subtype == 27) {
+      } else if (parsed.subtype == XiaomiAuth.cmdAuth) {
+        final belongsToCurrentHandshake = isPlainPbWrite &&
+            parsed.type == XiaomiAuth.commandType &&
+            _pendingAuthConfirmEpoch == connectionEpoch &&
+            _sppAwaitingAuthConfirm &&
+            _pendingPhoneNonce != null &&
+            _pendingSessionKeys != null &&
+            parsed.authStatus != null &&
+            sppConnecting &&
+            !sessionReady;
+        if (!belongsToCurrentHandshake) {
+          _log('  忽略不属于当前鉴权握手的 f=27 响应。');
+          return;
+        }
+
         // f=27 响应：设备确认（kc0{success, capability}）→ device ready。
-        _sppAwaitingAuthConfirm = false;
+        final keys = _pendingSessionKeys!;
         final confirmed = parsed.authStatus == 1;
+        _sppAwaitingAuthConfirm = false;
+        _pendingAuthConfirmEpoch = null;
+        _pendingPhoneNonce = null;
+        _pendingSessionKeys = null;
+        _sppWatchdog?.cancel();
+        _sppWatchdog = null;
         sppConnecting = false;
         if (confirmed) {
-          sessionReady = true;
+          _sessionCipher = SessionCipher(keys);
+          _log('  已启用 WRITE_ENC 业务通道与只读解密诊断。');
           _authenticatedAt = DateTime.now();
-          final keys = _pendingSessionKeys;
-          if (keys != null) {
-            _sessionCipher = SessionCipher(keys);
-            _pendingSessionKeys = null;
-            _log('  已启用 WRITE_ENC 业务通道与只读解密诊断。');
+          sessionReady = true;
+          final authenticatedDevice = connectedDevice ?? _lastPeripheral;
+          final authenticatedName = connectedDeviceName;
+          if (defaultTargetPlatform == TargetPlatform.macOS &&
+              authenticatedDevice != null &&
+              authenticatedName != null) {
+            unawaited(_confirmMacOSRfcommIdentity(
+              authenticatedDevice,
+              authenticatedName,
+            ));
           }
           _connectionIssues.authenticated();
-          _sppWatchdog?.cancel();
-          _sppWatchdog = null;
           // f=27 confirms the authenticated session. Do not send a speculative
           // encrypted "keepalive" here: the reference installer proceeds with
           // the requested business command, and this device does not ACK the
           // previously tested 4/0 probe. A missing response to an optional
           // probe must never invalidate an otherwise healthy RFCOMM session.
+        } else {
+          _sessionCipher = null;
         }
         _log('  f=27 设备响应（confirmed=$confirmed，status=${parsed.status}）');
         _log(confirmed
@@ -1216,6 +1497,21 @@ class DeviceController extends ChangeNotifier {
       }
     } else {
       _log('  无法按 Xiaomi Command 解析');
+    }
+  }
+
+  Future<void> _confirmMacOSRfcommIdentity(
+    Peripheral device,
+    String advertisedName,
+  ) async {
+    try {
+      await _transport.confirmRfcommIdentity(
+        device.uuid,
+        advertisedName: advertisedName,
+      );
+      _log('已在 authkey 鉴权成功后保存 macOS 经典蓝牙设备关联。');
+    } on Object catch (exception) {
+      _log('macOS 经典蓝牙设备关联未持久化：$exception');
     }
   }
 
@@ -1243,14 +1539,20 @@ class DeviceController extends ChangeNotifier {
   }
 
   Future<void> _sppSendAuthConfirm({
+    required int connectionEpoch,
     required List<int> phoneNonce,
     required List<int> watchNonce,
     required List<int> watchHmac,
   }) async {
+    if (!_isCurrentSppConnection(connectionEpoch)) return;
     final device = connectedDevice;
-    if (device == null) return;
+    if (device == null) {
+      _clearPendingAuthConfirm();
+      return;
+    }
     final secretKey = XiaomiAuth.secretKeyFromHex(authKey ?? '');
     if (secretKey == null) {
+      _clearPendingAuthConfirm();
       _log('f=27 被拒绝：authkey 无效');
       return;
     }
@@ -1262,18 +1564,19 @@ class DeviceController extends ChangeNotifier {
       phoneModel: _companionDeviceName(),
     );
     if (cmd == null) {
+      _clearPendingAuthConfirm();
       _log('  ✗ 设备签名校验失败（HMAC 不匹配——authkey 与设备不匹配？）');
       return;
     }
     _pendingSessionKeys = SessionKeys.fromHkdf(
       XiaomiAuth.computeStep3Hmac(secretKey, phoneNonce, watchNonce),
     );
+    _pendingAuthConfirmEpoch = connectionEpoch;
     final frame = SppProtocol.buildDataFrame(_sppSeq++, cmd);
     _log('发送 f=27（seq=${_sppSeq - 1}，${frame.length}B）：${_hex(frame)}');
     try {
-      // 设备可能在 Windows 写入 Future 完成前回包，先置状态以避免随后误挂超时。
-      _sppAwaitingAuthConfirm = true;
       await _transport.rfcommWrite(device.uuid, frame);
+      if (!_isCurrentSppConnection(connectionEpoch)) return;
       if (!_sppAwaitingAuthConfirm) {
         _log('f=27 已在写入完成前收到设备确认。');
         return;
@@ -1281,14 +1584,26 @@ class DeviceController extends ChangeNotifier {
       _log('f=27 已写入，等待设备确认（device ready）…');
       _sppWatchdog?.cancel();
       _sppWatchdog = Timer(const Duration(seconds: 15), () {
-        if (_sppAwaitingAuthConfirm) {
-          _sppAwaitingAuthConfirm = false;
-          _log('SPP 超时：15 秒内无 f=27 响应');
+        if (_isCurrentSppConnection(connectionEpoch) &&
+            _sppAwaitingAuthConfirm &&
+            _pendingAuthConfirmEpoch == connectionEpoch) {
+          _clearPendingAuthConfirm();
+          unawaited(_cleanupFailedSppConnect(
+            device,
+            TimeoutException('15 秒内无 f=27 响应'),
+            connectionEpoch,
+          ));
         }
       });
     } catch (exception) {
-      _sppAwaitingAuthConfirm = false;
+      if (!_isCurrentSppConnection(connectionEpoch)) return;
+      _clearPendingAuthConfirm();
       _log('f=27 发送失败：$exception');
+      await _cleanupFailedSppConnect(
+        device,
+        exception,
+        connectionEpoch,
+      );
     }
   }
 
@@ -1301,10 +1616,17 @@ class DeviceController extends ChangeNotifier {
     } on Object {
       // 主机名不可用时使用不含用户信息的通用平台名。
     }
-    return 'Windows';
+    return switch (defaultTargetPlatform) {
+      TargetPlatform.macOS => 'macOS',
+      TargetPlatform.android => 'Android',
+      TargetPlatform.windows => 'Windows',
+      TargetPlatform.linux => 'Linux',
+      _ => 'Wristload',
+    };
   }
 
-  Future<void> _sppSendAuthStep1() async {
+  Future<void> _sppSendAuthStep1(int connectionEpoch) async {
+    if (!_isCurrentSppConnection(connectionEpoch)) return;
     final device = connectedDevice;
     if (device == null) return;
     final nonce = List<int>.generate(16, (_) => _random.nextInt(256));
@@ -1314,17 +1636,30 @@ class DeviceController extends ChangeNotifier {
     _log('发送 f=26（seq=${_sppSeq - 1}，${frame.length}B）：${_hex(frame)}');
     try {
       await _transport.rfcommWrite(device.uuid, frame);
+      if (!_isCurrentSppConnection(connectionEpoch)) return;
       _log('f=26 已写入，等待设备 watchNonce…');
       _sppWatchdog?.cancel();
       _sppWatchdog = Timer(const Duration(seconds: 15), () {
-        _log('SPP 超时：15 秒内无 watchNonce');
+        if (!_isCurrentSppConnection(connectionEpoch)) return;
+        unawaited(_cleanupFailedSppConnect(
+          device,
+          TimeoutException('15 秒内无 watchNonce'),
+          connectionEpoch,
+        ));
       });
     } catch (exception) {
+      if (!_isCurrentSppConnection(connectionEpoch)) return;
       _log('f=26 发送失败：$exception');
+      await _cleanupFailedSppConnect(
+        device,
+        exception,
+        connectionEpoch,
+      );
     }
   }
 
-  Future<void> _sppSendAck(int seq) async {
+  Future<void> _sppSendAck(int seq, int connectionEpoch) async {
+    if (!_isCurrentSppConnection(connectionEpoch)) return;
     final device = connectedDevice;
     if (device == null) return;
     try {
@@ -1343,6 +1678,9 @@ class DeviceController extends ChangeNotifier {
 
   Future<void> disconnect() async {
     _advanceSessionEpoch();
+    _sppConnectionEpoch++;
+    _closingFailedSppEpoch = null;
+    _clearSppHandshakeState();
     if (_installInProgress) {
       await cancelInstall();
       _log('RFCOMM/GATT 正在断开：安装已停止，设备可能保留部分数据。');
@@ -1363,6 +1701,7 @@ class DeviceController extends ChangeNotifier {
     }
     connectedDevice = null;
     connectedDeviceName = null;
+    connectedClassicAddress = null;
     connectedProfile = null;
     sessionReady = false;
     sppConnecting = false;
@@ -1373,8 +1712,6 @@ class DeviceController extends ChangeNotifier {
     _authenticatedAt = null;
     _recoveringPostAuthClose = false;
     _resumeAuthenticatedSession = false;
-    _sppAwaitingAuthConfirm = false;
-    _pendingSessionKeys = null;
     _sessionCipher = null;
     _isScanning = false;
     services = const [];
@@ -1629,20 +1966,94 @@ class DeviceController extends ChangeNotifier {
       _log('没有待恢复的安装检查点。');
       return;
     }
-    final file = File(checkpoint.path);
-    if (!await file.exists()) {
-      _log('恢复检查失败：源文件已不存在，设备状态未知。');
-      return;
+    List<int> bytes;
+    SecurityScopedFileLease? lease;
+    try {
+      lease = await SecurityScopedFileAccess.instance.acquire(
+        ScopedFileRef(path: checkpoint.path, bookmark: checkpoint.bookmark),
+      );
+      final file = File(lease.file.path);
+      if (!await file.exists()) throw StateError('源文件已不存在');
+      bytes = await file.readAsBytes();
+      if (bytes.length != checkpoint.fileSize ||
+          md5.convert(bytes).toString() != checkpoint.md5Hex ||
+          sha256.convert(bytes).toString() != checkpoint.sha256Hex) {
+        _log('恢复检查失败：源文件已变更，不能使用此检查点续传。');
+        return;
+      }
+      final resolvedPath = File(lease.file.path).absolute.path;
+      final resolvedBookmark = lease.file.bookmark;
+      final sourceChanged = resolvedPath != checkpoint.path ||
+          !listEquals(resolvedBookmark, checkpoint.bookmark);
+      if (sourceChanged) {
+        await _checkpointStore.save(InstallCheckpoint(
+          kind: checkpoint.kind,
+          path: resolvedPath,
+          fileSize: checkpoint.fileSize,
+          md5Hex: checkpoint.md5Hex,
+          sha256Hex: checkpoint.sha256Hex,
+          dataType: checkpoint.dataType,
+          lastAcknowledgedSegment: checkpoint.lastAcknowledgedSegment,
+          phase: checkpoint.phase,
+          faceId: checkpoint.faceId,
+          packageName: checkpoint.packageName,
+          versionCode: checkpoint.versionCode,
+          bookmark: resolvedBookmark,
+        ));
+      }
+      if (sourceChanged) {
+        _refreshRetryRequestSources(
+          checkpoint,
+          ScopedFileRef(path: resolvedPath, bookmark: resolvedBookmark),
+        );
+      }
+      _log('检查点有效：已确认片 ${checkpoint.lastAcknowledgedSegment}，'
+          '重新认证后将重新 MassPrepare，由设备决定是否给出可信断点。');
+    } on Object {
+      _log('恢复检查失败：源文件不存在、没有访问权限或无法更新检查点，设备状态未知。');
+    } finally {
+      try {
+        await lease?.close();
+      } on Object catch (cleanupError) {
+        if (!_disposed) {
+          _log('恢复检查点后释放文件访问权限失败（' +
+              cleanupError.runtimeType.toString() +
+              '）。');
+        }
+      }
     }
-    final bytes = await file.readAsBytes();
-    if (bytes.length != checkpoint.fileSize ||
-        md5.convert(bytes).toString() != checkpoint.md5Hex ||
-        sha256.convert(bytes).toString() != checkpoint.sha256Hex) {
-      _log('恢复检查失败：源文件已变更，不能使用此检查点续传。');
-      return;
+  }
+
+  void _refreshRetryRequestSources(
+    InstallCheckpoint checkpoint,
+    ScopedFileRef source,
+  ) {
+    bool matchesCheckpoint(InstallRequest request) =>
+        request.kind == checkpoint.kind &&
+        request.path == checkpoint.path &&
+        request.metadata.fileSize == checkpoint.fileSize &&
+        request.metadata.md5Hex == checkpoint.md5Hex &&
+        request.metadata.sha256Hex == checkpoint.sha256Hex;
+
+    InstallRequest withSource(InstallRequest request) => InstallRequest(
+          kind: request.kind,
+          path: source.path,
+          metadata: request.metadata,
+          source: source,
+          unsupportedLuaConfirmed: request.unsupportedLuaConfirmed,
+          watchfaceResolutionConfirmed: request.watchfaceResolutionConfirmed,
+        );
+
+    final lastRequest = _lastInstallRequest;
+    if (lastRequest != null && matchesCheckpoint(lastRequest)) {
+      _lastInstallRequest = withSource(lastRequest);
     }
-    _log('检查点有效：已确认片 ${checkpoint.lastAcknowledgedSegment}，'
-        '重新认证后将重新 MassPrepare，由设备决定是否给出可信断点。');
+    for (final entry in installQueue) {
+      if (entry.stage == QueueStage.stateUnknown &&
+          matchesCheckpoint(entry.request)) {
+        entry.request = withSource(entry.request);
+      }
+    }
   }
 
   /// Retries the same package without discarding the device's Mass checkpoint.
@@ -1716,7 +2127,30 @@ class DeviceController extends ChangeNotifier {
   Future<void> _runInstall(InstallRequest request) async {
     final metadata = request.metadata;
     _validateInstallRequest(request);
-    final file = File(request.path);
+    final lease = await SecurityScopedFileAccess.instance.acquire(
+      request.source ?? ScopedFileRef(path: request.path),
+    );
+    try {
+      await _runInstallWithLease(request, metadata, lease);
+    } finally {
+      try {
+        await lease.close();
+      } on Object catch (error) {
+        // Cleanup failure must not replace install success or its primary
+        // failure; avoid logging sensitive paths or bookmark contents.
+        _log('安装后释放文件访问权限失败（' +
+            error.runtimeType.toString() +
+            '）。');
+      }
+    }
+  }
+
+  Future<void> _runInstallWithLease(
+    InstallRequest request,
+    InstallMetadata metadata,
+    SecurityScopedFileLease lease,
+  ) async {
+    final file = File(lease.file.path);
     if (!await file.exists()) throw StateError('源文件已不存在');
     final bytes = await file.readAsBytes();
     if (bytes.length != metadata.fileSize ||
@@ -1821,7 +2255,7 @@ class DeviceController extends ChangeNotifier {
     final totalSegments = transferPlan?.totalSegments ?? 0;
     await _checkpointStore.save(InstallCheckpoint(
       kind: request.kind,
-      path: request.path,
+      path: lease.file.path,
       fileSize: metadata.fileSize,
       md5Hex: metadata.md5Hex,
       sha256Hex: metadata.sha256Hex,
@@ -1831,6 +2265,7 @@ class DeviceController extends ChangeNotifier {
       faceId: metadata.faceId,
       packageName: metadata.packageName,
       versionCode: metadata.versionCode,
+      bookmark: lease.file.bookmark,
     ));
     // The device negotiated a three-packet L1 receive window. The UI can raise
     // this experimental window for throughput testing. Complete L1 frames are
@@ -1888,7 +2323,7 @@ class DeviceController extends ChangeNotifier {
       confirmedFileBytes = queuedFileBytes;
       await _checkpointStore.save(InstallCheckpoint(
         kind: request.kind,
-        path: request.path,
+        path: lease.file.path,
         fileSize: metadata.fileSize,
         md5Hex: metadata.md5Hex,
         sha256Hex: metadata.sha256Hex,
@@ -1898,6 +2333,7 @@ class DeviceController extends ChangeNotifier {
         faceId: metadata.faceId,
         packageName: metadata.packageName,
         versionCode: metadata.versionCode,
+        bookmark: lease.file.bookmark,
       ));
       if (confirmed.index < totalSegments) {
         await Future<void>.delayed(Duration(milliseconds: segmentIntervalMs));
@@ -1914,7 +2350,7 @@ class DeviceController extends ChangeNotifier {
         bytesPerSecond: _confirmedBytesPerSecond);
     await _checkpointStore.save(InstallCheckpoint(
       kind: request.kind,
-      path: request.path,
+      path: lease.file.path,
       fileSize: metadata.fileSize,
       md5Hex: metadata.md5Hex,
       sha256Hex: metadata.sha256Hex,
@@ -1924,6 +2360,7 @@ class DeviceController extends ChangeNotifier {
       faceId: metadata.faceId,
       packageName: metadata.packageName,
       versionCode: metadata.versionCode,
+      bookmark: lease.file.bookmark,
     ));
     if (watchCompletion != null) {
       final result = await _withInstallCancellation(
@@ -2503,8 +2940,9 @@ class DeviceController extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
-    _sppWatchdog?.cancel();
-    _sppWatchdog = null;
+    _sppConnectionEpoch++;
+    _closingFailedSppEpoch = null;
+    _clearSppHandshakeState();
     unawaited(_scanSubscription?.cancel());
     unawaited(_sppSub?.cancel());
     _sppSub = null;

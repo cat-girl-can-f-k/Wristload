@@ -30,14 +30,28 @@ class DropUpdateEvent extends DropEvent {
 
 class DropDoneEvent extends DropEvent {
   final List<DropItem> files;
+  final List<DropError> errors;
 
   DropDoneEvent({
     required Offset location,
     required this.files,
+    this.errors = const [],
   }) : super(location);
 
   @override
   String toString() {
     return '$runtimeType($location, $files)';
   }
+}
+
+class DropError {
+  const DropError({
+    required this.code,
+    required this.message,
+    this.path,
+  });
+
+  final String code;
+  final String message;
+  final String? path;
 }

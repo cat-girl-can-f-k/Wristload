@@ -11,9 +11,11 @@ class DropDoneDetails {
     required this.files,
     required this.localPosition,
     required this.globalPosition,
+    this.errors = const [],
   });
 
   final List<DropItem> files;
+  final List<DropError> errors;
   final Offset localPosition;
   final Offset globalPosition;
 }
@@ -171,6 +173,7 @@ class _DropTargetState extends State<DropTarget> {
       );
       widget.onDragDone?.call(DropDoneDetails(
         files: event.files,
+        errors: event.errors,
         localPosition: position,
         globalPosition: globalPosition,
       ));

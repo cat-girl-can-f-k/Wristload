@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:desktop_multi_window/desktop_multi_window.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
@@ -12,11 +11,11 @@ import 'application/device_controller.dart';
 import 'application/floating_window_coordinator.dart';
 import 'application/theme_controller.dart';
 import 'domain/firmware_package_inspector.dart';
-import 'domain/install_metadata_reader.dart';
 import 'domain/install_models.dart';
 import 'domain/install_preference_store.dart';
 import 'domain/install_task.dart';
 import 'domain/oobe_store.dart';
+import 'domain/queue_file_importer.dart';
 import 'presentation/device_info_page.dart';
 import 'presentation/apps_page.dart';
 import 'presentation/debug_page.dart';
@@ -32,6 +31,8 @@ import 'presentation/oobe_page.dart';
 import 'presentation/queue_page.dart';
 import 'presentation/settings_page.dart';
 import 'presentation/tools_page.dart';
+import 'platform/scoped_file_picker.dart';
+import 'platform/security_scoped_file_access.dart';
 
 Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -157,9 +158,12 @@ class _WristloadAppState extends State<WristloadApp> {
             unawaited(_themeController.setSeed(color));
             unawaited(_floatingWindowCoordinator.updateTheme());
           },
-          onFloatingInstallWindowEnabledChanged: (enabled) {
-            unawaited(_setFloatingInstallWindowEnabled(enabled));
-          },
+          onFloatingInstallWindowEnabledChanged:
+              widget.desktopIntegrationEnabled
+                  ? (enabled) {
+                      unawaited(_setFloatingInstallWindowEnabled(enabled));
+                    }
+                  : null,
         ),
       );
 
@@ -276,9 +280,9 @@ class AppShell extends StatefulWidget {
   final ValueChanged<InstallPreference> onPreferredInstallTargetChanged;
   final Future<void> Function() onReplayOobe;
   final bool floatingInstallWindowEnabled;
-  final ValueChanged<bool> onFloatingInstallWindowEnabledChanged;
   final Color themeSeedColor;
   final ValueChanged<Color> onThemeSeedChanged;
+  final ValueChanged<bool>? onFloatingInstallWindowEnabledChanged;
 
   @override
   State<AppShell> createState() => _AppShellState();
@@ -682,16 +686,18 @@ class HomePage extends StatelessWidget {
   final ValueChanged<InstallPreference> onPreferredInstallTargetChanged;
 
   Future<void> _pickFirmware(BuildContext context) async {
-    final selected = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
+    final selected = await ScopedFilePicker.pickFiles(
       allowedExtensions: const ['zip', 'bin'],
     );
-    final file = selected?.files.single;
+    final file = selected?.single;
     final path = file?.path;
     if (path == null || !context.mounted) return;
 
     try {
-      final inspection = await const FirmwarePackageInspector().inspect(path);
+      final inspection = await SecurityScopedFileAccess.instance.withAccess(
+        file!,
+        (resolved) => const FirmwarePackageInspector().inspect(resolved.path),
+      );
       if (!context.mounted) return;
       await showDialog<void>(
         context: context,
@@ -702,7 +708,7 @@ class HomePage extends StatelessWidget {
       await showDialog<void>(
         context: context,
         builder: (_) => FirmwareInspectionErrorDialog(
-          fileName: file!.name,
+          fileName: path.split(RegExp(r'[/\\]')).last,
           message: error.message.toString(),
         ),
       );
@@ -711,7 +717,7 @@ class HomePage extends StatelessWidget {
       await showDialog<void>(
         context: context,
         builder: (_) => FirmwareInspectionErrorDialog(
-          fileName: file!.name,
+          fileName: path.split(RegExp(r'[/\\]')).last,
           message: '读取固件包时发生错误：$error',
         ),
       );
@@ -721,14 +727,17 @@ class HomePage extends StatelessWidget {
   Future<void> _pickAndTry(BuildContext context, InstallKind kind) async {
     final extensions =
         kind == InstallKind.watchface ? const ['bin', 'face'] : const ['rpk'];
-    final selected = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
+    final selected = await ScopedFilePicker.pickFiles(
       allowedExtensions: extensions,
     );
-    final path = selected?.files.single.path;
-    if (path == null) return;
+    final source = selected?.single;
+    if (source == null) return;
     try {
-      var metadata = await InstallMetadataReader().read(kind, path);
+      final importedRequest = await QueueFileImporter().prepareSingle(
+        source,
+        expectedKind: kind,
+      );
+      var metadata = importedRequest.metadata;
       var unsupportedLuaConfirmed = false;
       var watchfaceResolutionConfirmed = false;
       if (!context.mounted) return;
@@ -766,9 +775,7 @@ class HomePage extends StatelessWidget {
               metadata.versionCode! > maxRpkVersionCode)) {
         throw const FormatException('RPK 清单未提供版本号，请填写有效 32 位正整数版本号');
       }
-      controller.enqueue(InstallRequest(
-        kind: kind,
-        path: path,
+      controller.enqueue(importedRequest.copyWith(
         metadata: metadata,
         unsupportedLuaConfirmed: unsupportedLuaConfirmed,
         watchfaceResolutionConfirmed: watchfaceResolutionConfirmed,

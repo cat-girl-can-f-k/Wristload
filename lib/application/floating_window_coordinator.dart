@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:flutter/material.dart';
@@ -10,6 +11,7 @@ import 'package:window_manager/window_manager.dart';
 
 import '../domain/floating_window_preferences.dart';
 import '../domain/queue_file_importer.dart';
+import '../platform/security_scoped_file_access.dart';
 import 'device_controller.dart';
 import 'floating_install_snapshot_mapper.dart';
 import 'theme_controller.dart';
@@ -152,7 +154,7 @@ class FloatingWindowCoordinator with WindowListener {
         scheduleMicrotask(() => unawaited(_finishFloatingReady()));
         return true;
       case 'addFiles':
-        return _importFiles(_stringList(call.arguments));
+        return _importFiles(_fileRefs(call.arguments));
       case 'retry':
         return _retryFile(call.arguments);
       case 'openMain':
@@ -170,7 +172,7 @@ class FloatingWindowCoordinator with WindowListener {
     }
   }
 
-  Future<Map<String, Object?>> _importFiles(List<String> paths) async {
+  Future<Map<String, Object?>> _importFiles(List<ScopedFileRef> paths) async {
     final result = await _importer.prepare(
       paths,
       existingPaths: controller.installQueue.map((entry) => entry.request.path),
@@ -438,10 +440,20 @@ class FloatingWindowImportNotice {
       };
 }
 
-List<String> _stringList(Object? value) {
-  if (value is Map) value = value['paths'];
+List<ScopedFileRef> _fileRefs(Object? value) {
+  if (value is Map) value = value['files'] ?? value['paths'];
   if (value is! List) return const [];
-  return value.whereType<String>().where((path) => path.isNotEmpty).toList();
+  return value.map((item) {
+    if (item is String) return ScopedFileRef(path: item);
+    if (item is Map && item['path'] is String) {
+      final bookmark = item['bookmark'];
+      return ScopedFileRef(
+        path: item['path'] as String,
+        bookmark: bookmark is Uint8List ? bookmark : null,
+      );
+    }
+    return null;
+  }).whereType<ScopedFileRef>().where((file) => file.path.isNotEmpty).toList();
 }
 
 bool _samePath(String a, String b) =>

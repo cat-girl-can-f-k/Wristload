@@ -1,0 +1,13 @@
+name: wristload_tui
+description: macOS-only terminal backend for Wristload installers.
+publish_to: none
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+dependencies:
+  archive: ^3.6.1
+  console: ^4.1.0
+  crypto: ^3.0.3
+  pointycastle: ^3.9.1
+  wcwidth: ^0.0.4
+dev_dependencies:
+  test: ^1.25.0

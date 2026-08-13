@@ -37,25 +37,6 @@ class DesktopDrop {
     });
   }
 
-  Future<bool> startAccessingSecurityScopedResource(
-      {required Uint8List bookmark}) async {
-    Map<String, dynamic> resultMap = Map();
-    resultMap["apple-bookmark"] = bookmark;
-    final bool? result = await _channel.invokeMethod(
-        "startAccessingSecurityScopedResource", resultMap);
-    if (result == null) return false;
-    return result;
-  }
-
-  Future<bool> stopAccessingSecurityScopedResource(
-      {required Uint8List bookmark}) async {
-    Map<String, dynamic> resultMap = Map();
-    resultMap["apple-bookmark"] = bookmark;
-    final bool result = await _channel.invokeMethod(
-        "stopAccessingSecurityScopedResource", resultMap);
-    return result;
-  }
-
   Future<void> _handleMethodChannel(MethodCall call) async {
     switch (call.method) {
       case "entered":
@@ -97,17 +78,48 @@ class DesktopDrop {
         _offset = null;
         break;
       case "performOperation_macos":
-        // final paths = (call.arguments as List).cast<Map<String?, Object?>>();
-        final paths = call.arguments as List;
+        final payload = call.arguments;
+        final rawItems = payload is Map ? payload['items'] : payload;
+        final rawErrors = payload is Map ? payload['errors'] : null;
+        final files = <DropItem>[];
+        final errors = <DropError>[];
+        if (rawItems is List) {
+          for (final item in rawItems) {
+            if (item is Map && item['path'] is String) {
+              final bookmark = item['apple-bookmark'];
+              if (bookmark is Uint8List && bookmark.isNotEmpty) {
+                files.add(DropItemFile(
+                  item['path'] as String,
+                  extraAppleBookmark: bookmark,
+                ));
+              } else {
+                errors.add(DropError(
+                  code: 'bookmark_missing',
+                  message: 'The dropped file has no macOS authorization.',
+                  path: item['path'] as String,
+                ));
+              }
+            }
+          }
+        }
+        if (rawErrors is List) {
+          for (final item in rawErrors) {
+            if (item is Map &&
+                item['code'] is String &&
+                item['message'] is String) {
+              errors.add(DropError(
+                code: item['code'] as String,
+                message: item['message'] as String,
+                path: item['path'] as String?,
+              ));
+            }
+          }
+        }
         _notifyEvent(
           DropDoneEvent(
             location: _offset ?? Offset.zero,
-            files: paths
-                .map((e) => DropItemFile(
-                      e["path"] as String,
-                      extraAppleBookmark: e["apple-bookmark"] as Uint8List?,
-                    ))
-                .toList(),
+            files: files,
+            errors: errors,
           ),
         );
         _offset = null;

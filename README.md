@@ -4,24 +4,31 @@
 
 ## 当前能力
 
-- Windows 扫描目标设备后自动建立 RFCOMM、完成 L1START 与 authkey 会话；
+- Windows 和 macOS 扫描目标设备后建立 RFCOMM、完成 L1START 与 authkey 会话；
 - 导入 `.bin` 表盘和 `.rpk` 快应用，发送前校验元数据、文件大小与 MD5；
 - 表盘执行预安装、Mass 传输、安装结果与 `setFace(faceId)`；
 - 快应用执行 `20/1` 预安装、Mass `0x40` 传输，并等待匹配包名的 `20/2` 最终结果；
 - 设备 ACK 驱动双层进度条、KB 进度和 KB/s 实际确认速度；
 - 支持本地取消、超时停止、检查点和重连后的源文件一致性检查；
-- Android 已接入 RFCOMM 与安全存储，仍需目标设备真机验收；Linux 仅保留明确的不支持提示。
+- Android 已接入 RFCOMM 与安全存储，仍需目标设备真机验收；macOS 已接入
+  CoreBluetooth 扫描、IOBluetooth SPP、Keychain 和沙盒文件授权，仍需目标设备真机安装验收；
+  Linux 仅保留明确的不支持提示。
 
 ## 环境
 
-需要 Flutter 3.22+、Dart 3.3+ 和各平台开发工具。安装 SDK 后，在本目录运行：
+需要内置 Dart 3.9.2+ 的 Flutter stable 和各平台开发工具（当前已验证
+Flutter 3.44.8 / Dart 3.12.2）。安装 SDK 后，在本目录运行：
 
-```powershell
+```shell
 flutter pub get
 flutter run -d windows
+flutter run -d macos
 ```
 
 Android 原生工程已生成，最低 SDK 需保持为 21+，并已声明附近设备/蓝牙扫描/连接权限。不要让 Flutter 模板重新生成时覆盖 `lib/` 或 `pubspec.yaml`。
+macOS 最低版本为 10.15。首次连接前需在系统蓝牙设置中完成配对；应用会通过设备广播名将
+CoreBluetooth 标识映射到已配对的经典蓝牙设备。广播名不唯一时会拒绝猜测，避免连接到错误设备。
+发布构建可使用 `flutter build macos --release`。
 
 当前工作站验证状态（2026-08-10）：
 
@@ -31,13 +38,16 @@ Android 原生工程已生成，最低 SDK 需保持为 21+，并已声明附近
 - n67cn（小米手环 9 Pro）已真机确认 RFCOMM → L1START → `sendAppVerify` →
   `sendAppConfirm` → `device ready`，以及表盘 Mass 传输；
 - 快应用控制命令、Mass `0x40` 和最终 `20/2` 数据结构已实现，等待本版真机安装验收；
+- macOS Runner、蓝牙/文件沙盒权限、Keychain、系统时间、SPP/RFCOMM 与
+  security-scoped bookmark 恢复链路已实现；尚未在 Mac + 目标手环上完成端到端安装验收；
 - 小米手环 7 Pro 已确认属于 Huami/Zepp 独立协议，小米手环 8 Pro 属于旧 Vela V1；二者均与当前 V2 安装链路隔离，详见 [`文档/经典设备协议差异.md`](文档/经典设备协议差异.md)；
 - 逆向工具链（便携 JDK 21 + JADX 1.4.7）与反编译产物在 `项目目录/tools/`，不纳入仓库。
 
 
 ## 分层
 
-- `lib/platform/`：基于 `bluetooth_low_energy` 的真实 BLE 传输（Windows 优先）；
+- `lib/platform/`：基于 `bluetooth_low_energy` 的 BLE 传输，以及各平台 RFCOMM、
+  安全存储、系统时间和沙盒文件桥接；
 - `lib/domain/`：设备档案、安装任务和协议边界；
 - `lib/domain/protocol/`：私有协议核心（逆向确认的帧与命令，独立实现）；
 - `lib/application/`：状态控制器；

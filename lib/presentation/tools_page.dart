@@ -1,11 +1,12 @@
 import 'dart:io';
-
-import 'package:file_picker/file_picker.dart';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../application/device_controller.dart';
 import '../domain/device_tools.dart';
+import '../platform/scoped_file_picker.dart';
+import '../platform/security_scoped_file_access.dart';
 
 class ToolsPage extends StatefulWidget {
   const ToolsPage({required this.controller, super.key});
@@ -21,7 +22,8 @@ class _ToolsPageState extends State<ToolsPage> {
 
   final _snController = TextEditingController();
   final _macController = TextEditingController();
-  PlatformFile? _zipFile;
+  ScopedFileRef? _zipFile;
+  int? _zipFileSize;
   String? _authKey;
   bool _authKeyRevealed = false;
   String? _authError;
@@ -37,25 +39,42 @@ class _ToolsPageState extends State<ToolsPage> {
   }
 
   Future<void> _pickZip() async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: const ['zip'],
-      withData: true,
-    );
-    if (!mounted || result == null || result.files.isEmpty) return;
+    final result =
+        await ScopedFilePicker.pickFiles(allowedExtensions: const ['zip']);
+    if (!mounted || result == null || result.isEmpty) return;
     setState(() {
-      _zipFile = result.files.single;
+      _zipFile = result.single;
+      _zipFileSize = null;
       _authKey = null;
       _authKeyRevealed = false;
       _authError = null;
     });
   }
 
-  Future<Uint8List?> _readZip(PlatformFile file) async {
-    if (file.bytes != null) return file.bytes;
-    final path = file.path;
-    if (path == null) return null;
-    return Uint8List.fromList(await File(path).readAsBytes());
+  Future<Uint8List> _readZip(ScopedFileRef file) async {
+    final lease = await SecurityScopedFileAccess.instance.acquire(file);
+    try {
+      // Keep the native-resolved path and any refreshed bookmark for retries.
+      // Do not overwrite a newer selection made while acquisition was pending.
+      if (identical(_zipFile, file)) {
+        _zipFile = lease.file;
+      }
+      final bytes = await File(lease.file.path).readAsBytes();
+      if (identical(_zipFile, lease.file)) {
+        _zipFileSize = bytes.length;
+      }
+      return bytes;
+    } finally {
+      try {
+        await lease.close();
+      } on Object catch (cleanupError) {
+        // Scope release is cleanup; preserve bytes already read and avoid
+        // exposing paths or opaque bookmark contents in diagnostics.
+        debugPrint('工具文件访问权限释放失败（' +
+            cleanupError.runtimeType.toString() +
+            '）。');
+      }
+    }
   }
 
   Future<void> _extractAuthKey() async {
@@ -68,7 +87,6 @@ class _ToolsPageState extends State<ToolsPage> {
     });
     try {
       final bytes = await _readZip(file);
-      if (bytes == null) throw const FormatException('无法读取 ZIP 文件');
       final candidates = extractAuthKeysFromZip(bytes);
       if (candidates.isEmpty) {
         throw const FormatException('未找到 32 位 authkey');
@@ -164,11 +182,12 @@ class _ToolsPageState extends State<ToolsPage> {
                                   const SizedBox(width: 10),
                                   Expanded(
                                     child: Text(
-                                      _zipFile!.name,
+                                      _zipFileName(_zipFile!.path),
                                       overflow: TextOverflow.ellipsis,
                                     ),
                                   ),
-                                  Text(_formatSize(_zipFile!.size)),
+                                  if (_zipFileSize case final size?)
+                                    Text(_formatSize(size)),
                                   TextButton(
                                       onPressed: _pickZip,
                                       child: const Text('重新选择')),
@@ -448,3 +467,5 @@ String _formatSize(int bytes) {
   }
   return '${(bytes / 1024).toStringAsFixed(1)} KB';
 }
+
+String _zipFileName(String path) => path.split(RegExp(r'[/\]')).last;
