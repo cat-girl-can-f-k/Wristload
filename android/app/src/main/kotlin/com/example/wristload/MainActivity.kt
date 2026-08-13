@@ -74,6 +74,36 @@ class MainActivity : FlutterActivity() {
                         .commit()) { "Unable to persist secure value" }
                     result.success(null)
                 }
+                "readFor" -> {
+                    val id = call.arguments as? String
+                        ?: throw IllegalArgumentException("Missing device id")
+                    result.success(preferences.getString(deviceAuthKeyPreference(id), null)?.let {
+                        decryptAuthKey(it, wristloadAuthKeyAlias)
+                    })
+                }
+                "writeFor" -> {
+                    val args = call.arguments as? Map<*, *>
+                        ?: throw IllegalArgumentException("Missing device authkey arguments")
+                    val id = args["id"] as? String
+                        ?: throw IllegalArgumentException("Missing device id")
+                    val value = args["value"] as? String
+                        ?: throw IllegalArgumentException("Missing authkey value")
+                    require(Regex("^[0-9a-fA-F]{32}$").matches(value)) {
+                        "Authkey must be 32 hexadecimal characters"
+                    }
+                    check(preferences.edit()
+                        .putString(deviceAuthKeyPreference(id), encryptAuthKey(value))
+                        .commit()) { "Unable to persist device authkey" }
+                    result.success(null)
+                }
+                "deleteFor" -> {
+                    val id = call.arguments as? String
+                        ?: throw IllegalArgumentException("Missing device id")
+                    check(preferences.edit().remove(deviceAuthKeyPreference(id)).commit()) {
+                        "Unable to remove device authkey"
+                    }
+                    result.success(null)
+                }
                 "delete" -> {
                     val legacyPreferences =
                         getSharedPreferences(legacySecurePreferences, MODE_PRIVATE)
@@ -89,6 +119,12 @@ class MainActivity : FlutterActivity() {
         } catch (error: Exception) {
             result.error("secure_store", error.message, null)
         }
+    }
+
+    private fun deviceAuthKeyPreference(id: String): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(id.toByteArray())
+        return "authkey_device_" + digest.joinToString("") { "%02x".format(it) }
     }
 
     private fun readAuthKey(preferences: android.content.SharedPreferences): String? {

@@ -7,10 +7,12 @@ import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 
 import '../domain/device_profile.dart';
+import '../domain/auth_key_binding.dart';
 import '../domain/connection_issue.dart';
 import '../domain/install_models.dart';
 import '../domain/install_checkpoint_store.dart';
 import '../domain/install_task.dart';
+import '../domain/watch_app.dart';
 import '../domain/mass_ack_idle_timeout.dart';
 import '../domain/transfer_settings_store.dart';
 import '../domain/protocol/auth_handshake.dart';
@@ -32,6 +34,7 @@ class DeviceController extends ChangeNotifier {
   DeviceController({BleTransport? transport})
       : _transport = transport ?? BleTransport() {
     unawaited(_restoreAuthKey());
+    unawaited(_restoreAuthKeyBindings());
     _transferSettingsReady = _restoreTransferSettings();
   }
 
@@ -61,6 +64,9 @@ class DeviceController extends ChangeNotifier {
   /// 设备存储（字节），null 表示未取到。
   int? storageUsedBytes;
   int? storageTotalBytes;
+  List<WatchAppItem> installedWatchApps = const [];
+  bool watchAppsLoading = false;
+  String? watchAppsError;
   int _sessionEpoch = 0;
   int? _statusRefreshEpoch;
 
@@ -282,12 +288,14 @@ class DeviceController extends ChangeNotifier {
   /// authkey（绑定 token，32 位 hex = 16 字节）。连接前由 UI 弹窗输入。
   /// 校验规则：32 位十六进制字符。协议验证通过前只保存、不发送鉴权帧。
   String? authKey;
+  List<AuthKeyBinding> authKeyBindings = const [];
 
   /// 运行日志（时间戳 + 消息），供真机验证时观察 BLE/协议行为。
   List<String> logs = const [];
 
   static final RegExp _authKeyPattern = RegExp(r'^[0-9a-fA-F]{32}$');
   static final _secureStorage = AuthKeyStore();
+  static final _authKeyBindingStore = AuthKeyBindingStore();
   static final _transferSettings = TransferSettingsStore();
 
   /// Delay between consecutive Mass writes. The negotiated L1 receive window
@@ -359,6 +367,49 @@ class DeviceController extends ChangeNotifier {
   bool get isScanning => _isScanning;
 
   bool get hasAuthKey => authKey != null;
+
+  Future<void> _restoreAuthKeyBindings() async {
+    try {
+      authKeyBindings = await _authKeyBindingStore.read();
+      notifyListeners();
+    } on Object {
+      _log('无法读取历史绑定设备列表');
+    }
+  }
+
+  Future<String?> readAuthKeyFor(String id) async {
+    try {
+      return await _secureStorage.readFor(id);
+    } on Object {
+      return null;
+    }
+  }
+
+  Future<void> rememberAuthKeyBinding({
+    required String id,
+    required String name,
+    required String key,
+  }) async {
+    final normalized = key.trim().toLowerCase();
+    if (!_authKeyPattern.hasMatch(normalized)) return;
+    try {
+      await _secureStorage.writeFor(id, normalized);
+    } on Object {
+      // Keep metadata even when platform secure storage is unavailable.
+    }
+    final next = [
+      ...authKeyBindings.where((binding) => binding.id != id),
+      AuthKeyBinding(
+        id: id,
+        name: name,
+        uuid: id,
+        updatedAt: DateTime.now(),
+      ),
+    ]..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    authKeyBindings = next;
+    await _authKeyBindingStore.write(next);
+    notifyListeners();
+  }
 
   bool get installInProgress => _installInProgress;
 
@@ -1469,6 +1520,106 @@ class DeviceController extends ChangeNotifier {
       cancellation.complete();
     }
     _log('已停止本地安装队列；未发送未验证的设备取消命令。');
+  }
+
+  bool _debugInstallInProgress = false;
+  bool debugCleanupPolling = false;
+  DebugCleanupReport? debugCleanupReport;
+  String? debugError;
+
+  bool get debugInstallInProgress => _debugInstallInProgress;
+
+  Future<void> startDebugInstall(InstallRequest request) async {
+    if (_debugInstallInProgress) return;
+    _debugInstallInProgress = true;
+    debugError = null;
+    debugCleanupReport = null;
+    notifyListeners();
+    try {
+      await startInstall(request);
+    } on Object catch (exception) {
+      debugError = exception.toString();
+    } finally {
+      _debugInstallInProgress = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> cancelDebugInstall() async {
+    await cancelInstall();
+  }
+
+  /// Reads the installed quick-app list from the authenticated device.
+  Future<List<WatchAppItem>> refreshInstalledWatchApps() async {
+    if (watchAppsLoading) return installedWatchApps;
+    if (!sessionReady || _sessionCipher == null) {
+      watchAppsError = '请先完成设备鉴权';
+      notifyListeners();
+      return installedWatchApps;
+    }
+    watchAppsLoading = true;
+    watchAppsError = null;
+    notifyListeners();
+    try {
+      final response = await _requestBusiness(
+        Zau(command: ZauCommand.appList, sub: ZauCommand.appListSub),
+        ZauCommand.appList,
+        ZauCommand.appListSub,
+      );
+      final payload = response.payload;
+      if (payload == null || payload.$1 != 22) {
+        throw const FormatException('设备快应用列表缺少 v8s 载荷');
+      }
+      installedWatchApps = List<WatchAppItem>.unmodifiable(
+        V8s.parseInstalledApps(payload.$2),
+      );
+      return installedWatchApps;
+    } on Object catch (exception) {
+      watchAppsError = '读取快应用列表失败：$exception';
+      _log(watchAppsError!);
+      return installedWatchApps;
+    } finally {
+      watchAppsLoading = false;
+      notifyListeners();
+    }
+  }
+
+  Future<bool> uninstallWatchApp(WatchAppItem app) async {
+    if (!app.canRemove || watchAppsLoading) return false;
+    if (!sessionReady || _sessionCipher == null) {
+      watchAppsError = '请先完成设备鉴权';
+      notifyListeners();
+      return false;
+    }
+    watchAppsLoading = true;
+    watchAppsError = null;
+    notifyListeners();
+    try {
+      await _requestBusiness(
+        Zau(
+          command: ZauCommand.appList,
+          sub: ZauCommand.uninstallAppSub,
+          payload: V8s.uninstallRequest(
+            packageName: app.packageName,
+            fingerprint: app.fingerprint,
+          ),
+        ),
+        ZauCommand.appList,
+        ZauCommand.uninstallAppSub,
+      );
+      // Release the in-flight flag before re-querying; otherwise the refresh
+      // is treated as a duplicate request and returns the stale list.
+      watchAppsLoading = false;
+      await refreshInstalledWatchApps();
+      return true;
+    } on Object catch (exception) {
+      watchAppsError = '卸载快应用失败：$exception';
+      _log(watchAppsError!);
+      return false;
+    } finally {
+      watchAppsLoading = false;
+      notifyListeners();
+    }
   }
 
   /// 只校验本地检查点和源文件；没有设备侧状态查询证据时绝不自行续传。

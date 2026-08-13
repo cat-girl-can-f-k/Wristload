@@ -21,6 +21,7 @@ class TransferSettingsPage extends StatelessWidget {
     this.onFloatingInstallWindowEnabledChanged,
     this.onReplayOobe,
     this.onThemeSeedChanged,
+    this.onEditAuthKey,
     required this.onPreferredInstallTargetChanged,
     super.key,
   });
@@ -40,6 +41,7 @@ class TransferSettingsPage extends StatelessWidget {
   final ValueChanged<bool>? onFloatingInstallWindowEnabledChanged;
   final VoidCallback? onReplayOobe;
   final ValueChanged<Color>? onThemeSeedChanged;
+  final VoidCallback? onEditAuthKey;
   final ValueChanged<InstallPreference> onPreferredInstallTargetChanged;
 
   @override
@@ -60,7 +62,6 @@ class TransferSettingsPage extends StatelessWidget {
               value: themeSeedColor,
               onChanged: onThemeSeedChanged,
             ),
-            const Divider(height: 40),
             InstallPreferenceSelector(
               value: preferredInstallTarget,
               onChanged: onPreferredInstallTargetChanged,
@@ -93,6 +94,16 @@ class TransferSettingsPage extends StatelessWidget {
               trailing: const Icon(Icons.chevron_right),
               enabled: onReplayOobe != null,
               onTap: onReplayOobe,
+            ),
+            const Divider(height: 40),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.vpn_key_outlined),
+              title: const Text('修改绑定设备 authkey'),
+              subtitle: const Text('查看历史绑定设备并修改 Wristload 当前使用的 authkey'),
+              trailing: const Icon(Icons.chevron_right),
+              enabled: onEditAuthKey != null,
+              onTap: onEditAuthKey,
             ),
             const Divider(height: 40),
             Text('传输', style: theme.textTheme.titleMedium),

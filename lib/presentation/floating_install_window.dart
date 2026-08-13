@@ -277,8 +277,7 @@ class _IdleContent extends StatelessWidget {
               height: 8,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                color:
-                    snapshot.connected ? const Color(0xFF2E7D32) : colors.error,
+                color: snapshot.connected ? colors.primary : colors.error,
               ),
             ),
             const SizedBox(width: 6),

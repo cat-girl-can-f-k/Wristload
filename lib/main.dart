@@ -18,6 +18,8 @@ import 'domain/install_preference_store.dart';
 import 'domain/install_task.dart';
 import 'domain/oobe_store.dart';
 import 'presentation/device_info_page.dart';
+import 'presentation/apps_page.dart';
+import 'presentation/debug_page.dart';
 import 'presentation/connection_warning_dialog.dart';
 import 'presentation/firmware_inspection_dialog.dart';
 import 'presentation/floating_install_window_app.dart';
@@ -247,8 +249,10 @@ class _WristloadAppState extends State<WristloadApp> {
             '/': (context) => _buildAppShell(),
             '/oobe': (context) => _buildOobePage(),
             '/device-info': (context) => DeviceInfoPage(controller: controller),
+            '/apps': (context) => AppsPage(controller: controller),
             '/queue': (context) => QueuePage(controller: controller),
             '/tools': (context) => ToolsPage(controller: controller),
+            '/debug': (context) => DebugPage(controller: controller),
           },
         ),
       );
@@ -345,6 +349,7 @@ class _AppShellState extends State<AppShell> {
         context: context,
         issue: issue,
         onReconnect: widget.controller.reconnect,
+        onChangeAuthKey: () => _editAuthKey(showHistory: false),
       );
     } finally {
       widget.controller.dismissConnectionIssue(issueId);
@@ -358,6 +363,72 @@ class _AppShellState extends State<AppShell> {
     setState(() => _selectedIndex = 0);
   }
 
+  Future<void> _editAuthKey({bool showHistory = true}) async {
+    if (!mounted) return;
+    final controller = widget.controller;
+    String? selectedId;
+    if (showHistory && controller.authKeyBindings.isNotEmpty) {
+      selectedId = await showDialog<String>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('历史绑定设备'),
+          content: SizedBox(
+            width: 420,
+            child: ListView(
+              shrinkWrap: true,
+              children: controller.authKeyBindings
+                  .map((binding) => ListTile(
+                        leading: const Icon(Icons.watch_outlined),
+                        title: Text(binding.name),
+                        subtitle: Text(binding.uuid),
+                        trailing: const Icon(Icons.chevron_right),
+                        onTap: () =>
+                            Navigator.of(dialogContext).pop(binding.id),
+                      ))
+                  .toList(growable: false),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('取消'),
+            ),
+          ],
+        ),
+      );
+      if (selectedId == null) return;
+    }
+    selectedId ??= controller.connectedDevice?.uuid.toString();
+    if (selectedId == null || !mounted) return;
+    String? selectedName;
+    for (final binding in controller.authKeyBindings) {
+      if (binding.id == selectedId) selectedName = binding.name;
+    }
+    final initial = !showHistory
+        ? null
+        : selectedId == controller.connectedDevice?.uuid.toString()
+            ? controller.authKey
+            : await controller.readAuthKeyFor(selectedId);
+    if (!mounted) return;
+    final value = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => _AuthKeyEditDialog(
+        deviceName: selectedName,
+        initialValue: initial,
+      ),
+    );
+    if (value == null) return;
+    if (!await controller.setAuthKey(value)) return;
+    final name = selectedName ??
+        controller.connectedDeviceName ??
+        controller.connectedProfile?.displayName ??
+        '当前设备';
+    await controller.rememberAuthKeyBinding(
+        id: selectedId, name: name, key: value);
+    if (controller.isConnected) await controller.reconnect();
+  }
+
   @override
   void dispose() {
     widget.controller.removeListener(_handleConnectionIssue);
@@ -367,7 +438,7 @@ class _AppShellState extends State<AppShell> {
   @override
   Widget build(BuildContext context) => Scaffold(
         appBar: AppBar(
-          title: const Text('Wristload'),
+          title: _GlobalConnectionStatus(controller: widget.controller),
         ),
         body: SafeArea(
           child: Row(
@@ -397,9 +468,19 @@ class _AppShellState extends State<AppShell> {
                     label: const Text('队列'),
                   ),
                   const NavigationRailDestination(
+                    icon: Icon(Icons.apps_outlined),
+                    selectedIcon: Icon(Icons.apps),
+                    label: Text('快应用'),
+                  ),
+                  const NavigationRailDestination(
                     icon: Icon(Icons.build_outlined),
                     selectedIcon: Icon(Icons.build),
                     label: Text('工具'),
+                  ),
+                  const NavigationRailDestination(
+                    icon: Icon(Icons.bug_report_outlined),
+                    selectedIcon: Icon(Icons.bug_report),
+                    label: Text('调试'),
                   ),
                   const NavigationRailDestination(
                     icon: Icon(Icons.settings_outlined),
@@ -418,7 +499,9 @@ class _AppShellState extends State<AppShell> {
                           widget.onPreferredInstallTargetChanged,
                     ),
                   1 => QueuePage(controller: widget.controller),
-                  2 => ToolsPage(controller: widget.controller),
+                  2 => AppsPage(controller: widget.controller),
+                  3 => ToolsPage(controller: widget.controller),
+                  4 => DebugPage(controller: widget.controller),
                   _ => TransferSettingsPage(
                       preferredInstallTarget: widget.preferredInstallTarget,
                       connectionMode: widget.controller.connectionMode,
@@ -442,6 +525,7 @@ class _AppShellState extends State<AppShell> {
                       onPreferredInstallTargetChanged:
                           widget.onPreferredInstallTargetChanged,
                       onReplayOobe: widget.onReplayOobe,
+                      onEditAuthKey: _editAuthKey,
                     ),
                 },
               ),
@@ -449,6 +533,140 @@ class _AppShellState extends State<AppShell> {
           ),
         ),
       );
+}
+
+class _GlobalConnectionStatus extends StatelessWidget {
+  const _GlobalConnectionStatus({required this.controller});
+
+  final DeviceController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final connected = controller.isConnected;
+    final deviceName = (controller.connectedDeviceName ??
+            controller.connectedProfile?.displayName ??
+            '')
+        .trim();
+    final label =
+        connected ? (deviceName.isEmpty ? '已连接设备' : deviceName) : '设备未连接';
+
+    return Row(
+      key: const ValueKey('global-connection-status'),
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        const Text('Wristload'),
+        const SizedBox(width: 16),
+        Container(
+          key: const ValueKey('global-connection-status-dot'),
+          width: 8,
+          height: 8,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: connected ? colors.primary : colors.error,
+          ),
+        ),
+        const SizedBox(width: 7),
+        Flexible(
+          child: Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                  color: colors.onSurfaceVariant,
+                ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _AuthKeyEditDialog extends StatefulWidget {
+  const _AuthKeyEditDialog({
+    required this.deviceName,
+    required this.initialValue,
+  });
+
+  final String? deviceName;
+  final String? initialValue;
+
+  @override
+  State<_AuthKeyEditDialog> createState() => _AuthKeyEditDialogState();
+}
+
+class _AuthKeyEditDialogState extends State<_AuthKeyEditDialog> {
+  late final TextEditingController _field;
+  final _formKey = GlobalKey<FormState>();
+
+  @override
+  void initState() {
+    super.initState();
+    _field = TextEditingController(text: widget.initialValue ?? '');
+  }
+
+  @override
+  void dispose() {
+    _field.dispose();
+    super.dispose();
+  }
+
+  void _save() {
+    if (_formKey.currentState?.validate() ?? false) {
+      Navigator.of(context).pop(_field.text.trim());
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+        title: Text(
+          widget.deviceName == null
+              ? '修改设备 authkey'
+              : '修改 ${widget.deviceName} authkey',
+        ),
+        content: Form(
+          key: _formKey,
+          child: TextFormField(
+            controller: _field,
+            autofocus: true,
+            selectAllOnFocus: false,
+            maxLength: 32,
+            autocorrect: false,
+            enableSuggestions: false,
+            decoration: const InputDecoration(
+              labelText: 'authkey',
+              hintText: '32 位十六进制',
+              counterText: '',
+              border: OutlineInputBorder(),
+            ),
+            validator: (text) =>
+                RegExp(r'^[0-9a-fA-F]{32}$').hasMatch(text?.trim() ?? '')
+                    ? null
+                    : '请输入 32 位十六进制字符',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: _save,
+            child: const Text('保存'),
+          ),
+        ],
+      );
+}
+
+/// Exposes the authkey editor to widget tests without making its state public.
+Widget buildAuthKeyEditDialogForTesting({
+  String? deviceName,
+  String? initialValue,
+}) {
+  return _AuthKeyEditDialog(
+    deviceName: deviceName,
+    initialValue: initialValue,
+  );
 }
 
 class HomePage extends StatelessWidget {
@@ -779,6 +997,13 @@ class HomePage extends StatelessWidget {
       textController.dispose();
     }
     if (input != null && await controller.setAuthKey(input)) {
+      await controller.rememberAuthKeyBinding(
+        id: result.peripheral.uuid.toString(),
+        name: result.advertisement.name?.trim().isNotEmpty == true
+            ? result.advertisement.name!.trim()
+            : controller.connectedProfile?.displayName ?? '当前设备',
+        key: input,
+      );
       await controller.connect(result);
     }
   }

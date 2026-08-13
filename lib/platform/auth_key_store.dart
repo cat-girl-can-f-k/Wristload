@@ -24,5 +24,23 @@ class AuthKeyStore {
     await _channel.invokeMethod<void>('delete');
   }
 
+  Future<String?> readFor(String id) {
+    if (!_supported) return Future.value(null);
+    return _channel.invokeMethod<String>('readFor', id);
+  }
+
+  Future<void> writeFor(String id, String value) async {
+    if (!_supported) return;
+    await _channel.invokeMethod<void>('writeFor', <String, String>{
+      'id': id,
+      'value': value,
+    });
+  }
+
+  Future<void> deleteFor(String id) async {
+    if (!_supported) return;
+    await _channel.invokeMethod<void>('deleteFor', id);
+  }
+
   bool get _supported => Platform.isWindows || Platform.isAndroid;
 }

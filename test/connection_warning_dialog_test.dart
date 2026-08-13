@@ -47,6 +47,14 @@ void main() {
       tracker.authenticated();
       expect(tracker.recordUnexpectedDisconnect(), isTrue);
     });
+
+    test('RFCOMM 建链超时只发布一次专用提示', () {
+      final tracker = ConnectionIssueTracker();
+
+      expect(tracker.recordRfcommTimeout(), isTrue);
+      expect(tracker.pending?.kind, ConnectionIssueKind.rfcommTimeout);
+      expect(tracker.recordRfcommTimeout(), isFalse);
+    });
   });
 
   testWidgets('无法连接弹窗倒计时期间禁止按钮和 Esc 关闭', (tester) async {
@@ -122,6 +130,35 @@ void main() {
     reconnect.complete();
     await tester.pumpAndSettle();
     expect(find.text('您的设备似乎意外断开了'), findsNothing);
+    await dialog;
+  });
+
+  testWidgets('RFCOMM 超时提示使用两秒阅读锁和确认按钮', (tester) async {
+    await tester.pumpWidget(const MaterialApp(home: Scaffold()));
+
+    final dialog = showRfcommTimeoutWarning(
+      context: tester.element(find.byType(Scaffold)),
+    );
+    await tester.pump();
+
+    expect(find.text('您的设备暂时无法被连接'), findsOneWidget);
+    expect(find.text('请将设备切换至连接新手机模式重试'), findsOneWidget);
+    expect(find.text('确认（2）'), findsOneWidget);
+    expect(
+      tester.widget<FilledButton>(find.byType(FilledButton)).onPressed,
+      isNull,
+    );
+
+    await tester.pump(const Duration(seconds: 2));
+    await tester.pump();
+    expect(find.text('确认'), findsOneWidget);
+    expect(
+      tester.widget<FilledButton>(find.byType(FilledButton)).onPressed,
+      isNotNull,
+    );
+    await tester.tap(find.text('确认'));
+    await tester.pumpAndSettle();
+    expect(find.text('您的设备暂时无法被连接'), findsNothing);
     await dialog;
   });
 }

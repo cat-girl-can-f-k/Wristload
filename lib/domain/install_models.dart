@@ -171,3 +171,25 @@ class QueueEntry {
   /// offset, rather than silently dropping the item after a fixed attempt cap.
   bool get canRetry => isFailure;
 }
+
+/// Result of the debug cleanup probe that follows a cancelled installation.
+/// The device reports status 1 while it is still disposing the previous
+/// transfer; the probe stops at the first different status.
+class DebugCleanupReport {
+  const DebugCleanupReport({
+    required this.startedAt,
+    required this.finishedAt,
+    required this.pollCount,
+    required this.finalStatus,
+    this.error,
+  });
+
+  final DateTime startedAt;
+  final DateTime finishedAt;
+  final int pollCount;
+  final int? finalStatus;
+  final String? error;
+
+  Duration get elapsed => finishedAt.difference(startedAt);
+  bool get completed => error == null;
+}

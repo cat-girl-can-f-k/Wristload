@@ -1,4 +1,9 @@
-enum ConnectionIssueKind { unexpectedDisconnect, connectionUnavailable }
+enum ConnectionIssueKind {
+  unexpectedDisconnect,
+  connectionUnavailable,
+  rfcommTimeout,
+  authKeyMismatch,
+}
 
 class ConnectionIssue {
   const ConnectionIssue({required this.id, required this.kind});
@@ -18,6 +23,7 @@ class ConnectionIssueTracker {
   int? _unexpectedNoticeSession;
   int _consecutivePortConflicts = 0;
   bool _portConflictNoticeIssued = false;
+  bool _authKeyMismatchNoticeIssued = false;
   String? _targetId;
   final List<ConnectionIssue> _pending = [];
 
@@ -38,6 +44,19 @@ class ConnectionIssueTracker {
   }
 
   void connectionSucceeded() => _resetConnectionFailures();
+
+  bool recordAuthKeyMismatch() {
+    if (_authKeyMismatchNoticeIssued ||
+        _pending.any((issue) => issue.kind == ConnectionIssueKind.authKeyMismatch)) {
+      return false;
+    }
+    _authKeyMismatchNoticeIssued = true;
+    _pending.add(ConnectionIssue(
+      id: _nextId++,
+      kind: ConnectionIssueKind.authKeyMismatch,
+    ));
+    return true;
+  }
 
   bool recordConnectionFailure(Object error) {
     if (!isPortBindingConflict(error)) {
@@ -69,6 +88,17 @@ class ConnectionIssueTracker {
     return true;
   }
 
+  bool recordRfcommTimeout() {
+    if (_pending.any((issue) => issue.kind == ConnectionIssueKind.rfcommTimeout)) {
+      return false;
+    }
+    _pending.add(ConnectionIssue(
+      id: _nextId++,
+      kind: ConnectionIssueKind.rfcommTimeout,
+    ));
+    return true;
+  }
+
   bool acknowledge(int id) {
     final removed = _pending.length;
     _pending.removeWhere((issue) => issue.id == id);
@@ -93,5 +123,6 @@ class ConnectionIssueTracker {
   void _resetConnectionFailures() {
     _consecutivePortConflicts = 0;
     _portConflictNoticeIssued = false;
+    _authKeyMismatchNoticeIssued = false;
   }
 }

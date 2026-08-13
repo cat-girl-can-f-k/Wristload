@@ -18,10 +18,17 @@
 /// int 编码按 [IntEncoding]（见 proto_wire.dart 顶部说明，待真机验证）。
 library;
 
+import 'dart:typed_data';
+
+import '../watch_app.dart';
 import 'proto_wire.dart';
 
 /// 表盘 / RPK / Mass 命令号（zau.e）。
 abstract final class ZauCommand {
+  static const int appList = 20;
+  static const int appListSub = 0;
+  static const int uninstallAppSub = 3;
+
   /// Device basic-status requests. Battery is sub-command 1 and storage is
   /// sub-command 62.
   static const int basicStatus = 2;
@@ -314,6 +321,73 @@ abstract final class A9u {
 
 /// RPK 载荷 v8s（zau oneof field 22）。
 abstract final class V8s {
+  /// command=20/sub=3 carries v8s.field5=o8s.
+  static (int, List<int>) uninstallRequest({
+    required String packageName,
+    required List<int> fingerprint,
+  }) {
+    if (packageName.trim().isEmpty) {
+      throw ArgumentError.value(
+          packageName, 'packageName', 'must not be empty');
+    }
+    final app = ProtoWriter()
+      ..writeString(1, packageName)
+      ..writeBytes(2, fingerprint);
+    final v8s = ProtoWriter()..writeMessage(5, app.bytes);
+    return (22, v8s.bytes);
+  }
+
+  /// Parses v8s.field1=m8s[] from command=20/sub=0.
+  static List<WatchAppItem> parseInstalledApps(List<int> data) {
+    final apps = <WatchAppItem>[];
+    final outer = ProtoReader(data);
+    while (!outer.isAtEnd) {
+      final (field, wire) = outer.readFieldHeader();
+      if (field == 1 && wire == 2) {
+        apps.add(_parseInstalledApp(outer.readBytes()));
+      } else {
+        outer.skipField(wire);
+      }
+    }
+    return apps;
+  }
+
+  static WatchAppItem _parseInstalledApp(List<int> data) {
+    final reader = ProtoReader(data);
+    var packageName = '';
+    var fingerprint = Uint8List(0);
+    var versionCode = 0;
+    var canRemove = false;
+    var appName = '';
+    while (!reader.isAtEnd) {
+      final (field, wire) = reader.readFieldHeader();
+      switch ((field, wire)) {
+        case (1, 2):
+          packageName = reader.readString();
+        case (2, 2):
+          fingerprint = Uint8List.fromList(reader.readBytes());
+        case (3, 0):
+          versionCode = reader.readVarint();
+        case (4, 0):
+          canRemove = reader.readVarint() != 0;
+        case (5, 2):
+          appName = reader.readString();
+        default:
+          reader.skipField(wire);
+      }
+    }
+    if (packageName.isEmpty) {
+      throw const FormatException('设备快应用列表缺少包名');
+    }
+    return WatchAppItem(
+      packageName: packageName,
+      fingerprint: fingerprint,
+      versionCode: versionCode,
+      canRemove: canRemove,
+      appName: appName,
+    );
+  }
+
   static (int, List<int>) prepareRequest({
     required String packageName,
     required int versionCode,

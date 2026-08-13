@@ -50,7 +50,23 @@ std::filesystem::path LegacyAuthKeyPath() {
   return LocalAppDataPath() / L"MiWearableInstallTool" / L"authkey.dpapi";
 }
 
-void WriteProtectedAuthKey(const std::string& value) {
+std::filesystem::path AuthKeyPathFor(const std::string& id) {
+  std::wstring safe;
+  for (const unsigned char character : id) {
+    const bool valid = (character >= 'a' && character <= 'z') ||
+                       (character >= 'A' && character <= 'Z') ||
+                       (character >= '0' && character <= '9') ||
+                       character == '-' || character == '_';
+    safe.push_back(valid ? static_cast<wchar_t>(character) : L'_');
+  }
+  if (safe.empty()) safe = L"unknown";
+  const auto directory = LocalAppDataPath() / L"Wristload";
+  std::filesystem::create_directories(directory);
+  return directory / (L"authkey_" + safe + L".dpapi");
+}
+
+void WriteProtectedAuthKeyAt(const std::string& value,
+                             const std::filesystem::path& path) {
   if (!IsValidAuthKey(value)) {
     throw std::runtime_error("Authkey must be 32 hexadecimal characters");
   }
@@ -61,11 +77,15 @@ void WriteProtectedAuthKey(const std::string& value) {
                         CRYPTPROTECT_UI_FORBIDDEN, &protected_data)) {
     throw std::runtime_error("Windows DPAPI encryption failed");
   }
-  const auto path = AuthKeyPath();
+  std::filesystem::create_directories(path.parent_path());
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
   output.write(reinterpret_cast<const char*>(protected_data.pbData), protected_data.cbData);
   LocalFree(protected_data.pbData);
   if (!output) throw std::runtime_error("Unable to store protected authkey");
+}
+
+void WriteProtectedAuthKey(const std::string& value) {
+  WriteProtectedAuthKeyAt(value, AuthKeyPath());
 }
 
 std::optional<std::string> ReadProtectedAuthKeyAt(
@@ -127,6 +147,29 @@ void RegisterSecureStore(flutter::BinaryMessenger* messenger) {
             result->Success();
           } else if (call.method_name() == "delete") {
             DeleteProtectedAuthKey();
+            result->Success();
+          } else if (call.method_name() == "readFor") {
+            const auto* id = std::get_if<std::string>(call.arguments());
+            if (id == nullptr) throw std::runtime_error("Missing device id");
+            const auto value = ReadProtectedAuthKeyAt(AuthKeyPathFor(*id));
+            if (value) result->Success(flutter::EncodableValue(*value));
+            else result->Success();
+          } else if (call.method_name() == "writeFor") {
+            const auto* arguments = std::get_if<flutter::EncodableMap>(call.arguments());
+            if (arguments == nullptr) throw std::runtime_error("Missing device authkey arguments");
+            const auto idIt = arguments->find(flutter::EncodableValue("id"));
+            const auto valueIt = arguments->find(flutter::EncodableValue("value"));
+            const auto* id = idIt == arguments->end() ? nullptr : std::get_if<std::string>(&idIt->second);
+            const auto* value = valueIt == arguments->end() ? nullptr : std::get_if<std::string>(&valueIt->second);
+            if (id == nullptr || value == nullptr) throw std::runtime_error("Missing device authkey arguments");
+            WriteProtectedAuthKeyAt(*value, AuthKeyPathFor(*id));
+            result->Success();
+          } else if (call.method_name() == "deleteFor") {
+            const auto* id = std::get_if<std::string>(call.arguments());
+            if (id == nullptr) throw std::runtime_error("Missing device id");
+            std::error_code error;
+            std::filesystem::remove(AuthKeyPathFor(*id), error);
+            if (error) throw std::runtime_error("Unable to remove protected authkey");
             result->Success();
           } else {
             result->NotImplemented();
