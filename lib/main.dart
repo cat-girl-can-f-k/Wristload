@@ -545,13 +545,18 @@ class _AuthKeyBindingPickerState extends State<_AuthKeyBindingPicker> {
             shrinkWrap: true,
             children: widget.bindings
                 .map(
-                  (binding) => RadioListTile<AuthKeyBinding>(
-                    value: binding,
-                    groupValue: _selected,
-                    onChanged: (value) => setState(() => _selected = value),
-                    secondary: const Icon(Icons.watch_outlined),
+                  (binding) => ListTile(
+                    leading: Radio<AuthKeyBinding>(
+                      value: binding,
+                      groupValue: _selected,
+                      onChanged: (value) =>
+                          setState(() => _selected = value),
+                    ),
                     title: Text(binding.name),
                     subtitle: Text(binding.uuid),
+                    trailing: const Icon(Icons.chevron_right),
+                    selected: identical(_selected, binding),
+                    onTap: () => setState(() => _selected = binding),
                   ),
                 )
                 .toList(growable: false),
@@ -705,6 +710,10 @@ Widget buildAuthKeyEditDialogForTesting({
     initialValue: initialValue,
   );
 }
+
+Widget buildAuthKeyBindingPickerForTesting({
+  required List<AuthKeyBinding> bindings,
+}) => _AuthKeyBindingPicker(bindings: bindings);
 
 class HomePage extends StatelessWidget {
   const HomePage({

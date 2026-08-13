@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:wristload/domain/auth_key_binding.dart';
 import 'package:wristload/main.dart';
 
 void main() {
@@ -50,5 +51,63 @@ void main() {
     await tester.tap(find.byType(FilledButton));
     await tester.pumpAndSettle();
     expect(await dialogResult, replacementKey);
+  });
+
+  testWidgets('history binding picker keeps selected device until modification',
+      (tester) async {
+    final bindings = [
+      AuthKeyBinding(
+        id: 'device-a',
+        name: '设备 A',
+        uuid: 'device-a',
+        updatedAt: DateTime(2026, 1, 1),
+      ),
+      AuthKeyBinding(
+        id: 'device-b',
+        name: '设备 B',
+        uuid: 'device-b',
+        updatedAt: DateTime(2026, 1, 2),
+      ),
+    ];
+    Future<AuthKeyBinding?>? result;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (context) => Scaffold(
+            body: TextButton(
+              onPressed: () {
+                result = showDialog<AuthKeyBinding>(
+                  context: context,
+                  barrierDismissible: false,
+                  builder: (_) => buildAuthKeyBindingPickerForTesting(
+                    bindings: bindings,
+                  ),
+                );
+              },
+              child: const Text('打开列表'),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('打开列表'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('设备 B'));
+    await tester.pump();
+
+    final radio = tester.widget<Radio<AuthKeyBinding>>(
+      find.byWidgetPredicate(
+        (widget) => widget is Radio<AuthKeyBinding> &&
+            widget.value?.id == 'device-b',
+      ),
+    );
+    expect(radio.groupValue?.id, 'device-b');
+    expect(find.widgetWithText(FilledButton, '修改'), findsOneWidget);
+
+    await tester.tap(find.widgetWithText(FilledButton, '修改'));
+    await tester.pumpAndSettle();
+    expect((await result)?.id, 'device-b');
   });
 }
