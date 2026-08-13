@@ -730,7 +730,6 @@ class _AuthKeyEditDialogState extends State<_AuthKeyEditDialog> {
   late final TextEditingController _field;
   late final FocusNode _focusNode;
   final _formKey = GlobalKey<FormState>();
-  bool _selectedInitialValue = false;
 
   @override
   void initState() {
@@ -739,14 +738,7 @@ class _AuthKeyEditDialogState extends State<_AuthKeyEditDialog> {
     _focusNode = FocusNode();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      _focusNode.requestFocus();
-      if (_field.text.isNotEmpty) {
-        _field.selection = TextSelection(
-          baseOffset: 0,
-          extentOffset: _field.text.length,
-        );
-        _selectedInitialValue = true;
-      }
+      _field.selection = TextSelection.collapsed(offset: _field.text.length);
     });
   }
 
@@ -755,16 +747,6 @@ class _AuthKeyEditDialogState extends State<_AuthKeyEditDialog> {
     _field.dispose();
     _focusNode.dispose();
     super.dispose();
-  }
-
-  void _selectInitialValue() {
-    _focusNode.requestFocus();
-    if (_selectedInitialValue || !_field.text.isNotEmpty) return;
-    _selectedInitialValue = true;
-    _field.selection = TextSelection(
-      baseOffset: 0,
-      extentOffset: _field.text.length,
-    );
   }
 
   void _save() {
@@ -788,8 +770,9 @@ class _AuthKeyEditDialogState extends State<_AuthKeyEditDialog> {
             autofocus: true,
             readOnly: false,
             enableInteractiveSelection: true,
-            onTap: _selectInitialValue,
-            selectAllOnFocus: true,
+            showCursor: true,
+            cursorColor: Theme.of(context).colorScheme.primary,
+            selectAllOnFocus: false,
             keyboardType: TextInputType.visiblePassword,
             textInputAction: TextInputAction.done,
             maxLength: 32,
@@ -804,7 +787,6 @@ class _AuthKeyEditDialogState extends State<_AuthKeyEditDialog> {
                 tooltip: '清空 authkey',
                 onPressed: () {
                   _field.clear();
-                  _selectedInitialValue = true;
                   _focusNode.requestFocus();
                 },
                 icon: const Icon(Icons.clear),
