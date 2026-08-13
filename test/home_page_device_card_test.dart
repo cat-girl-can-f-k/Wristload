@@ -42,6 +42,19 @@ void main() {
     expect(find.text('100%'), findsOneWidget);
     expect(find.byIcon(Icons.battery_std), findsOneWidget);
     expect(find.text(deviceUuid.toString()), findsOneWidget);
+
+    final progress = tester.widget<LinearProgressIndicator>(
+      find.byType(LinearProgressIndicator),
+    );
+    expect(progress.minHeight, 4);
+    expect(progress.backgroundColor, theme.colorScheme.surfaceContainerHighest);
+    final clip = tester.widget<ClipRRect>(
+      find.ancestor(
+        of: find.byType(LinearProgressIndicator),
+        matching: find.byType(ClipRRect),
+      ),
+    );
+    expect(clip.borderRadius, BorderRadius.circular(2));
   });
 }
 

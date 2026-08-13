@@ -21,16 +21,18 @@ void main() {
     restored.dispose();
   });
 
-  testWidgets('theme preview keeps a visible full-width progress bar',
+  testWidgets('theme preview keeps visible progress segments in light and dark themes',
       (tester) async {
+    Future<void> pumpPreview(Brightness brightness) async {
     await tester.pumpWidget(
       MaterialApp(
         theme: ThemeData(
           useMaterial3: true,
           colorScheme: ColorScheme.fromSeed(
             seedColor: const Color(0xFF018786),
-            brightness: Brightness.light,
+            brightness: brightness,
           ),
+          brightness: brightness,
         ),
         home: Scaffold(
           body: TransferSettingsPage(
@@ -59,9 +61,17 @@ void main() {
     final size = tester.getSize(progress);
     expect(size.width, greaterThan(0));
     expect(size.height, 8);
-    expect(
-        find.byKey(const ValueKey('theme-preview-confirmed')), findsOneWidget);
-    expect(
-        find.byKey(const ValueKey('theme-preview-submitted')), findsOneWidget);
+    final confirmed = find.byKey(const ValueKey('theme-preview-confirmed'));
+    final submitted = find.byKey(const ValueKey('theme-preview-submitted'));
+    expect(confirmed, findsOneWidget);
+    expect(submitted, findsOneWidget);
+    expect(tester.getSize(confirmed).width, closeTo(size.width * .52, 1));
+    expect(tester.getSize(submitted).width, closeTo(size.width * .18, 1));
+    expect(tester.getSize(confirmed).height, greaterThanOrEqualTo(6));
+    expect(tester.getSize(submitted).height, greaterThanOrEqualTo(6));
+    }
+
+    await pumpPreview(Brightness.light);
+    await pumpPreview(Brightness.dark);
   });
 }

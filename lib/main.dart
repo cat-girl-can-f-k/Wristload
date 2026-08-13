@@ -1046,10 +1046,14 @@ class _DeviceStat extends StatelessWidget {
                 ?.copyWith(fontWeight: FontWeight.w500),
           ),
           const SizedBox(height: 6),
-          LinearProgressIndicator(
-            value: progress.clamp(0.0, 1.0),
-            minHeight: 4,
-            color: progressColor ?? theme.colorScheme.primary,
+          ClipRRect(
+            borderRadius: BorderRadius.circular(2),
+            child: LinearProgressIndicator(
+              value: progress.clamp(0.0, 1.0),
+              minHeight: 4,
+              color: progressColor ?? theme.colorScheme.primary,
+              backgroundColor: theme.colorScheme.surfaceContainerHighest,
+            ),
           ),
         ],
       ),
