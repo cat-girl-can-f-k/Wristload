@@ -194,7 +194,15 @@ class ThemeColorSelector extends StatelessWidget {
               .toList(growable: false),
         ),
         const SizedBox(height: 20),
-        _ThemeColorPreview(colors: colors),
+        _ThemeColorPreview(
+          colors: colors,
+          themeName: _choices
+              .firstWhere(
+                (choice) => choice.color.toARGB32() == value.toARGB32(),
+                orElse: () => _choices.first,
+              )
+              .name,
+        ),
       ],
     );
   }
@@ -288,104 +296,203 @@ class _ThemeColorChoice extends StatelessWidget {
 }
 
 class _ThemeColorPreview extends StatelessWidget {
-  const _ThemeColorPreview({required this.colors});
+  const _ThemeColorPreview({
+    required this.colors,
+    required this.themeName,
+  });
 
   final ColorScheme colors;
+  final String themeName;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final textTheme = theme.textTheme;
+    return Container(
+      key: const ValueKey('theme-color-preview'),
+      padding: const EdgeInsets.fromLTRB(20, 18, 20, 20),
+      decoration: BoxDecoration(
+        color: colors.surfaceContainer,
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '实时预览 · $themeName',
+            key: const ValueKey('theme-preview-title'),
+            style: textTheme.titleMedium?.copyWith(
+              color: colors.onSurface,
+            ),
+          ),
+          const SizedBox(height: 18),
+          Wrap(
+            key: const ValueKey('theme-preview-actions'),
+            spacing: 12,
+            runSpacing: 12,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              FilledButton.icon(
+                key: const ValueKey('theme-preview-install'),
+                onPressed: () {},
+                icon: const Icon(Icons.watch),
+                label: const Text('安装表盘'),
+              ),
+              FilledButton.tonal(
+                key: const ValueKey('theme-preview-retry'),
+                onPressed: () {},
+                child: const Text('重试'),
+              ),
+              OutlinedButton(
+                key: const ValueKey('theme-preview-cancel'),
+                onPressed: () {},
+                child: const Text('取消'),
+              ),
+              _ThemePreviewChip(
+                key: const ValueKey('theme-preview-installable'),
+                colors: colors,
+                label: '可安装',
+              ),
+            ],
+          ),
+          const SizedBox(height: 26),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(3),
+            child: SizedBox(
+              key: const ValueKey('theme-preview-progress-track'),
+              height: 6,
+              child: Row(
+                children: [
+                  Expanded(
+                    flex: 52,
+                    child: ColoredBox(
+                      key: const ValueKey('theme-preview-confirmed'),
+                      color: colors.primary,
+                    ),
+                  ),
+                  Expanded(
+                    flex: 18,
+                    child: ColoredBox(
+                      key: const ValueKey('theme-preview-submitted'),
+                      color: colors.primaryContainer,
+                    ),
+                  ),
+                  Expanded(
+                    flex: 30,
+                    child: ColoredBox(
+                      key: const ValueKey('theme-preview-track'),
+                      color: colors.surfaceContainerHighest,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            key: const ValueKey('theme-preview-transfer-stats'),
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Text(
+                  '设备确认 43/82 片 · 669.5/1301.2 KB',
+                  style: textTheme.bodyMedium?.copyWith(
+                    color: colors.onSurfaceVariant,
+                    fontFeatures: const [FontFeature.tabularFigures()],
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Text(
+                '76.9 KB/s',
+                textAlign: TextAlign.end,
+                style: textTheme.bodyMedium?.copyWith(
+                  color: colors.onSurfaceVariant,
+                  fontFeatures: const [FontFeature.tabularFigures()],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 26),
+          Wrap(
+            key: const ValueKey('theme-preview-navigation'),
+            spacing: 12,
+            runSpacing: 10,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              Container(
+                key: const ValueKey('theme-preview-navigation-pill'),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                decoration: BoxDecoration(
+                  color: colors.secondaryContainer,
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: Icon(
+                  Icons.home,
+                  color: colors.onSecondaryContainer,
+                  size: 22,
+                ),
+              ),
+              Text(
+                '侧栏选中态',
+                style: textTheme.bodyMedium?.copyWith(
+                  color: colors.onSurfaceVariant,
+                ),
+              ),
+              Container(
+                key: const ValueKey('theme-preview-badge'),
+                width: 28,
+                height: 28,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: colors.primary,
+                  shape: BoxShape.circle,
+                ),
+                child: Text(
+                  '3',
+                  style: textTheme.labelLarge?.copyWith(
+                    color: colors.onPrimary,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              Text(
+                '队列角标',
+                style: textTheme.bodyMedium?.copyWith(
+                  color: colors.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ThemePreviewChip extends StatelessWidget {
+  const _ThemePreviewChip({
+    required this.colors,
+    required this.label,
+    super.key,
+  });
+
+  final ColorScheme colors;
+  final String label;
 
   @override
   Widget build(BuildContext context) => Container(
-        key: const ValueKey('theme-color-preview'),
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
         decoration: BoxDecoration(
-          color: colors.surfaceContainer,
-          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: colors.primary),
+          borderRadius: BorderRadius.circular(12),
         ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('实时预览', style: Theme.of(context).textTheme.titleSmall),
-            const SizedBox(height: 12),
-            Wrap(
-              spacing: 10,
-              runSpacing: 10,
-              children: [
-                FilledButton.icon(
-                  onPressed: () {},
-                  icon: const Icon(Icons.watch),
-                  label: const Text('安装表盘'),
-                ),
-                FilledButton.tonal(
-                  onPressed: () {},
-                  child: const Text('重试'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(3),
-              child: SizedBox(
-                height: 6,
-                child: Row(
-                  children: [
-                    Expanded(
-                      flex: 58,
-                      child: ColoredBox(
-                        key: const ValueKey('theme-preview-confirmed'),
-                        color: colors.primary,
-                      ),
-                    ),
-                    Expanded(
-                      flex: 24,
-                      child: ColoredBox(
-                        key: const ValueKey('theme-preview-submitted'),
-                        color: colors.primaryContainer,
-                      ),
-                    ),
-                    Expanded(
-                      flex: 18,
-                      child: ColoredBox(color: colors.surfaceContainerHighest),
-                    ),
-                  ],
-                ),
+        child: Text(
+          label,
+          style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                color: colors.primary,
               ),
-            ),
-            const SizedBox(height: 12),
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
-                  key: const ValueKey('theme-preview-navigation-pill'),
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: colors.secondaryContainer,
-                    borderRadius: BorderRadius.circular(20),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(Icons.home, color: colors.onSecondaryContainer),
-                      const SizedBox(width: 6),
-                      Text(
-                        '侧栏选中态',
-                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                              color: colors.onSecondaryContainer,
-                            ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Badge.count(
-                  count: 3,
-                  child: Text(
-                    '队列角标',
-                    style: Theme.of(context).textTheme.bodySmall,
-                  ),
-                ),
-              ],
-            ),
-          ],
         ),
       );
 }
