@@ -4,6 +4,35 @@ import 'package:flutter/services.dart';
 
 import '../domain/device_profile.dart';
 
+class DiagnosticLogToggle extends StatelessWidget {
+  const DiagnosticLogToggle({
+    required this.entryCount,
+    required this.enabled,
+    required this.onChanged,
+    super.key,
+  });
+
+  final int entryCount;
+  final bool enabled;
+  final ValueChanged<bool>? onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final available = onChanged != null;
+    return Card(
+      child: SwitchListTile(
+        value: enabled && available,
+        onChanged: available ? onChanged : null,
+        secondary: const Icon(Icons.receipt_long_outlined),
+        title: const Text('独立诊断日志窗口'),
+        subtitle: Text(available
+            ? 'Trace 级日志、Runtime、Storage 和通信记录 · 当前 $entryCount 条'
+            : '当前平台不支持独立日志窗口'),
+      ),
+    );
+  }
+}
+
 class LogPanel extends StatelessWidget {
   const LogPanel({
     required this.logs,

@@ -14,6 +14,7 @@ import 'package:crypto/crypto.dart';
 import 'install_models.dart';
 import 'install_task.dart';
 import 'device_profile.dart';
+import '../application/diagnostic_log_service.dart';
 import '../platform/security_scoped_file_access.dart';
 
 class InstallMetadataReader {
@@ -33,11 +34,42 @@ class InstallMetadataReader {
     InstallKind kind,
     String path, {
     ScopedFileRef? source,
-  }) =>
-      SecurityScopedFileAccess.instance.withAccess(
+  }) async {
+    appLogger.trace(
+      '安装文件元数据读取开始',
+      category: DiagnosticLogCategory.installation,
+      fields: <String, Object?>{
+        'kind': kind.name,
+        'extension': _extension(path),
+      },
+    );
+    try {
+      final value = await SecurityScopedFileAccess.instance.withAccess(
         source ?? ScopedFileRef(path: path),
         (resolved) => _readResolved(kind, resolved.path),
       );
+      appLogger.info(
+        '安装文件元数据读取完成',
+        category: DiagnosticLogCategory.installation,
+        fields: <String, Object?>{
+          'kind': kind.name,
+          'fileSize': value.fileSize,
+          'hasFaceId': value.faceId != null,
+          'hasPackageName': value.packageName != null,
+          'resolutionCount': value.watchfaceResolutions.length,
+          'containsLua': value.containsLua,
+        },
+      );
+      return value;
+    } on Object catch (error) {
+      appLogger.error(
+        '安装文件元数据读取失败',
+        category: DiagnosticLogCategory.installation,
+        fields: <String, Object?>{'kind': kind.name, 'errorType': error.runtimeType.toString()},
+      );
+      rethrow;
+    }
+  }
 
   /// Reads metadata while the caller keeps [lease] open.
   ///
@@ -46,8 +78,32 @@ class InstallMetadataReader {
   Future<InstallMetadata> readWithLease(
     InstallKind kind,
     SecurityScopedFileLease lease,
-  ) =>
-      _readResolved(kind, lease.file.path);
+  ) async {
+    appLogger.trace(
+      '安装文件元数据读取开始（复用安全作用域）',
+      category: DiagnosticLogCategory.installation,
+      fields: <String, Object?>{'kind': kind.name},
+    );
+    try {
+      final value = await _readResolved(kind, lease.file.path);
+      appLogger.info(
+        '安装文件元数据读取完成（复用安全作用域）',
+        category: DiagnosticLogCategory.installation,
+        fields: <String, Object?>{'kind': kind.name, 'fileSize': value.fileSize},
+      );
+      return value;
+    } on Object catch (error) {
+      appLogger.error(
+        '安装文件元数据读取失败（复用安全作用域）',
+        category: DiagnosticLogCategory.installation,
+        fields: <String, Object?>{
+          'kind': kind.name,
+          'errorType': error.runtimeType.toString(),
+        },
+      );
+      rethrow;
+    }
+  }
 
   Future<InstallMetadata> _readResolved(
     InstallKind kind,
@@ -73,6 +129,12 @@ class InstallMetadataReader {
       ],
       containsLua: value['containsLua']! as bool,
     );
+  }
+
+  static String _extension(String path) {
+    final name = path.split(RegExp(r'[/\\]')).last;
+    final dot = name.lastIndexOf('.');
+    return dot >= 0 && dot + 1 < name.length ? name.substring(dot + 1).toLowerCase() : '';
   }
 
   Future<InstallMetadata> _readDirect(InstallKind kind, String path) async {

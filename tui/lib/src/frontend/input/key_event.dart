@@ -32,6 +32,43 @@ class PasteEvent extends KeyEvent {
   final String text;
 }
 
+/// A decoded SGR mouse event. Coordinates use the terminal's one-based grid.
+class MouseEvent extends KeyEvent {
+  const MouseEvent({
+    required this.action,
+    required this.column,
+    required this.row,
+    required this.rawButtonCode,
+    this.button,
+    this.scrollDirection,
+    this.shift = false,
+    this.alt = false,
+    this.control = false,
+  });
+
+  final MouseAction action;
+  final int column;
+  final int row;
+
+  /// Original SGR button/modifier field for diagnostics and future mapping.
+  final int rawButtonCode;
+  final MouseButton? button;
+  final MouseScrollDirection? scrollDirection;
+  final bool shift;
+  final bool alt;
+  final bool control;
+
+  bool get isPress => action == MouseAction.press;
+  bool get isRelease => action == MouseAction.release;
+  bool get isScroll => action == MouseAction.scroll;
+}
+
+enum MouseAction { press, release, move, scroll }
+
+enum MouseButton { left, middle, right }
+
+enum MouseScrollDirection { up, down, left, right }
+
 /// Terminal resize event.
 class ResizeEvent extends KeyEvent {
   const ResizeEvent(this.rows, this.columns);

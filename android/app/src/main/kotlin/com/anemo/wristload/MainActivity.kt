@@ -1,4 +1,4 @@
-package com.example.wristload
+package com.anemo.wristload
 
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice

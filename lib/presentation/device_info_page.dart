@@ -5,10 +5,108 @@ import 'package:flutter/services.dart';
 import '../application/device_controller.dart';
 
 /// 设备信息查看页。
-class DeviceInfoPage extends StatelessWidget {
+///
+/// 这个页面只能展示已经完成应用层 authkey 鉴权的当前会话。系统蓝牙
+/// 配对、RFCOMM 建链中，或一个已经失效的连接都不是可供用户操作的
+/// "已连接设备"。路由入口会先做同样的检查；这里再检查一次，防止
+/// 在页面打开后断开时保留过期设备详情。
+class DeviceInfoPage extends StatefulWidget {
   const DeviceInfoPage({required this.controller, super.key});
 
   final DeviceController controller;
+
+  static bool hasVerifiedSession(DeviceController controller) =>
+      controller.connectedDevice != null &&
+      controller.isConnected &&
+      controller.sessionReady;
+
+  @override
+  State<DeviceInfoPage> createState() => _DeviceInfoPageState();
+}
+
+class _DeviceInfoPageState extends State<DeviceInfoPage> {
+  bool _leaveScheduled = false;
+  bool _deletingSavedDevice = false;
+
+  DeviceController get controller => widget.controller;
+
+  void _leaveWhenSessionIsUnavailable() {
+    if (_leaveScheduled) return;
+    _leaveScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _leaveScheduled = false;
+      if (!mounted || DeviceInfoPage.hasVerifiedSession(controller)) return;
+      // A delete-confirmation dialog can be above this route. Popping only
+      // one route would dismiss the dialog and leave stale details visible.
+      final navigator = Navigator.of(context, rootNavigator: true);
+      if (navigator.canPop()) {
+        navigator.popUntil((route) => route.isFirst);
+      }
+    });
+  }
+
+  Future<void> _deleteSavedDevice(
+    BuildContext context, {
+    required String deviceId,
+    required String? deviceName,
+  }) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        final colors = Theme.of(dialogContext).colorScheme;
+        return AlertDialog(
+          title: const Text('删除已保存设备？'),
+          content: Text(
+            '将删除${deviceName ?? '此设备'}在 Wristload 本机保存的 authkey、历史绑定和经典蓝牙身份映射。'
+            '当前连接不会断开，也不会删除系统蓝牙配对；下次连接时必须手动输入 authkey。',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('取消'),
+            ),
+            FilledButton.icon(
+              style: FilledButton.styleFrom(
+                backgroundColor: colors.error,
+                foregroundColor: colors.onError,
+              ),
+              onPressed: () => Navigator.pop(dialogContext, true),
+              icon: const Icon(Icons.delete_outline),
+              label: const Text('删除设备'),
+            ),
+          ],
+        );
+      },
+    );
+    if (confirmed != true || !context.mounted || _deletingSavedDevice) return;
+
+    // The dialog can remain open while the user disconnects or starts a new
+    // connection. Do not let a stale details page remove records belonging to
+    // a different device.
+    final device = controller.connectedDevice;
+    if (!DeviceInfoPage.hasVerifiedSession(controller) ||
+        device == null ||
+        device.uuid.toString() != deviceId) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('设备连接已结束或已改变，未删除已保存设备。')),
+      );
+      return;
+    }
+
+    setState(() => _deletingSavedDevice = true);
+    final removed = await controller.deleteSavedDevice(device.uuid);
+    if (!context.mounted) return;
+    setState(() => _deletingSavedDevice = false);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          removed
+              ? '已删除已保存设备；下次连接需要手动输入 authkey。'
+              : '已从当前会话移除凭据，但部分已保存设备信息未能清除。',
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -18,17 +116,23 @@ class DeviceInfoPage extends StatelessWidget {
         listenable: controller,
         builder: (context, _) {
           final device = controller.connectedDevice;
+          if (device == null || !DeviceInfoPage.hasVerifiedSession(controller)) {
+            _leaveWhenSessionIsUnavailable();
+            return const _UnavailableDeviceInfo();
+          }
           final isMacOS = defaultTargetPlatform == TargetPlatform.macOS;
-          final identifier = device?.uuid.toString();
+          final identifier = device.uuid.toString();
           final classicAddress = controller.connectedClassicAddress;
-          final mac = classicAddress ??
-              (isMacOS || identifier == null ? null : _formatMac(identifier));
+          final mac = isMacOS
+              ? null
+              : classicAddress ?? _formatMac(identifier);
           final firmware = controller.connectedFirmwareVersion;
           final model = controller.connectedDeviceName ??
               controller.connectedProfile?.displayName;
           final battery = controller.batteryPercent;
           final storageTotal = controller.storageTotalBytes;
           final storageUsed = controller.storageUsedBytes;
+          final authKey = controller.authKey;
           return ListView(
             padding: const EdgeInsets.all(16),
             children: [
@@ -45,7 +149,7 @@ class DeviceInfoPage extends StatelessWidget {
               ListTile(
                 leading: const Icon(Icons.bluetooth),
                 title: Text(isMacOS ? '设备标识' : 'MAC 地址'),
-                subtitle: Text(isMacOS ? identifier ?? '未连接' : mac ?? '未连接'),
+                subtitle: Text(isMacOS ? identifier : mac ?? '未连接'),
               ),
               if (isMacOS && classicAddress != null)
                 ListTile(
@@ -58,7 +162,36 @@ class DeviceInfoPage extends StatelessWidget {
                 title: Text('连接方式'),
                 subtitle: Text('蓝牙'),
               ),
-              _AuthKeyTile(value: controller.authKey),
+              _AuthKeyTile(value: authKey),
+              Padding(
+                padding: const EdgeInsets.only(left: 16, top: 4, bottom: 8),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: OutlinedButton.icon(
+                    key: const ValueKey('delete-saved-device-button'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Theme.of(context).colorScheme.error,
+                      side: BorderSide(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                    ),
+                    onPressed: _deletingSavedDevice
+                        ? null
+                        : () => _deleteSavedDevice(
+                              context,
+                              deviceId: identifier,
+                              deviceName: model,
+                            ),
+                    icon: _deletingSavedDevice
+                        ? const SizedBox.square(
+                            dimension: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.delete_outline),
+                    label: Text(_deletingSavedDevice ? '正在删除…' : '删除已保存设备'),
+                  ),
+                ),
+              ),
               if (battery != null && battery >= 0 && battery <= 100)
                 ListTile(
                   leading: const Icon(Icons.battery_std),
@@ -107,6 +240,21 @@ class DeviceInfoPage extends StatelessWidget {
     }
     return '${(bytes / 1024).toStringAsFixed(1)} KB';
   }
+}
+
+class _UnavailableDeviceInfo extends StatelessWidget {
+  const _UnavailableDeviceInfo();
+
+  @override
+  Widget build(BuildContext context) => const Center(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Text(
+            '设备未处于已验证连接状态，无法查看设备详情。',
+            textAlign: TextAlign.center,
+          ),
+        ),
+      );
 }
 
 class _AuthKeyTile extends StatefulWidget {

@@ -12,7 +12,7 @@ import os
 import sys
 import time
 
-log_path, gate_path, fail_cleanup_path = sys.argv[1:4]
+log_path, gate_path, fail_cleanup_path, fail_connect_path = sys.argv[1:5]
 
 def emit(value):
     print(json.dumps(value), flush=True)
@@ -31,6 +31,34 @@ for line in sys.stdin:
             'helperSessionId': 'test-helper',
         })
     elif name == 'connect':
+        emit({
+            'event': 'connection.stage',
+            'requestId': request_id,
+            'connectionId': command['connectionId'],
+            'stage': 'sdp.started',
+            'timeoutMs': 15000,
+        })
+        if os.path.exists(fail_connect_path):
+            emit({
+                'event': 'error',
+                'requestId': request_id,
+                'connectionId': command['connectionId'],
+                'code': 'sdp_query_failed',
+                'message': 'controlled connect failure',
+            })
+            emit({
+                'event': 'connection.stage',
+                'requestId': request_id,
+                'connectionId': command['connectionId'],
+                'stage': 'cleanup.completed',
+                'reason': 'error',
+            })
+            emit({
+                'event': 'closed',
+                'connectionId': command['connectionId'],
+                'reason': 'error',
+            })
+            continue
         emit({
             'event': 'connect.done',
             'requestId': request_id,
@@ -68,6 +96,7 @@ void main() {
   late File commandLog;
   late File disconnectGate;
   late File failCleanup;
+  late File failConnect;
   late JsonLineMacBluetoothTransport transport;
 
   setUp(() async {
@@ -75,6 +104,7 @@ void main() {
     commandLog = File('${directory.path}/commands.jsonl');
     disconnectGate = File('${directory.path}/disconnect.gate');
     failCleanup = File('${directory.path}/fail-cleanup');
+    failConnect = File('${directory.path}/fail-connect');
     transport = JsonLineMacBluetoothTransport(
       executablePath: 'controlled-test-helper',
       processStarter: (_) => Process.start(
@@ -86,6 +116,7 @@ void main() {
           commandLog.path,
           disconnectGate.path,
           failCleanup.path,
+          failConnect.path,
         ],
         runInShell: false,
       ),
@@ -144,9 +175,53 @@ void main() {
     await expectLater(transport.connect(device), throwsA(isA<StateError>()));
     expect(await _commandCount(commandLog, 'connect'), 1);
   });
+
+  test('native error then closed retires and releases the failed connection',
+      () async {
+    final device = MacBluetoothDevice(
+      address: 'AA-BB-CC-DD-EE-04',
+      name: 'native failure',
+    );
+    await failConnect.writeAsString('fail');
+
+    await expectLater(
+      transport.connect(device),
+      throwsA(
+        isA<MacBluetoothNativeException>().having(
+          (error) => error.code,
+          'code',
+          'sdp_query_failed',
+        ),
+      ),
+    );
+    await failConnect.delete();
+    await transport.connect(device);
+
+    expect(await _commandCount(commandLog, 'connect'), 2);
+    expect(await _commandCount(commandLog, 'disconnect'), 0);
+  });
+
+  test('connection stage events expose the current native boundary', () async {
+    final messages = <String?>[];
+    final subscription = transport.snapshots.listen(
+      (snapshot) => messages.add(snapshot.message),
+    );
+    addTearDown(subscription.cancel);
+
+    await transport.connect(
+      MacBluetoothDevice(
+        address: 'AA-BB-CC-DD-EE-05',
+        name: 'stage evidence',
+      ),
+    );
+
+    expect(messages, contains('正在查询 SDP 服务端点。'));
+    expect(transport.snapshot.connected, isTrue);
+  });
 }
 
-Future<void> _waitForCommandCount(File log, String command, int expected) async {
+Future<void> _waitForCommandCount(
+    File log, String command, int expected) async {
   final deadline = DateTime.now().add(const Duration(seconds: 3));
   while (DateTime.now().isBefore(deadline)) {
     if (await _commandCount(log, command) >= expected) return;

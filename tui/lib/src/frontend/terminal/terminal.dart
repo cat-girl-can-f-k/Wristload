@@ -31,6 +31,14 @@ abstract class Terminal {
   /// delivered through [keyStream]; in canonical mode lines are delivered.
   void setRawMode(bool enabled);
 
+  /// Enable or disable SGR mouse capture.
+  ///
+  /// Implementations emit mouse reports through [byteStream] so that the
+  /// input decoder can order mouse and keyboard events from one source.
+  /// Callers must disable capture before terminal shutdown. [reset] also
+  /// restores this mode as a final safety net.
+  void setMouseCapture(bool enabled);
+
   /// Stream of raw byte chunks from stdin.
   Stream<List<int>> get byteStream;
 

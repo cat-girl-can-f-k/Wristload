@@ -6,10 +6,17 @@ enum ConnectionIssueKind {
 }
 
 class ConnectionIssue {
-  const ConnectionIssue({required this.id, required this.kind});
+  const ConnectionIssue({
+    required this.id,
+    required this.kind,
+    this.targetId,
+    this.targetName,
+  });
 
   final int id;
   final ConnectionIssueKind kind;
+  final String? targetId;
+  final String? targetName;
 }
 
 /// Tracks user-facing connection notices independently from diagnostic logs.
@@ -45,7 +52,7 @@ class ConnectionIssueTracker {
 
   void connectionSucceeded() => _resetConnectionFailures();
 
-  bool recordAuthKeyMismatch() {
+  bool recordAuthKeyMismatch({String? targetId, String? targetName}) {
     if (_authKeyMismatchNoticeIssued ||
         _pending.any((issue) => issue.kind == ConnectionIssueKind.authKeyMismatch)) {
       return false;
@@ -54,6 +61,8 @@ class ConnectionIssueTracker {
     _pending.add(ConnectionIssue(
       id: _nextId++,
       kind: ConnectionIssueKind.authKeyMismatch,
+      targetId: targetId,
+      targetName: targetName,
     ));
     return true;
   }

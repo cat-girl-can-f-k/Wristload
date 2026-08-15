@@ -1,69 +1,88 @@
-# WearableInstall macOS TUI
+# Wristload macOS TUI
 
-这是 Wristload 的独立、纯 Dart、仅面向 macOS 的终端界面（TUI）工作区。它不复用 Flutter GUI，也不启动隐藏 Flutter engine；安装协议、文件校验和恢复语义由 Dart 后端保留，经典蓝牙由一个小型原生 JSON Lines 子进程桥接。
+`tui/` 是 Wristload 的独立、纯 Dart、仅面向 macOS 的终端应用。它不启动 Flutter engine，不依赖 Flutter GUI 的 widget、controller、presentation 或运行时。经典蓝牙由一个小型 JSON Lines 原生 helper 承担；安装状态机和 Xiaomi 协议实现位于 TUI 工作区自己的纯 Dart 层。
 
-当前目录包含独立的 TUI 前端、生产 facade、安装状态机和 macOS 原生蓝牙 helper。根目录 Flutter GUI 不受影响，也不是此 TUI 的运行依赖。前端仍可通过 fixture 预览模式脱离真实设备开发；生产模式则只通过 `TuiFacade` 访问后端。
-
-## 范围
-
-- 平台：只支持 macOS。Windows、Linux 和 Android 都不在此 TUI 的兼容范围内。
-- 蓝牙：只使用 macOS `IOBluetooth.framework` 的经典蓝牙 / SDP / RFCOMM，不把它当作 BLE GATT 客户端。
-- 支持的安装链路：只允许当前已验证的 Vela V2 协议进入安装状态机。旧 Vela、Huami/Zepp 和协议未知设备保持只读或拒绝安装。
-- 安全边界：authkey 鉴权、`VerificationGate`、文件类型和元数据校验、MD5/SHA-256 源文件一致性检查、Mass ACK、业务完成事件、检查点恢复和“设备状态未知”语义必须完整保留。
-
-不允许为了简化 TUI 而直接向 RFCOMM 写私有帧，也不允许以“写入完成”或“Mass ACK 完成”冒充设备安装成功。
-
-## 架构
+## 生产架构
 
 ```text
-TUI 前端（键盘、布局、展示）
-  -> TuiFacade（唯一可调用业务 API）
-  -> Dart 应用/安装状态机
-  -> JSONL Bluetooth facade（长驻子进程）
-  -> tui/macos_bridge/wearable_macos_bridge
+UiNextShell + UiConsoleTerminal
+  -> UiNextPort
+  -> TuiApplicationUiPortAdapter
+  -> TuiApplication
+  -> TuiBackendPort
+  -> MacOsTuiBackendAdapter
+  -> JsonLineMacBluetoothTransport
+  -> macos_bridge/wearable_macos_bridge
   -> IOBluetooth: classic inquiry -> SDP -> RFCOMM
 ```
 
-TUI 前端只能订阅 `TuiFacade` 的状态流并调用其公开动作。它不能 import 协议编码、`VerificationGate`、检查点存储、`Process`、bridge 的 stdin/stdout，不能把文件字节、authkey 或私有帧直接写给 bridge。bridge 只负责发现、SDP 服务解析、RFCOMM 字节收发；它不理解安装协议。
+这条边界的职责是明确的：
 
-### 地址规则
+- `ui_next/` 只处理 terminal 输入、鼠标、渲染、主题和稳定设备选择。render 不会启动扫描、连接、写入 authkey 或安装资源。
+- `application/` 合并已保存设备与实时发现结果，以规范化经典蓝牙 MAC 作为唯一身份；它管理自动连接、连接代次、保存设备、Keychain authkey 和安装状态。
+- `backend_next/` 是 TUI 自己拥有的 macOS backend 边界。它组合 TUI 内的纯 Dart 协议状态机和 JSONL helper，不调用 Flutter GUI controller 或生命周期。
+- `macos_bridge/` 只负责 classic discovery、SDP、RFCOMM open/close 和原始字节；它不理解 authkey、安装协议或业务成功语义。
 
-经典蓝牙地址必须来自 `IOBluetoothDevice.addressString` 或用户明确输入的经典蓝牙地址。绝不从 CoreBluetooth 的 UUID、BLE 广播 ID，或 UUID 末尾 6 字节伪造 MAC。
+`--fixture` 也使用新界面：
 
-输入接受下列三种等价形式：
-
-- `AA-BB-CC-DD-EE-FF`
-- `AA:BB:CC:DD:EE:FF`
-- `AABBCCDDEEFF`
-
-输入层必须先删除分隔符并严格验证为 12 个十六进制字符；内部用无分隔大写 12 hex 作为比较键，向用户与 macOS bridge 展示时统一为 `AA-BB-CC-DD-EE-FF`。不要把横杠改成 Windows 风格的冒号展示。
-
-### JSON Lines bridge
-
-bridge 的源码在 [`macos_bridge/main.mm`](macos_bridge/main.mm)，协议说明在 [`macos_bridge/README.md`](macos_bridge/README.md)。正常运行时必须保持同一个子进程存活；关闭 stdin 等于主动退出 bridge。若旧 SDP 终端回调长期不返回，bridge 会返回 `sdp_drain_required` 并阻止同一设备重连；当前 Dart transport 不会自动重启 helper，此时只能在没有活跃连接时重启 helper/TUI。
-
-命令为一行一个 JSON 对象；每个命令都必须带非空 `requestId`：
-
-```json
-{"command":"scan.start","requestId":"r-1","scanId":"scan-1","duration":10}
-{"command":"connect","requestId":"r-2","connectionId":"conn-1","address":"AA-BB-CC-DD-EE-FF","serviceUuid":"1101"}
-{"command":"write","requestId":"r-3","connectionId":"conn-1","base64":"AQID"}
-{"command":"disconnect","requestId":"r-4","connectionId":"conn-1"}
+```text
+FakeUiNextPort -> UiNextShell -> UiConsoleTerminal
 ```
 
-事件也为一行一个 JSON 对象：`device`、`connect.done`、`data`、`closed`、`error`。连接时 bridge 会先做 SDP 查询，从请求的服务记录取得实际 RFCOMM channel 后再打开连接；不要硬编码 SPP 的 channel number。默认服务 UUID 是 SPP `00001101-0000-1000-8000-00805F9B34FB`（bridge 接受短写 `1101`）。
+fixture 不会启动 helper、访问蓝牙、写 Keychain、持久化设备或安装资源。legacy `frontend/` 仍保留为历史参考，但不在生产入口或 fixture 入口上执行。
 
-bridge 目前以 `writeSync` 按 RFCOMM MTU 分片写入。Dart facade 仍须维护单写 FIFO、连接代次和断线传播：旧连接晚到的 `data` 或 `closed` 不能污染重连后的会话。
+## UI 行为
 
-### SPP ACK 与序号代际
+默认主题为 `black-blue`，并可在运行时切换 `black-cyan`、`black-green`。所有颜色通过 `UiTheme` 集中定义。
 
-SPP ACK 帧只携带 8 位 `sequence`，不携带连接代际、`connectionId` 或 session epoch。本地 `_sessionEpoch` 只能隔离 Dart Future，不能消除同一物理 RFCOMM 字节流中序号回绕后的迟到 ACK 歧义。因此当前实现对每个物理 RFCOMM 连接采用一次性序号空间：序号一旦发送，无论 ACK 成功、超时、取消、写失败或可选 ACK 退役，都永久从该连接代际中退役；quarantine 只用于诊断，不能恢复复用。
+设备的主行语义始终是：
 
-单个物理连接最多发送 256 个需要 SPP 序号的出站数据帧。Mass 窗口会在写入前原子预留完整序号集合；空间不足时不发送半个窗口，而是 fail-closed、断开链路并返回稳定错误码 `rfcomm_rebuild_required`，提示重建 RFCOMM 后重试。只有 transport 完成新 `connect.done`、确认新的物理 channel 建立后，backend 才创建新的序号空间。
+```text
+设备名称 -- MAC地址 -- 可否支持 -- authkey
+```
+
+authkey 已保存时显示完整值；未保存时显示 `-`。设备名称以 Unicode grapheme 和 terminal cell width 渲染，处理 CJK、emoji 与 ANSI/控制字符。宽终端使用单行多列，中等宽度自动换行，窄终端使用堆叠信息；选中后按 `Enter` 可进入可滚动详情页查看完整名称。
+
+键盘与鼠标共用同一条规范化 MAC 选择状态：方向键或 `j`/`k` 选择、`Enter` 详情、滚轮滚动、鼠标点击选择或操作。终端 resize 会重新计算布局和 hitbox。退出时恢复 raw mode、鼠标捕获、备用屏幕和 cursor。
+
+常用操作：
+
+```text
+r 扫描/停止扫描     c 连接     x 断开
+s 保存/取消保存     a 输入 authkey     i 安装资源
+z 取消安装          t 自动连接开关       m 切换主题
+q 或 Ctrl-C 退出
+```
+
+安装和 Bluetooth I/O 均在渲染循环之外执行。取消安装可以越过正在等待的安装 action；底层 RFCOMM 写入仍由 transport FIFO 串行化。只有设备业务完成事件才能标记安装成功，RFCOMM `write.done` 或 Mass ACK 不是安装成功。
+
+## 保存和自动连接
+
+- 保存记录使用经典蓝牙 MAC、显示名称、支持 profile 和最后成功连接时间。扫描刷新与保存记录按 MAC 合并，保存名称/profile 优先保护。
+- authkey 每台设备独立存在 macOS Keychain service `com.anemo.wristload.tui.authkey` 中；JSON 保存文件不含密钥。
+- 仅当对应连接真正进入 `ready` 后，用户提交的 authkey 才会持久化。取消保存会删除记录和该 MAC 的 Keychain key。
+- 启动自动连接会按最近 `lastConnectedAt` 的已保存设备直接以 MAC 连接，不先扫描。没有 authkey 时进入 `awaitingAuthKey`，不会伪装为 ready。
+- 用户主动断开后，本进程会抑制自动重连。连接 generation 防止旧回调覆盖新连接状态。
+
+## 地址和 transport 规则
+
+经典蓝牙地址只能来自 `IOBluetoothDevice.addressString` 或用户明确输入的 classic 地址，不能从 CoreBluetooth UUID 或 BLE 广播 ID 推导。输入支持：
+
+```text
+AA-BB-CC-DD-EE-FF
+AA:BB:CC:DD:EE:FF
+AABBCCDDEEFF
+```
+
+内部 identity 是无分隔大写 12 hex；对用户与 helper 展示为 `AA-BB-CC-DD-EE-FF`。
+
+helper 在连接时使用 SDP 查找服务记录并动态取得 RFCOMM channel，绝不硬编码 channel。Xiaomi Mi Fitness APK 的已有反编译结果显示其 SPP client 使用标准 UUID `00001101-0000-1000-8000-00805F9B34FB`；TUI 使用这个 UUID 是基于该行为证据，而不是复制 APK 代码。`connect.done` 才表示 native RFCOMM channel 已打开；之后才允许后端发送 L1START。
+
+SPP 8-bit sequence 只在一个物理 RFCOMM generation 内有效。TUI 对每个物理连接一次性分配 sequence，耗尽时 fail-closed 并要求重建 RFCOMM，避免迟到 ACK 误匹配。
 
 ## 构建和运行
 
-先准备 macOS 的 Xcode Command Line Tools、CMake、Flutter/Dart SDK。bridge 不需要 Flutter。
+要求：macOS、Xcode Command Line Tools、CMake 和 Dart SDK。bridge 不需要 Flutter。
 
 ```sh
 cd tui/macos_bridge
@@ -75,29 +94,40 @@ dart pub get
 dart run bin/wristload_tui.dart
 ```
 
-默认生产入口使用 `macos_bridge/build/wearable_macos_bridge`。可用 `--helper <绝对或相对路径>` 指定其他构建产物，用 `--probe` 只启动 helper 并刷新已配对设备，不启动 TUI，也不连接、鉴权或安装。界面开发可用 `--fixture <name>` 启动纯 fake 预览；该模式不会连接蓝牙或安装文件。
-
-当前实现已具备可审查的生产 facade、安装状态机和 TUI 工作台，但尚未完成 macOS 真机端到端验收。当前已确认 `git diff --check -- tui` 和 native bridge 构建；Dart VM 在本机启动阶段崩溃，因此不能把 format、analyze 或 test 宣称为通过。请先在可用 Dart SDK 下完成验证，再连接真实设备。
-
 ```sh
-dart run bin/wristload_tui.dart --help
+# 只验证 helper 启动、JSONL handshake 和已配对设备读取。
 dart run bin/wristload_tui.dart --probe
-dart run bin/wristload_tui.dart --fixture queueWaiting
+
+# 新 UI 的纯内存预览。
+dart run bin/wristload_tui.dart --fixture ready
+dart run bin/wristload_tui.dart --fixture queueRunningTransfer
 ```
 
-## macOS 权限和发布
+可用 `--helper <path>` 覆盖 helper 路径，`--help` 列出完整 fixture 名称。
 
-- 首次蓝牙访问可能由 macOS 弹出授权提示；用户需要在“系统设置 -> 隐私与安全性 -> 蓝牙”允许应用或终端。
-- 真机连接前，设备必须可发现或已在 macOS 中配对，并且其 SDP 服务实际暴露 RFCOMM。配对是系统级操作，不等同于本项目的 authkey 鉴权。
-- 若把 TUI 包成带签名的 app / helper，应在目标 macOS 版本上验证 Sandbox、Bluetooth entitlement 与 `Info.plist` 的蓝牙使用说明；发布配置必须以 Apple 当前签名/公证要求为准。先在非沙盒开发环境验证经典 RFCOMM，再引入沙盒。
-- 不申请或模拟 Windows 权限，也不为跨平台兼容把地址格式降级成 Windows 规则。
+## 已验证与当前真实设备边界
 
-## 当前真机限制
+本次重构已实际验证：
 
-根仓库已在 n67cn（小米手环 9 Pro）上验证 Windows RFCOMM -> L1START -> f=26/f=27 -> Mass 表盘传输；这证明 Dart 协议层的互操作结论，不等于 macOS bridge 已完成同设备端到端验收。TUI 的 `kProtocolVerified=true` 仅表示其后端允许进入已验证的协议状态机，绝不构成 macOS 真机安装成功声明。
+- `dart analyze` 无问题，完整 `dart test` 通过。
+- `cmake -S macos_bridge -B macos_bridge/build && cmake --build macos_bridge/build` 成功。
+- `dart run bin/wristload_tui.dart --probe` 成功：Dart -> JSONL helper 的启动、`hello` handshake 与已配对设备读取可用。
+- 新 UI 覆盖了 60/80/120 列响应式布局、Unicode/CJK/emoji cell width、控制字符净化、详情滚动、键盘/鼠标统一选择、滚轮、resize、主题、取消安装、fixture 和 terminal cleanup。
 
-macOS 版本仍必须逐台实测：经典发现、已配对地址、SDP 服务 UUID、动态 RFCOMM channel、配对后的链路加密、L1START、authkey 鉴权、断链恢复、表盘安装和 RPK 安装。文件达到 100%、RFCOMM `write` 完成或 Mass ACK 完成，都只代表传输状态；只有设备业务完成事件才可显示安装成功。未验收的型号或任何模糊终态必须显示为失败/设备状态未知，不能显示成功。
+已在此 Mac 上对已配对的 Xiaomi Smart Band 10（`04-34-C3-3F-9D-63`）做过一次受控 native 实验：helper 接受 `connect`，使用标准 SPP UUID `1101` 发起 SDP；35 秒内没有收到 `sdpQueryComplete` 导致的 `connect.done`、`error` 或任何 raw RX。随后发送本地 `disconnect`，helper 正确返回 `closed(local)` 与 `disconnect.done`。
 
-## 同步根仓库代码
+因此当前首个未通过的真实层是：
 
-复制来源、commit 和同步原则见 [`UPSTREAM_SOURCES.md`](UPSTREAM_SOURCES.md)。同步时只带入可复用的领域/协议代码并保留其测试；不要从根 GUI 复制 `presentation/`，不要把 Windows BLE transport 移植进 TUI。
+```text
+IOBluetooth performSDPQuery accepted
+  -> SDP terminal callback / service resolution: UNKNOWN / no callback observed
+  -> RFCOMM open: not reached
+  -> raw TX: not reached
+  -> raw RX: not reached
+```
+
+这不是 authkey、L1START、安装协议或资源传输失败的证据。TUI transport 会在 RFCOMM 建链等待 30 秒后报告超时、尝试受控 native cleanup，并拒绝在不确定会话上继续写入。没有明确 `connect.done`、原始 TX 和原始 RX 前，Band 9、9 Pro、10、10 Pro 的 macOS 端到端兼容性均保持 `UNKNOWN`。
+
+## macOS 权限
+
+首次使用可能需要在“系统设置 -> 隐私与安全性 -> 蓝牙”允许实际启动 TUI/helper 的进程。配对是系统级状态，不等同于 authkey 鉴权，也不证明 RFCOMM/SDP 可用。发布为签名 app 或 helper 时，需要重新核验 bundle identity、Info.plist、entitlements、Sandbox 和 TCC；不能仅以开发终端的授权状态推断发布产物可用。

@@ -27,6 +27,34 @@ void main() {
       expect(port.recordedActions.where((a) => a.name == 'dispose').length, 1);
     });
 
+    test('fake terminal injects mouse reports and reset disables capture',
+        () async {
+      final terminal = FakeTerminal();
+      terminal.setMouseCapture(true);
+      terminal.click(14, 7);
+      terminal.release(14, 7);
+      terminal.scroll(14, 7, delta: -2);
+
+      final reports = <List<int>>[];
+      final subscription = terminal.byteStream.listen(reports.add);
+      // Mouse reports are asynchronous stream events, so inject again after
+      // subscribing and inspect the exact SGR sequences.
+      terminal.click(14, 7);
+      terminal.release(14, 7);
+      terminal.scroll(14, 7, delta: -2);
+      await Future<void>.delayed(Duration.zero);
+      terminal.reset();
+      await subscription.cancel();
+
+      expect(terminal.mouseCapture, isFalse);
+      expect(reports.map(String.fromCharCodes), [
+        '\x1b[<0;14;7M',
+        '\x1b[<3;14;7m',
+        '\x1b[<65;14;7M',
+        '\x1b[<65;14;7M',
+      ]);
+    });
+
     test('refuses to run on non-interactive terminal', () async {
       final terminal = FakeTerminal(interactive: false);
       final port = FakeTuiFrontendPort(initial: TuiFixtures.base());

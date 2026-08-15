@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import '../domain/protocol/transport_constants.dart';
+import '../application/diagnostic_log_service.dart';
 
 /// Cross-platform BLE central wrapper plus the verified RFCOMM bridges.
 ///
@@ -13,7 +14,24 @@ import '../domain/protocol/transport_constants.dart';
 /// CoreBluetooth peripheral identifier and advertised name, then resolves the
 /// paired classic device natively.
 class BleTransport {
-  BleTransport();
+  BleTransport({DiagnosticLogService? logger}) : _logger = logger ?? appLogger;
+
+  final DiagnosticLogService _logger;
+
+  void _trace(String message, {Map<String, Object?> fields = const {}}) =>
+      _logger.trace(message, category: DiagnosticLogCategory.communication, component: 'wristload.BluetoothPlatform', fields: fields);
+
+  void _debug(String message, {Map<String, Object?> fields = const {}}) =>
+      _logger.debug(message, category: DiagnosticLogCategory.communication, component: 'wristload.BluetoothPlatform', fields: fields);
+
+  void _info(String message, {Map<String, Object?> fields = const {}}) =>
+      _logger.info(message, category: DiagnosticLogCategory.communication, component: 'wristload.BluetoothPlatform', fields: fields);
+
+  void _warning(String message, {Map<String, Object?> fields = const {}}) =>
+      _logger.warning(message, category: DiagnosticLogCategory.communication, component: 'wristload.BluetoothPlatform', fields: fields);
+
+  void _error(String message, {Map<String, Object?> fields = const {}}) =>
+      _logger.error(message, category: DiagnosticLogCategory.communication, component: 'wristload.BluetoothPlatform', fields: fields);
 
   // Creating the platform channel is deferred until a BLE operation is used.
   // This keeps presentation-only consumers independent from native Bluetooth.
@@ -25,14 +43,59 @@ class BleTransport {
 
   Stream<DiscoveredEventArgs> get discoveries => _central.discovered;
 
-  Future<void> startScan() async {
+  /// Current adapter/permission state used by the scan UI. Keeping this at
+  /// the transport boundary avoids coupling the controller to platform
+  /// channels and does not affect RFCOMM or GATT operations.
+  BluetoothLowEnergyState get bluetoothState => _central.state;
+
+  /// Emits every adapter state transition (powered off/on, authorization,
+  /// unsupported, or unknown).
+  Stream<BluetoothLowEnergyStateChangedEventArgs> get bluetoothStateChanged =>
+      _central.stateChanged;
+
+  /// Requests runtime Bluetooth permission where the platform supports it.
+  /// The Android app bridge owns the RFCOMM permission dialog; the plugin
+  /// authorization call then refreshes the BLE manager's authorization state.
+  /// Desktop platforms only expose the current state and never send a
+  /// protocol frame from this method.
+  Future<bool> requestBluetoothAuthorization() async {
     if (_isAndroid) {
       await _androidMethods.invokeMethod<void>('ensurePermissions');
+      return _central.authorize();
     }
-    await _central.startDiscovery();
+    return _central.state == BluetoothLowEnergyState.poweredOn;
   }
 
-  Future<void> stopScan() => _central.stopDiscovery();
+  Future<void> startScan() async {
+    _trace('BLE 扫描开始', fields: <String, Object?>{
+      'platform': defaultTargetPlatform.name,
+    });
+    try {
+      if (_isAndroid) {
+        await _androidMethods.invokeMethod<void>('ensurePermissions');
+      }
+      await _central.startDiscovery();
+      _info('BLE 扫描已启动');
+    } on Object catch (error) {
+      _error('BLE 扫描启动失败：$error', fields: <String, Object?>{
+        'errorType': error.runtimeType.toString(),
+      });
+      rethrow;
+    }
+  }
+
+  Future<void> stopScan() async {
+    _trace('BLE 扫描停止请求');
+    try {
+      await _central.stopDiscovery();
+      _info('BLE 扫描已停止');
+    } on Object catch (error) {
+      _error('BLE 扫描停止失败：$error', fields: <String, Object?>{
+        'errorType': error.runtimeType.toString(),
+      });
+      rethrow;
+    }
+  }
 
   /// 连接并枚举 GATT 服务。成功判定：**MI Wear 服务（fe95）必须存在且包含
   /// 版本/写/通知三个特征**（00000050 / 0000005f / 0000005e）。
@@ -40,27 +103,68 @@ class BleTransport {
   /// 每次失败会**断开连接后重新连接**再枚举（Windows 侧残留状态会污染
   /// 下次枚举，重连能刷新），最多 [discoverAttempts] 轮。
   Future<List<GATTService>> connectAndDiscover(Peripheral peripheral) async {
+    final peripheralId = peripheral.uuid.toString();
+    _trace('GATT 连接与服务发现开始', fields: <String, Object?>{
+      'peripheral': peripheralId,
+      'maxAttempts': discoverAttempts,
+    });
     Object? lastError;
     for (var attempt = 1; attempt <= discoverAttempts; attempt++) {
       try {
+        _trace('GATT 连接尝试', fields: <String, Object?>{
+          'peripheral': peripheralId,
+          'attempt': attempt,
+        });
         await _central.connect(peripheral);
         final services = await _central.discoverGATT(peripheral);
+        _trace('GATT 服务发现返回', fields: <String, Object?>{
+          'peripheral': peripheralId,
+          'attempt': attempt,
+          'serviceCount': services.length,
+        });
         if (_hasFullMiWearService(services)) {
+          _info('GATT 服务发现成功', fields: <String, Object?>{
+            'peripheral': peripheralId,
+            'attempt': attempt,
+            'serviceCount': services.length,
+          });
           return services;
         }
         lastError = 'MI Wear 服务 fe95 缺失或特征不全（尝试 $attempt）';
+        _warning(lastError.toString(), fields: <String, Object?>{
+          'peripheral': peripheralId,
+          'attempt': attempt,
+        });
       } catch (exception) {
         lastError = exception;
+        _warning('GATT 连接或服务发现尝试失败：$exception', fields: <String, Object?>{
+          'peripheral': peripheralId,
+          'attempt': attempt,
+          'errorType': exception.runtimeType.toString(),
+        });
       }
       try {
         await _central.disconnect(peripheral);
       } catch (_) {
+        _debug('GATT 失败后的断开清理失败', fields: <String, Object?>{
+          'peripheral': peripheralId,
+          'attempt': attempt,
+        });
         // 保留发现失败作为主错误；断开是每轮失败后的 best-effort 清理。
       }
       if (attempt < discoverAttempts) {
+        _trace('GATT 服务发现等待重试', fields: <String, Object?>{
+          'peripheral': peripheralId,
+          'attempt': attempt,
+          'delayMs': 600 * attempt,
+        });
         await Future.delayed(Duration(milliseconds: 600 * attempt));
       }
     }
+    _error('GATT 服务发现最终失败：$lastError', fields: <String, Object?>{
+      'peripheral': peripheralId,
+      'attempts': discoverAttempts,
+    });
     throw Exception('GATT 服务发现失败（重试 $discoverAttempts 轮）：$lastError');
   }
 
@@ -80,8 +184,20 @@ class BleTransport {
     return false;
   }
 
-  Future<void> disconnect(Peripheral peripheral) =>
-      _central.disconnect(peripheral);
+  Future<void> disconnect(Peripheral peripheral) async {
+    final peripheralId = peripheral.uuid.toString();
+    _trace('GATT 断开请求', fields: <String, Object?>{'peripheral': peripheralId});
+    try {
+      await _central.disconnect(peripheral);
+      _info('GATT 已断开', fields: <String, Object?>{'peripheral': peripheralId});
+    } on Object catch (error) {
+      _error('GATT 断开失败：$error', fields: <String, Object?>{
+        'peripheral': peripheralId,
+        'errorType': error.runtimeType.toString(),
+      });
+      rethrow;
+    }
+  }
 
   /// 触发系统经典蓝牙配对（bonding）。手环 9 的写入特征要求加密连接：
   /// 未配对时直接写入会被设备静默丢弃（read 正常、write 无回包——正是
@@ -94,15 +210,26 @@ class BleTransport {
   /// [uuid]. The native bridge uses that identity to resolve the paired classic
   /// Bluetooth device and returns its real address when available.
   Future<String?> pairDevice(UUID uuid, {String? advertisedName}) async {
+    final peripheralId = uuid.toString();
+    _trace('经典蓝牙配对请求', fields: <String, Object?>{
+      'peripheral': peripheralId,
+      'platform': defaultTargetPlatform.name,
+      'hasAdvertisedName': advertisedName?.trim().isNotEmpty == true,
+    });
+    try {
     if (_isAndroid) {
       await _androidMethods.invokeMethod<void>('ensurePermissions');
       await _androidMethods.invokeMethod<void>('pair', _androidAddress(uuid));
-      return _androidAddress(uuid);
+      final address = _androidAddress(uuid);
+      _info('经典蓝牙配对完成', fields: <String, Object?>{'peripheral': peripheralId});
+      return address;
     }
     if (_isMacOS) {
       final reply = await _macosMethods.invokeMethod<Object?>('pair',
           _macosIdentity(uuid, advertisedName));
-      return _macosAddress(reply, 'pair');
+      final address = _macosAddress(reply, 'pair');
+      _info('经典蓝牙配对完成', fields: <String, Object?>{'peripheral': peripheralId, 'hasAddress': address != null});
+      return address;
     }
     _requireRfcommPlatform();
     final hex = uuid.toString().replaceAll('-', '');
@@ -114,7 +241,16 @@ class BleTransport {
     );
     final reply = await channel.send(<Object?>[address]);
     _throwIfPigeonError(reply, 'pair');
-    return _formatBluetoothAddress(address);
+    final formatted = _formatBluetoothAddress(address);
+    _info('经典蓝牙配对完成', fields: <String, Object?>{'peripheral': peripheralId});
+    return formatted;
+    } on Object catch (error) {
+      _error('经典蓝牙配对失败：$error', fields: <String, Object?>{
+        'peripheral': peripheralId,
+        'errorType': error.runtimeType.toString(),
+      });
+      rethrow;
+    }
   }
 
   /// Persist the macOS CoreBluetooth-to-classic-device association only after
@@ -124,10 +260,42 @@ class BleTransport {
     String? advertisedName,
   }) async {
     if (!_isMacOS) return;
+    _trace('macOS 经典蓝牙身份确认请求', fields: <String, Object?>{
+      'peripheral': uuid.toString(),
+    });
     await _macosMethods.invokeMethod<void>(
       'confirmIdentity',
       _macosIdentity(uuid, advertisedName),
     );
+    _info('macOS 经典蓝牙身份已确认', fields: <String, Object?>{
+      'peripheral': uuid.toString(),
+    });
+  }
+
+  /// Removes only macOS's local CoreBluetooth-to-classic-device association.
+  /// It intentionally leaves the system Bluetooth pairing and any active
+  /// RFCOMM connection untouched.
+  Future<void> forgetRfcommIdentity(UUID uuid) async {
+    if (!_isMacOS) return;
+    final peripheralId = uuid.toString();
+    _trace('macOS 经典蓝牙身份关联删除请求', fields: <String, Object?>{
+      'peripheral': peripheralId,
+    });
+    try {
+      await _macosMethods.invokeMethod<void>('forgetIdentity', <String, Object>{
+        'peripheralId': peripheralId,
+      });
+      _info('macOS 经典蓝牙身份关联已删除', fields: <String, Object?>{
+        'peripheral': peripheralId,
+      });
+    } on Object catch (error) {
+      _error('macOS 经典蓝牙身份关联删除失败：$error',
+          fields: <String, Object?>{
+        'peripheral': peripheralId,
+        'errorType': error.runtimeType.toString(),
+      });
+      rethrow;
+    }
   }
 
   /// Windows 上若发现现存系统配对，则删除该配对记录并返回 true。
@@ -162,14 +330,24 @@ class BleTransport {
     String? serviceUuid,
     String? advertisedName,
   }) async {
-    _beginRfcommEpoch();
+    final peripheralId = uuid.toString();
+    final epoch = _beginRfcommEpoch();
+    _trace('RFCOMM 连接开始', fields: <String, Object?>{
+      'peripheral': peripheralId,
+      'epoch': epoch,
+      'serviceUuid': serviceUuid ?? '00001101-0000-1000-8000-00805f9b34fb',
+      'platform': defaultTargetPlatform.name,
+    });
+    try {
     if (_isAndroid) {
       await _androidMethods.invokeMethod<void>('ensurePermissions');
       await _androidMethods.invokeMethod<void>('connect', {
         'address': _androidAddress(uuid),
         'serviceUuid': serviceUuid ?? '00001101-0000-1000-8000-00805f9b34fb',
       });
-      return _androidAddress(uuid);
+      final address = _androidAddress(uuid);
+      _info('RFCOMM 连接成功', fields: <String, Object?>{'peripheral': peripheralId, 'epoch': epoch});
+      return address;
     }
     if (_isMacOS) {
       // The Swift bridge resolves RFCOMM from peripheralId + advertised name;
@@ -178,7 +356,9 @@ class BleTransport {
         'connect',
         _macosIdentity(uuid, advertisedName),
       );
-      return _macosAddress(reply, 'connect');
+      final address = _macosAddress(reply, 'connect');
+      _info('RFCOMM 连接成功', fields: <String, Object?>{'peripheral': peripheralId, 'epoch': epoch, 'hasAddress': address != null});
+      return address;
     }
     _requireRfcommPlatform();
     final hex = uuid.toString().replaceAll('-', '');
@@ -192,7 +372,17 @@ class BleTransport {
       serviceUuid ?? '00001101-0000-1000-8000-00805f9b34fb',
     ]);
     _throwIfPigeonError(reply, 'connectRfcomm');
-    return _formatBluetoothAddress(address);
+    final formatted = _formatBluetoothAddress(address);
+    _info('RFCOMM 连接成功', fields: <String, Object?>{'peripheral': peripheralId, 'epoch': epoch});
+    return formatted;
+    } on Object catch (error) {
+      _error('RFCOMM 连接失败：$error', fields: <String, Object?>{
+        'peripheral': peripheralId,
+        'epoch': epoch,
+        'errorType': error.runtimeType.toString(),
+      });
+      rethrow;
+    }
   }
 
   // StreamSocket.OutputStream only supports one pending write. ACK and the
@@ -210,6 +400,13 @@ class BleTransport {
   /// 写 RFCOMM 数据（严格串行）。
   Future<void> rfcommWrite(UUID uuid, List<int> data) {
     final epoch = _rfcommWriteEpoch;
+    _trace('RFCOMM 写入排队', fields: <String, Object?>{
+      'peripheral': uuid.toString(),
+      'epoch': epoch,
+      'bytes': data.length,
+      'direction': 'TX',
+      'wireHex': _wireHex(data),
+    });
     final operation = _rfcommWriteTail.then(
       (_) async {
         if (epoch != _rfcommWriteEpoch) {
@@ -219,11 +416,43 @@ class BleTransport {
         if (epoch != _rfcommWriteEpoch) {
           throw StateError('RFCOMM connection changed while writing.');
         }
+        _trace('RFCOMM 写入完成', fields: <String, Object?>{
+          'peripheral': uuid.toString(),
+          'epoch': epoch,
+          'bytes': data.length,
+          'direction': 'TX',
+          'wireHex': _wireHex(data),
+        });
       },
     );
     // A failed packet is reported to its caller but must not poison the queue.
-    _rfcommWriteTail = operation.then<void>((_) {}, onError: (_) {});
+    _rfcommWriteTail = operation.then<void>((_) {}, onError: (Object error, StackTrace stack) {
+      _error('RFCOMM 写入失败：$error', fields: <String, Object?>{
+        'peripheral': uuid.toString(),
+        'epoch': epoch,
+        'bytes': data.length,
+        'direction': 'TX',
+        'wireHex': _wireHex(data),
+        'errorType': error.runtimeType.toString(),
+      });
+    });
     return operation;
+  }
+
+  String _wireHex(List<int> bytes) => bytes
+      .map((b) => b.toRadixString(16).padLeft(2, '0').toUpperCase())
+      .join(' ');
+
+  Uint8List? _decodeWireHex(String value) {
+    final trimmed = value.trim();
+    if (trimmed.isEmpty) return Uint8List(0);
+    final tokens = trimmed.split(RegExp(r'\s+'));
+    final bytes = <int>[];
+    for (final token in tokens) {
+      if (!RegExp(r'^[0-9a-fA-F]{2}$').hasMatch(token)) return null;
+      bytes.add(int.parse(token, radix: 16));
+    }
+    return Uint8List.fromList(bytes);
   }
 
   Future<void> _rfcommWriteDirect(UUID uuid, List<int> data) async {
@@ -254,6 +483,7 @@ class BleTransport {
   /// 断开 RFCOMM。
   Future<void> disconnectRfcomm(UUID uuid) async {
     final epoch = _beginRfcommEpoch();
+    _trace('RFCOMM 断开请求', fields: <String, Object?>{'peripheral': uuid.toString(), 'epoch': epoch});
     try {
       if (_isAndroid) {
         await _androidMethods.invokeMethod<void>('disconnect');
@@ -272,6 +502,14 @@ class BleTransport {
       );
       final reply = await channel.send(<Object?>[address]);
       _throwIfPigeonError(reply, 'disconnectRfcomm');
+      _info('RFCOMM 已断开', fields: <String, Object?>{'peripheral': uuid.toString(), 'epoch': epoch});
+    } on Object catch (error) {
+      _error('RFCOMM 断开失败：$error', fields: <String, Object?>{
+        'peripheral': uuid.toString(),
+        'epoch': epoch,
+        'errorType': error.runtimeType.toString(),
+      });
+      rethrow;
     } finally {
       if (epoch == _rfcommWriteEpoch) {
         _rfcommWriteTail = Future<void>.value();
@@ -367,17 +605,49 @@ class BleTransport {
         .join(':');
   }
 
+  DiagnosticLogLevel _macosNativeEventLevel(String eventName) {
+    // Pairing failures used to arrive as trace-only native events, which made
+    // a system rejection look unrelated to the user-visible MethodChannel
+    // error. Keep the low-level event and make its severity actionable.
+    if (const <String>{
+      'error',
+      'pairing_failed',
+      'pairing_start_failed',
+      'pairing_timeout',
+      'pairing_user_input_unavailable',
+      'pairing_user_input_invalid',
+    }.contains(eventName)) {
+      return DiagnosticLogLevel.error;
+    }
+    if (const <String>{
+      'pairing_cancelled',
+      'pairing_rejected',
+    }.contains(eventName)) {
+      return DiagnosticLogLevel.warning;
+    }
+    return DiagnosticLogLevel.trace;
+  }
+
   /// 注册 RFCOMM 数据回调（监听 C++ 侧 Pigeon FlutterApi `onRfcommData`）。
   void listenRfcommData() {
+    _trace('RFCOMM 数据监听注册', fields: <String, Object?>{'platform': defaultTargetPlatform.name});
     if (_isAndroid) {
       _androidRfcommSubscription ??=
           _androidEvents.receiveBroadcastStream().listen(
         (Object? value) {
           if (value is Uint8List && !_rfcommDataController.isClosed) {
+            _trace('RFCOMM RX', fields: <String, Object?>{
+              'bytes': value.length,
+              'platform': 'android',
+              'transport': 'RFCOMM/SPP',
+              'direction': 'RX',
+              'wireHex': _wireHex(value),
+            });
             _rfcommDataController.add(value);
           }
         },
         onError: (Object error, StackTrace stackTrace) {
+          _error('RFCOMM 数据流错误：$error', fields: <String, Object?>{'platform': 'android', 'errorType': error.runtimeType.toString()});
           if (!_rfcommDataController.isClosed) {
             _rfcommDataController.addError(error, stackTrace);
           }
@@ -390,13 +660,72 @@ class BleTransport {
           .receiveBroadcastStream()
           .listen(
         (Object? value) {
+          if (value is Map) {
+            final event = <String, Object?>{
+              for (final entry in value.entries)
+                entry.key.toString(): entry.value,
+            };
+            final eventName = event['event']?.toString() ?? 'native';
+            final level = _macosNativeEventLevel(eventName);
+            final fields = <String, Object?>{
+              'platform': 'macos',
+              'transport': 'RFCOMM/SPP',
+              'nativeEvent': eventName,
+              ...event,
+            };
+            switch (level) {
+              case DiagnosticLogLevel.error:
+                _logger.error(
+                  'macOS RFCOMM $eventName',
+                  category: DiagnosticLogCategory.communication,
+                  component: 'wristload.RfcommDriver',
+                  event: eventName,
+                  fields: fields,
+                );
+              default:
+                _logger.trace(
+                  'macOS RFCOMM $eventName',
+                  category: DiagnosticLogCategory.communication,
+                  component: 'wristload.RfcommDriver',
+                  event: eventName,
+                  fields: fields,
+                );
+            }
+            // Keep the native event in the same visible journal used by the
+            // diagnostic window; the byte stream is handled below.
+            if (event['kind'] == 'data' && event['wireHex'] is String) {
+              final bytes = _decodeWireHex(event['wireHex']!.toString());
+              if (bytes != null && !_rfcommDataController.isClosed) {
+                _rfcommDataController.add(bytes);
+              }
+            }
+            // `entry` is intentionally retained through the logger; no extra
+            // controller-side history exists in this transport wrapper.
+            return;
+          }
           if (value is Uint8List && !_rfcommDataController.isClosed) {
+            _trace('RFCOMM RX', fields: <String, Object?>{
+              'bytes': value.length,
+              'platform': 'macos',
+              'transport': 'RFCOMM/SPP',
+              'direction': 'RX',
+              'wireHex': _wireHex(value),
+            });
             _rfcommDataController.add(value);
           } else if (value is List<int> && !_rfcommDataController.isClosed) {
-            _rfcommDataController.add(Uint8List.fromList(value));
+            final bytes = Uint8List.fromList(value);
+            _trace('RFCOMM RX', fields: <String, Object?>{
+              'bytes': bytes.length,
+              'platform': 'macos',
+              'transport': 'RFCOMM/SPP',
+              'direction': 'RX',
+              'wireHex': _wireHex(bytes),
+            });
+            _rfcommDataController.add(bytes);
           }
         },
         onError: (Object error, StackTrace stackTrace) {
+          _error('RFCOMM 数据流错误：$error', fields: <String, Object?>{'platform': 'macos', 'errorType': error.runtimeType.toString()});
           if (!_rfcommDataController.isClosed) {
             _rfcommDataController.addError(error, stackTrace);
           }
@@ -413,6 +742,13 @@ class BleTransport {
       if (args == null || args.length < 2) return null;
       final data = args[1];
       if (data is Uint8List && !_rfcommDataController.isClosed) {
+        _trace('RFCOMM RX', fields: <String, Object?>{
+          'bytes': data.length,
+          'platform': 'windows',
+          'transport': 'RFCOMM/SPP',
+          'direction': 'RX',
+          'wireHex': _wireHex(data),
+        });
         _rfcommDataController.add(data);
       }
       return null;
@@ -420,6 +756,7 @@ class BleTransport {
   }
 
   Future<void> disposeRfcommStream() async {
+    _trace('RFCOMM 数据监听释放');
     await _androidRfcommSubscription?.cancel();
     _androidRfcommSubscription = null;
     await _macosRfcommSubscription?.cancel();
@@ -439,12 +776,33 @@ class BleTransport {
     if (!_rfcommDataController.isClosed) {
       await _rfcommDataController.close();
     }
+    _info('RFCOMM 数据监听已释放');
   }
 
   /// 读取特征值（只读操作，用于版本特征等被动读取，不发送任何写帧）。
   Future<Uint8List> readCharacteristic(
     Peripheral peripheral,
     GATTCharacteristic characteristic,
-  ) =>
-      _central.readCharacteristic(peripheral, characteristic);
+  ) async {
+    _trace('GATT 特征读取开始', fields: <String, Object?>{
+      'peripheral': peripheral.uuid.toString(),
+      'characteristic': characteristic.uuid.toString(),
+    });
+    try {
+      final value = await _central.readCharacteristic(peripheral, characteristic);
+      _trace('GATT 特征读取完成', fields: <String, Object?>{
+        'peripheral': peripheral.uuid.toString(),
+        'characteristic': characteristic.uuid.toString(),
+        'bytes': value.length,
+      });
+      return value;
+    } on Object catch (error) {
+      _error('GATT 特征读取失败：$error', fields: <String, Object?>{
+        'peripheral': peripheral.uuid.toString(),
+        'characteristic': characteristic.uuid.toString(),
+        'errorType': error.runtimeType.toString(),
+      });
+      rethrow;
+    }
+  }
 }

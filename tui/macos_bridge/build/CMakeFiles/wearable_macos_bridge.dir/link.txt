@@ -1,1 +1,1 @@
-/usr/bin/clang++ -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/wearable_macos_bridge.dir/main.mm.o -o wearable_macos_bridge  -framework Foundation -framework IOBluetooth
+/usr/bin/clang++ -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/wearable_macos_bridge.dir/main.mm.o -o wearable_macos_bridge  -framework Foundation -framework IOBluetooth -framework IOKit

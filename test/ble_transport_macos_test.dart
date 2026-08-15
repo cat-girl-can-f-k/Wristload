@@ -88,6 +88,24 @@ void main() {
     expect(invoked, isFalse);
   });
 
+  test('forgets only the saved Darwin-to-classic identity mapping', () async {
+    MethodCall? received;
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      received = call;
+      return null;
+    });
+    final transport = BleTransport();
+    final identifier =
+        UUID.fromString('12345678-90ab-cdef-1234-567890abcdef');
+
+    await transport.forgetRfcommIdentity(identifier);
+
+    expect(received?.method, 'forgetIdentity');
+    expect(received?.arguments, <String, Object>{
+      'peripheralId': '12345678-90ab-cdef-1234-567890abcdef',
+    });
+  });
+
   test('a reconnect does not wait for writes queued by the old session',
       () async {
     final firstWriteStarted = Completer<void>();

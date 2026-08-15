@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -21,14 +23,22 @@ class AppsPage extends StatefulWidget {
 class _AppsPageState extends State<AppsPage> {
   DeviceController get controller => widget.controller;
 
+  // A page can be opened before authentication completes.  Keep the refresh
+  // scoped to the authenticated session so controller notifications do not
+  // issue duplicate list requests, while a later reconnect can read again.
+  bool _lastSessionReady = false;
+  int _sessionEpoch = 0;
+  int? _autoRefreshRequestedEpoch;
+
   @override
   void initState() {
     super.initState();
+    _lastSessionReady = controller.sessionReady;
+    if (_lastSessionReady) _sessionEpoch = 1;
     controller.addListener(_onControllerChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && controller.sessionReady) {
-        controller.refreshInstalledWatchApps();
-      }
+      if (!mounted) return;
+      _scheduleAutoRefreshForReadySession();
     });
   }
 
@@ -37,7 +47,13 @@ class _AppsPageState extends State<AppsPage> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.controller == widget.controller) return;
     oldWidget.controller.removeListener(_onControllerChanged);
+    _lastSessionReady = controller.sessionReady;
+    _sessionEpoch++;
+    _autoRefreshRequestedEpoch = null;
     controller.addListener(_onControllerChanged);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _scheduleAutoRefreshForReadySession();
+    });
   }
 
   @override
@@ -47,7 +63,40 @@ class _AppsPageState extends State<AppsPage> {
   }
 
   void _onControllerChanged() {
+    final sessionReady = controller.sessionReady;
+    if (sessionReady != _lastSessionReady) {
+      _lastSessionReady = sessionReady;
+      _sessionEpoch++;
+      if (!sessionReady) {
+        _autoRefreshRequestedEpoch = null;
+      } else {
+        _scheduleAutoRefreshForReadySession();
+      }
+    }
     if (mounted) setState(() {});
+  }
+
+  void _scheduleAutoRefreshForReadySession() {
+    if (!controller.sessionReady ||
+        controller.quickAppsLoadedForCurrentSession ||
+        _autoRefreshRequestedEpoch == _sessionEpoch) {
+      return;
+    }
+    final epoch = _sessionEpoch;
+    _autoRefreshRequestedEpoch = epoch;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || epoch != _sessionEpoch || !controller.sessionReady) {
+        return;
+      }
+      unawaited(_refreshForSession(epoch));
+    });
+  }
+
+  Future<void> _refreshForSession(int epoch) async {
+    if (!mounted || epoch != _sessionEpoch || !controller.sessionReady) {
+      return;
+    }
+    await controller.refreshInstalledWatchApps();
   }
 
   Future<void> _refresh() async {
@@ -55,13 +104,20 @@ class _AppsPageState extends State<AppsPage> {
       _showMessage('请先连接并完成设备鉴权', error: true);
       return;
     }
+    final sessionEpoch = controller.quickAppSessionEpoch;
     await controller.refreshInstalledWatchApps();
-    if (!mounted || controller.watchAppsError == null) return;
+    if (!mounted ||
+        !controller.sessionReady ||
+        controller.quickAppSessionEpoch != sessionEpoch ||
+        controller.watchAppsError == null) {
+      return;
+    }
     _showMessage(controller.watchAppsError!, error: true);
   }
 
   Future<void> _uninstall(WatchAppItem app) async {
-    final confirmed = await showDialog<bool>(
+    final confirmed =
+        await showDialog<bool>(
           context: context,
           builder: (dialogContext) => AlertDialog(
             title: const Text('卸载快应用？'),
@@ -80,20 +136,30 @@ class _AppsPageState extends State<AppsPage> {
         ) ??
         false;
     if (!confirmed || !mounted) return;
+    final sessionEpoch = controller.quickAppSessionEpoch;
     final success = await controller.uninstallWatchApp(app);
-    if (!mounted) return;
+    if (!mounted ||
+        !controller.sessionReady ||
+        controller.quickAppSessionEpoch != sessionEpoch) {
+      return;
+    }
     final error = controller.watchAppsError;
-    _showMessage(success ? '已发送卸载请求' : (error ?? '卸载失败'), error: !success);
+    _showMessage(
+      success ? '卸载已确认（SPP ACK）' : (error ?? '卸载失败'),
+      error: !success,
+    );
   }
 
   void _showMessage(String message, {bool error = false}) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(
-        content: Text(message),
-        backgroundColor: error ? Theme.of(context).colorScheme.error : null,
-      ));
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          backgroundColor: error ? Theme.of(context).colorScheme.error : null,
+        ),
+      );
   }
 
   @override
@@ -117,8 +183,10 @@ class _AppsPageState extends State<AppsPage> {
                     children: [
                       Text('快应用', style: theme.textTheme.headlineSmall),
                       const SizedBox(height: 4),
-                      Text('查看和管理已安装在设备上的快应用',
-                          style: theme.textTheme.bodyMedium),
+                      Text(
+                        '查看和管理已安装在设备上的快应用',
+                        style: theme.textTheme.bodyMedium,
+                      ),
                     ],
                   ),
                 ),
@@ -169,13 +237,19 @@ class _AppsPageState extends State<AppsPage> {
               Text('${apps.length} 个快应用', style: theme.textTheme.titleMedium),
               const SizedBox(height: 10),
               for (final app in apps)
-                _AppCard(app: app, onUninstall: _uninstall),
+                _AppCard(
+                  app: app,
+                  onUninstall: _uninstall,
+                  uninstallEnabled: !controller.watchAppsLoading,
+                ),
             ],
             if (controller.watchAppsError != null && apps.isNotEmpty)
               Padding(
                 padding: const EdgeInsets.only(top: 12),
-                child: Text(controller.watchAppsError!,
-                    style: TextStyle(color: colors.error)),
+                child: Text(
+                  controller.watchAppsError!,
+                  style: TextStyle(color: colors.error),
+                ),
               ),
           ],
         ),
@@ -185,10 +259,15 @@ class _AppsPageState extends State<AppsPage> {
 }
 
 class _AppCard extends StatelessWidget {
-  const _AppCard({required this.app, required this.onUninstall});
+  const _AppCard({
+    required this.app,
+    required this.onUninstall,
+    required this.uninstallEnabled,
+  });
 
   final WatchAppItem app;
   final Future<void> Function(WatchAppItem) onUninstall;
+  final bool uninstallEnabled;
 
   String _fingerprint() => app.fingerprint
       .map((value) => value.toRadixString(16).padLeft(2, '0'))
@@ -200,8 +279,9 @@ class _AppCard extends StatelessWidget {
     if (value.isEmpty) return;
     await Clipboard.setData(ClipboardData(text: value));
     if (!context.mounted) return;
-    ScaffoldMessenger.of(context)
-        .showSnackBar(const SnackBar(content: Text('指纹已复制')));
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('指纹已复制')));
   }
 
   @override
@@ -234,20 +314,24 @@ class _AppCard extends StatelessWidget {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(app.displayName,
-                          style: theme.textTheme.titleMedium,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis),
-                      Text(app.packageName,
-                          style: theme.textTheme.bodySmall,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis),
+                      Text(
+                        app.displayName,
+                        style: theme.textTheme.titleMedium,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      Text(
+                        app.packageName,
+                        style: theme.textTheme.bodySmall,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
                     ],
                   ),
                 ),
                 if (app.canRemove)
                   OutlinedButton.icon(
-                    onPressed: () => onUninstall(app),
+                    onPressed: uninstallEnabled ? () => onUninstall(app) : null,
                     icon: const Icon(Icons.delete_outline),
                     label: const Text('卸载'),
                   )
@@ -293,9 +377,10 @@ class _Detail extends StatelessWidget {
       children: [
         Text(label, style: theme.textTheme.labelMedium),
         const SizedBox(height: 2),
-        SelectableText(value,
-            style:
-                theme.textTheme.bodySmall?.copyWith(fontFamily: 'monospace')),
+        SelectableText(
+          value,
+          style: theme.textTheme.bodySmall?.copyWith(fontFamily: 'monospace'),
+        ),
       ],
     );
   }
@@ -332,10 +417,13 @@ class _EmptyState extends StatelessWidget {
           const SizedBox(height: 14),
           Text(title, style: theme.textTheme.titleLarge),
           const SizedBox(height: 6),
-          Text(message,
-              style: theme.textTheme.bodyMedium
-                  ?.copyWith(color: colors.onSurfaceVariant),
-              textAlign: TextAlign.center),
+          Text(
+            message,
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: colors.onSurfaceVariant,
+            ),
+            textAlign: TextAlign.center,
+          ),
           if (action != null) ...[const SizedBox(height: 16), action!],
         ],
       ),

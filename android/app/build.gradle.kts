@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.wristload"
+    namespace = "com.anemo.wristload"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -15,9 +15,7 @@ android {
     }
 
     defaultConfig {
-        // The deployment ID remains stable across the Wristload rebrand so
-        // installed copies can upgrade in place and migrate their encrypted authkey.
-        applicationId = "com.example.miwearable_install_tool"
+        applicationId = "com.anemo.wristload"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion

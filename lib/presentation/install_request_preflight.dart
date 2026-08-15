@@ -44,15 +44,21 @@ class InstallRequestPreflight {
     if (request.kind == InstallKind.watchface) {
       if (controller.watchfaceCompatibilityError(metadata) != null &&
           !resolutionConfirmed) {
-        resolutionConfirmed =
-            await _confirmWatchfaceResolution(context, controller, metadata);
+        resolutionConfirmed = await _confirmWatchfaceResolution(
+          context,
+          controller,
+          metadata,
+        );
         if (!resolutionConfirmed || !context.mounted) return null;
       }
 
       if (controller.requiresUnsupportedLuaConfirmation(metadata) &&
           !luaConfirmed) {
-        luaConfirmed =
-            await _confirmUnsupportedLua(context, controller, metadata);
+        luaConfirmed = await _confirmUnsupportedLua(
+          context,
+          controller,
+          metadata,
+        );
         if (!luaConfirmed || !context.mounted) return null;
       }
 
@@ -154,125 +160,117 @@ class InstallRequestPreflight {
     BuildContext context,
     InstallMetadata metadata,
   ) async {
-    final input = TextEditingController(text: metadata.faceId);
+    // Let TextFormField own its controller until the dialog route is actually
+    // disposed. Disposing a caller-owned controller after showDialog returns
+    // races the reverse route animation on desktop Flutter.
+    var faceId = metadata.faceId ?? '';
     final formKey = GlobalKey<FormState>();
-    try {
-      return await showDialog<InstallMetadata>(
-        context: context,
-        barrierDismissible: false,
-        builder: (dialogContext) => AlertDialog(
-          title: const Text('表盘 faceId'),
-          content: Form(
-            key: formKey,
-            child: TextFormField(
-              controller: input,
-              autofocus: true,
-              keyboardType: TextInputType.number,
-              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-              decoration: const InputDecoration(
-                labelText: '从表盘资源解析，可按需编辑',
-                border: OutlineInputBorder(),
-              ),
-              validator: (value) =>
-                  _validFaceId(value) ? null : 'faceId 必须是非空数值',
-              onFieldSubmitted: (_) {
-                if (!formKey.currentState!.validate()) return;
-                Navigator.pop(
-                  dialogContext,
-                  metadata.copyWith(faceId: input.text.trim()),
-                );
-              },
+    return showDialog<InstallMetadata>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('表盘 faceId'),
+        content: Form(
+          key: formKey,
+          child: TextFormField(
+            initialValue: faceId,
+            onChanged: (value) => faceId = value,
+            autofocus: true,
+            keyboardType: TextInputType.number,
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+            decoration: const InputDecoration(
+              labelText: '从表盘资源解析，可按需编辑',
+              border: OutlineInputBorder(),
             ),
+            validator: (value) => _validFaceId(value) ? null : 'faceId 必须是非空数值',
+            onFieldSubmitted: (value) {
+              faceId = value;
+              if (!formKey.currentState!.validate()) return;
+              Navigator.pop(
+                dialogContext,
+                metadata.copyWith(faceId: faceId.trim()),
+              );
+            },
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('取消'),
-            ),
-            FilledButton(
-              onPressed: () {
-                if (!formKey.currentState!.validate()) return;
-                Navigator.pop(
-                  dialogContext,
-                  metadata.copyWith(faceId: input.text.trim()),
-                );
-              },
-              child: const Text('继续'),
-            ),
-          ],
         ),
-      );
-    } finally {
-      input.dispose();
-    }
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () {
+              if (!formKey.currentState!.validate()) return;
+              Navigator.pop(
+                dialogContext,
+                metadata.copyWith(faceId: faceId.trim()),
+              );
+            },
+            child: const Text('继续'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<InstallMetadata?> _editRpkVersion(
     BuildContext context,
     InstallMetadata metadata,
   ) async {
-    final input = TextEditingController(
-      text: metadata.versionCode?.toString() ?? '',
-    );
+    var versionText = metadata.versionCode?.toString() ?? '';
     final formKey = GlobalKey<FormState>();
-    try {
-      return await showDialog<InstallMetadata>(
-        context: context,
-        barrierDismissible: false,
-        builder: (dialogContext) => AlertDialog(
-          title: const Text('RPK 版本号'),
-          content: Form(
-            key: formKey,
-            child: TextFormField(
-              controller: input,
-              autofocus: true,
-              keyboardType: TextInputType.number,
-              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-              decoration: InputDecoration(
-                labelText: '包名：${metadata.packageName}',
-                helperText: '包名必须来自 RPK 清单，不能手动修改。',
-                border: const OutlineInputBorder(),
-              ),
-              validator: (value) {
-                final version = int.tryParse(value?.trim() ?? '');
-                return _validRpkVersion(version)
-                    ? null
-                    : '请输入 1–$maxRpkVersionCode';
-              },
-              onFieldSubmitted: (_) {
-                if (!formKey.currentState!.validate()) return;
-                Navigator.pop(
-                  dialogContext,
-                  metadata.copyWith(
-                    versionCode: int.parse(input.text.trim()),
-                  ),
-                );
-              },
+    return showDialog<InstallMetadata>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('RPK 版本号'),
+        content: Form(
+          key: formKey,
+          child: TextFormField(
+            initialValue: versionText,
+            onChanged: (value) => versionText = value,
+            autofocus: true,
+            keyboardType: TextInputType.number,
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+            decoration: InputDecoration(
+              labelText: '包名：${metadata.packageName}',
+              helperText: '包名必须来自 RPK 清单，不能手动修改。',
+              border: const OutlineInputBorder(),
             ),
+            validator: (value) {
+              final version = int.tryParse(value?.trim() ?? '');
+              return _validRpkVersion(version)
+                  ? null
+                  : '请输入 1–$maxRpkVersionCode';
+            },
+            onFieldSubmitted: (value) {
+              versionText = value;
+              if (!formKey.currentState!.validate()) return;
+              Navigator.pop(
+                dialogContext,
+                metadata.copyWith(versionCode: int.parse(versionText.trim())),
+              );
+            },
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('取消'),
-            ),
-            FilledButton(
-              onPressed: () {
-                if (!formKey.currentState!.validate()) return;
-                Navigator.pop(
-                  dialogContext,
-                  metadata.copyWith(
-                    versionCode: int.parse(input.text.trim()),
-                  ),
-                );
-              },
-              child: const Text('继续'),
-            ),
-          ],
         ),
-      );
-    } finally {
-      input.dispose();
-    }
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () {
+              if (!formKey.currentState!.validate()) return;
+              Navigator.pop(
+                dialogContext,
+                metadata.copyWith(versionCode: int.parse(versionText.trim())),
+              );
+            },
+            child: const Text('继续'),
+          ),
+        ],
+      ),
+    );
   }
 
   static bool _validFaceId(String? value) =>

@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:window_manager/window_manager.dart';
 
 import '../application/floating_window_coordinator.dart';
+import '../application/diagnostic_log_service.dart';
 import '../application/theme_controller.dart';
 import '../domain/floating_install_snapshot.dart';
 import '../platform/security_scoped_file_access.dart';
@@ -43,6 +44,7 @@ class _FloatingInstallWindowAppState extends State<FloatingInstallWindowApp>
   }
 
   Future<void> _initialize() async {
+    appLogger.info('浮动安装窗口引擎初始化开始', category: DiagnosticLogCategory.ui);
     try {
       await _channel.setMethodCallHandler(_handleMainCall);
       await windowManager.waitUntilReadyToShow(
@@ -63,13 +65,25 @@ class _FloatingInstallWindowAppState extends State<FloatingInstallWindowApp>
         },
       );
       await _channel.invokeMethod<void>('ready');
+      appLogger.info('浮动安装窗口引擎已就绪', category: DiagnosticLogCategory.ui);
     } on Object catch (error, stackTrace) {
-      debugPrint('Floating window initialization failed: $error');
-      debugPrintStack(stackTrace: stackTrace);
+      appLogger.error(
+        '浮动安装窗口引擎初始化失败',
+        category: DiagnosticLogCategory.ui,
+        fields: <String, Object?>{
+          'errorType': error.runtimeType.toString(),
+          'stackTrace': stackTrace.toString(),
+        },
+      );
     }
   }
 
   Future<Object?> _handleMainCall(MethodCall call) async {
+    appLogger.trace(
+      '浮动安装窗口引擎收到命令',
+      category: DiagnosticLogCategory.communication,
+      fields: <String, Object?>{'method': call.method},
+    );
     switch (call.method) {
       case 'snapshot':
         final values = call.arguments;
@@ -121,6 +135,11 @@ class _FloatingInstallWindowAppState extends State<FloatingInstallWindowApp>
   }
 
   Future<void> _addFiles(List<ScopedFileRef> files) async {
+    appLogger.trace(
+      '浮动安装窗口提交文件导入',
+      category: DiagnosticLogCategory.communication,
+      fields: <String, Object?>{'fileCount': files.length},
+    );
     Map<Object?, Object?>? result;
     try {
       result = await _channel.invokeMethod<Map<Object?, Object?>>(
@@ -133,7 +152,12 @@ class _FloatingInstallWindowAppState extends State<FloatingInstallWindowApp>
             },
         ]},
       );
-    } on Object {
+    } on Object catch (error) {
+      appLogger.error(
+        '浮动安装窗口提交文件导入失败',
+        category: DiagnosticLogCategory.communication,
+        fields: <String, Object?>{'errorType': error.runtimeType.toString()},
+      );
       if (mounted) _showNotice('无法连接主窗口，请稍后重试', error: true);
       return;
     }

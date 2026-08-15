@@ -17,8 +17,9 @@ import 'package:wristload/presentation/tools_page.dart';
 
 void main() {
   test('known profile hints stay restricted to verified observations', () {
-    final hints =
-        DeviceProfile.recognized.expand((profile) => profile.modelHints);
+    final hints = DeviceProfile.recognized.expand(
+      (profile) => profile.modelHints,
+    );
     expect(hints, contains('miwear.watch.n66'));
     expect(hints, contains('miwear.watch.o63'));
     expect(hints, contains('hqbd3.watch.l67'));
@@ -28,42 +29,62 @@ void main() {
 
   test('设备名称按具体型号优先分类', () {
     expect(
-      DeviceProfile.matchAdvertisementName('Xiaomi Smart Band 9Pro CCF2')
-          ?.family,
+      DeviceProfile.matchAdvertisementName(
+        'Xiaomi Smart Band 9Pro CCF2',
+      )?.family,
       DeviceFamily.band9Pro,
     );
     expect(
       DeviceProfile.matchAdvertisementName('Xiaomi Smart Band 10 Pro')?.family,
       DeviceFamily.band10Pro,
     );
-    expect(DeviceProfile.matchAdvertisementName('Xiaomi Watch S4')?.family,
-        DeviceFamily.watchS4);
-    expect(DeviceProfile.matchAdvertisementName('Xiaomi Watch S5')?.family,
-        DeviceFamily.watchS5);
-    expect(DeviceProfile.matchAdvertisementName('REDMI Watch5')?.family,
-        DeviceFamily.redmiWatch5);
-    expect(DeviceProfile.matchAdvertisementName('redmi watch 6')?.family,
-        DeviceFamily.redmiWatch6);
-    expect(DeviceProfile.matchAdvertisementName('REDMI Watch 4')?.family,
-        DeviceFamily.redmiWatch4);
     expect(
-        DeviceProfile.matchAdvertisementName('Xiaomi Smart Band 8 Pro')?.family,
-        DeviceFamily.band8Pro);
+      DeviceProfile.matchAdvertisementName('Xiaomi Watch S4')?.family,
+      DeviceFamily.watchS4,
+    );
     expect(
-        DeviceProfile.matchAdvertisementName('Xiaomi Smart Band 7Pro')?.family,
-        DeviceFamily.band7Pro);
+      DeviceProfile.matchAdvertisementName('Xiaomi Watch S5')?.family,
+      DeviceFamily.watchS5,
+    );
+    expect(
+      DeviceProfile.matchAdvertisementName('REDMI Watch5')?.family,
+      DeviceFamily.redmiWatch5,
+    );
+    expect(
+      DeviceProfile.matchAdvertisementName('redmi watch 6')?.family,
+      DeviceFamily.redmiWatch6,
+    );
+    expect(
+      DeviceProfile.matchAdvertisementName('REDMI Watch 4')?.family,
+      DeviceFamily.redmiWatch4,
+    );
+    expect(
+      DeviceProfile.matchAdvertisementName('Xiaomi Smart Band 8 Pro')?.family,
+      DeviceFamily.band8Pro,
+    );
+    expect(
+      DeviceProfile.matchAdvertisementName('Xiaomi Smart Band 7Pro')?.family,
+      DeviceFamily.band7Pro,
+    );
   });
 
   test('Sport 名称不再单独拒绝且已知设备分辨率正确', () {
     expect(
-        DeviceProfile.matchAdvertisementName('Xiaomi Watch S4 Sport')?.family,
-        DeviceFamily.watchS4);
-    expect(DeviceProfile.band9Pro.watchfaceResolution,
-        const WatchfaceResolution(336, 480));
-    expect(DeviceProfile.redmiWatch5.watchfaceResolution,
-        const WatchfaceResolution(432, 514));
-    expect(DeviceProfile.watchS5.watchfaceResolution,
-        const WatchfaceResolution(464, 464));
+      DeviceProfile.matchAdvertisementName('Xiaomi Watch S4 Sport')?.family,
+      DeviceFamily.watchS4,
+    );
+    expect(
+      DeviceProfile.band9Pro.watchfaceResolution,
+      const WatchfaceResolution(336, 480),
+    );
+    expect(
+      DeviceProfile.redmiWatch5.watchfaceResolution,
+      const WatchfaceResolution(432, 514),
+    );
+    expect(
+      DeviceProfile.watchS5.watchfaceResolution,
+      const WatchfaceResolution(464, 464),
+    );
     expect(DeviceProfile.band8Pro.generation, ProtocolGeneration.v1Vela);
     expect(DeviceProfile.band7Pro.generation, ProtocolGeneration.huamiZepp);
     expect(DeviceProfile.redmiWatch4.generation, ProtocolGeneration.unknown);
@@ -88,15 +109,17 @@ void main() {
       bytesPerSecond: 2048,
       transferElapsed: Duration(seconds: 3),
     );
-    await tester.pumpWidget(MaterialApp(
-      home: Scaffold(
-        body: InstallTaskCard(
-          task: task,
-          onCancel: () async {},
-          onRetry: () async {},
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: InstallTaskCard(
+            task: task,
+            onCancel: () async {},
+            onRetry: () async {},
+          ),
         ),
       ),
-    ));
+    );
 
     expect(find.text('demo.rpk'), findsOneWidget);
     expect(find.textContaining('1.0 KB/4.0 KB'), findsOneWidget);
@@ -147,15 +170,17 @@ void main() {
       transferElapsed: Duration(milliseconds: 1999),
     );
 
-    await tester.pumpWidget(MaterialApp(
-      home: Scaffold(
-        body: InstallTaskCard(
-          task: task,
-          onCancel: () async {},
-          onRetry: () async {},
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: InstallTaskCard(
+            task: task,
+            onCancel: () async {},
+            onRetry: () async {},
+          ),
         ),
       ),
-    ));
+    );
 
     expect(find.textContaining('2.0 KB/s'), findsOneWidget);
     expect(find.textContaining('预计剩余'), findsNothing);
@@ -184,17 +209,19 @@ void main() {
       transferElapsed: Duration(seconds: 3),
     );
 
-    await tester.pumpWidget(MaterialApp(
-      home: Scaffold(
-        body: SingleChildScrollView(
-          child: InstallTaskCard(
-            task: task,
-            onCancel: () async {},
-            onRetry: () async {},
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SingleChildScrollView(
+            child: InstallTaskCard(
+              task: task,
+              onCancel: () async {},
+              onRetry: () async {},
+            ),
           ),
         ),
       ),
-    ));
+    );
     await tester.pumpAndSettle();
 
     expect(tester.takeException(), isNull);
@@ -218,15 +245,17 @@ void main() {
       transferElapsed: Duration(seconds: 2),
     );
 
-    await tester.pumpWidget(MaterialApp(
-      home: Scaffold(
-        body: InstallTaskCard(
-          task: task,
-          onCancel: () async {},
-          onRetry: () async {},
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: InstallTaskCard(
+            task: task,
+            onCancel: () async {},
+            onRetry: () async {},
+          ),
         ),
       ),
-    ));
+    );
 
     expect(find.text('取消'), findsNothing);
     expect(find.text('100.0%'), findsOneWidget);
@@ -247,15 +276,17 @@ void main() {
       transferElapsed: Duration(seconds: 3),
     );
 
-    await tester.pumpWidget(MaterialApp(
-      home: Scaffold(
-        body: InstallTaskCard(
-          task: task,
-          onCancel: () async => cancelCalls++,
-          onRetry: () async {},
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: InstallTaskCard(
+            task: task,
+            onCancel: () async => cancelCalls++,
+            onRetry: () async {},
+          ),
         ),
       ),
-    ));
+    );
 
     await tester.tap(find.text('取消'));
     await tester.pumpAndSettle();
@@ -294,22 +325,21 @@ void main() {
       averageBytesPerSecond: 2048,
     );
 
-    await tester.pumpWidget(MaterialApp(
-      home: Scaffold(
-        body: InstallTaskCard(
-          task: task,
-          onCancel: () async {},
-          onRetry: () async {},
-          onClear: () => clearCalls++,
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: InstallTaskCard(
+            task: task,
+            onCancel: () async {},
+            onRetry: () async {},
+            onClear: () => clearCalls++,
+          ),
         ),
       ),
-    ));
+    );
 
     expect(find.text('demo.rpk'), findsOneWidget);
-    expect(
-      find.text('快应用 · com.example.demo · 版本：42'),
-      findsOneWidget,
-    );
+    expect(find.text('快应用 · com.example.demo · 版本：42'), findsOneWidget);
     expect(find.byIcon(Icons.check_circle), findsOneWidget);
     expect(find.text('安装完成'), findsOneWidget);
     expect(find.text('用时 1 分 5 秒'), findsOneWidget);
@@ -357,16 +387,18 @@ void main() {
       elapsed: Duration(seconds: 9),
     );
 
-    await tester.pumpWidget(MaterialApp(
-      home: Scaffold(
-        body: InstallTaskCard(
-          task: task,
-          onCancel: () async {},
-          onRetry: () async => retryCalls++,
-          onClear: () => clearCalls++,
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: InstallTaskCard(
+            task: task,
+            onCancel: () async {},
+            onRetry: () async => retryCalls++,
+            onClear: () => clearCalls++,
+          ),
         ),
       ),
-    ));
+    );
 
     expect(find.text('broken.face'), findsOneWidget);
     expect(find.text('表盘 · ID 1234'), findsOneWidget);
@@ -407,19 +439,19 @@ void main() {
 
   testWidgets('安装警告倒计时结束后才能确认，且可取消', (tester) async {
     Future<bool?> openDialog() async => showDialog<bool>(
-          context: tester.element(find.byType(Scaffold)),
-          barrierDismissible: false,
-          builder: (_) => InstallWarningDialog(
-            title: '表盘分辨率不匹配',
-            message: '安装后可能无法正常显示或使用',
-            rows: const [
-              ('表盘分辨率', '336×480', false),
-              ('设备分辨率', '432×514', true),
-              ('文件名', 'demo.face', false),
-            ],
-            onConfirm: () {},
-          ),
-        );
+      context: tester.element(find.byType(Scaffold)),
+      barrierDismissible: false,
+      builder: (_) => InstallWarningDialog(
+        title: '表盘分辨率不匹配',
+        message: '安装后可能无法正常显示或使用',
+        rows: const [
+          ('表盘分辨率', '336×480', false),
+          ('设备分辨率', '432×514', true),
+          ('文件名', 'demo.face', false),
+        ],
+        onConfirm: () {},
+      ),
+    );
 
     await tester.pumpWidget(const MaterialApp(home: Scaffold()));
     final cancelled = openDialog();
@@ -488,31 +520,35 @@ void main() {
     );
     final decoration = banner.decoration as BoxDecoration;
     expect(decoration.color, scheme.errorContainer);
-    final warningText = tester.widget<Text>(find.descendant(
-      of: find.byKey(const ValueKey('unlock-warning-banner')),
-      matching: find.byType(Text),
-    ));
+    final warningText = tester.widget<Text>(
+      find.descendant(
+        of: find.byKey(const ValueKey('unlock-warning-banner')),
+        matching: find.byType(Text),
+      ),
+    );
     expect(warningText.style?.color, scheme.onErrorContainer);
   });
 
   testWidgets('设置页显示发送窗口间隔与每窗口分片数', (tester) async {
     int? interval;
     int? windowSize;
-    await tester.pumpWidget(MaterialApp(
-      home: Scaffold(
-        body: TransferSettingsPage(
-          connectionMode: ConnectionMode.modern,
-          preferredInstallTarget: InstallPreference.watchface,
-          connectionModeEnabled: true,
-          segmentIntervalMs: 5,
-          massWindowSize: 50,
-          onConnectionModeChanged: (_) {},
-          onSegmentIntervalChanged: (value) => interval = value,
-          onMassWindowSizeChanged: (value) => windowSize = value,
-          onPreferredInstallTargetChanged: (_) {},
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: TransferSettingsPage(
+            connectionMode: ConnectionMode.modern,
+            preferredInstallTarget: InstallPreference.watchface,
+            connectionModeEnabled: true,
+            segmentIntervalMs: 5,
+            massWindowSize: 50,
+            onConnectionModeChanged: (_) {},
+            onSegmentIntervalChanged: (value) => interval = value,
+            onMassWindowSizeChanged: (value) => windowSize = value,
+            onPreferredInstallTargetChanged: (_) {},
+          ),
         ),
       ),
-    ));
+    );
 
     await tester.scrollUntilVisible(
       find.text('发送窗口间隔'),
@@ -683,25 +719,25 @@ void main() {
     InstallKind? installed;
 
     Future<void> pump(InstallKind target) => tester.pumpWidget(
-          MaterialApp(
-            home: Scaffold(
-              body: InstallSplitButton(
-                preferredTarget: target == InstallKind.watchface
-                    ? InstallPreference.watchface
-                    : InstallPreference.quickApp,
-                enabled: true,
-                onInstall: (value) async => installed = value,
-                onInstallFirmware: () async {},
-              ),
-            ),
+      MaterialApp(
+        home: Scaffold(
+          body: InstallSplitButton(
+            preferredTarget: target == InstallKind.watchface
+                ? InstallPreference.watchface
+                : InstallPreference.quickApp,
+            enabled: true,
+            onInstall: (value) async => installed = value,
+            onInstallFirmware: () async {},
           ),
-        );
+        ),
+      ),
+    );
 
     await pump(InstallKind.watchface);
     expect(find.text('安装表盘 .bin / .face'), findsOneWidget);
-    final popup = tester.widget(
-      find.byKey(const ValueKey('install-menu-popup')),
-    ) as dynamic;
+    final popup =
+        tester.widget(find.byKey(const ValueKey('install-menu-popup')))
+            as dynamic;
     expect(
       popup.borderRadius,
       const BorderRadius.horizontal(
@@ -876,8 +912,10 @@ void main() {
 
     await tester.tap(find.byKey(const ValueKey('install-menu-popup')));
     await tester.pump();
-    expect(find.byKey(const ValueKey('alternate-install-menu-item')),
-        findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('alternate-install-menu-item')),
+      findsOneWidget,
+    );
 
     await tester.pumpWidget(
       const MaterialApp(
@@ -895,7 +933,9 @@ void main() {
     addTearDown(controller.dispose);
 
     await tester.pumpWidget(
-      MaterialApp(home: Scaffold(body: QueuePage(controller: controller))),
+      MaterialApp(
+        home: Scaffold(body: QueuePage(controller: controller)),
+      ),
     );
 
     expect(find.text('安装队列 · 0 项'), findsOneWidget);
@@ -924,7 +964,9 @@ void main() {
     controller.installQueue.single.stage = QueueStage.done;
 
     await tester.pumpWidget(
-      MaterialApp(home: Scaffold(body: QueuePage(controller: controller))),
+      MaterialApp(
+        home: Scaffold(body: QueuePage(controller: controller)),
+      ),
     );
 
     expect(find.text('添加文件'), findsOneWidget);
@@ -954,7 +996,9 @@ void main() {
       ..failureAttempts = 2;
 
     await tester.pumpWidget(
-      MaterialApp(home: Scaffold(body: QueuePage(controller: controller))),
+      MaterialApp(
+        home: Scaffold(body: QueuePage(controller: controller)),
+      ),
     );
 
     expect(find.text('失败 · 重试'), findsOneWidget);

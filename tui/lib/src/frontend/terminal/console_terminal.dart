@@ -13,6 +13,7 @@ class ConsoleTerminal implements Terminal {
 
   late final StreamSubscription<void> _resizeSub;
   final _resizeController = StreamController<void>.broadcast();
+  bool _mouseCaptureEnabled = false;
 
   @override
   int get rows {
@@ -87,6 +88,20 @@ class ConsoleTerminal implements Terminal {
   }
 
   @override
+  void setMouseCapture(bool enabled) {
+    if (_mouseCaptureEnabled == enabled) return;
+    _mouseCaptureEnabled = enabled;
+    try {
+      // 1002 reports button motion, while 1006 makes coordinates unambiguous
+      // decimal values (SGR: ESC [ < b ; x ; y M/m).
+      Console.write(
+          enabled ? '\x1b[?1002h\x1b[?1006h' : '\x1b[?1002l\x1b[?1006l');
+    } on StdoutException {
+      // stdout may already be closed during shutdown.
+    }
+  }
+
+  @override
   Stream<List<int>> get byteStream => stdin;
 
   @override
@@ -104,6 +119,7 @@ class ConsoleTerminal implements Terminal {
     _resizeSub.cancel();
     _resizeController.close();
     try {
+      setMouseCapture(false);
       Console.resetAll();
       setCursorVisible(true);
       setRawMode(false);

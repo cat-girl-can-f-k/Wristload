@@ -12,13 +12,17 @@ class TransferSettingsPage extends StatelessWidget {
     required this.segmentIntervalMs,
     required this.massWindowSize,
     this.autoTimeSync = false,
+    this.autoConnectLastDevice = true,
     this.floatingInstallWindowEnabled = false,
+    this.autoOpenDiagnosticLog = false,
     this.themeSeedColor = const Color(0xFF6750A4),
     required this.onConnectionModeChanged,
     required this.onSegmentIntervalChanged,
     required this.onMassWindowSizeChanged,
     this.onAutoTimeSyncChanged,
+    this.onAutoConnectLastDeviceChanged,
     this.onFloatingInstallWindowEnabledChanged,
+    this.onAutoOpenDiagnosticLogChanged,
     this.onReplayOobe,
     this.onThemeSeedChanged,
     this.onEditAuthKey,
@@ -32,13 +36,17 @@ class TransferSettingsPage extends StatelessWidget {
   final int segmentIntervalMs;
   final int massWindowSize;
   final bool autoTimeSync;
+  final bool autoConnectLastDevice;
   final bool floatingInstallWindowEnabled;
+  final bool autoOpenDiagnosticLog;
   final Color themeSeedColor;
   final ValueChanged<ConnectionMode> onConnectionModeChanged;
   final ValueChanged<int> onSegmentIntervalChanged;
   final ValueChanged<int> onMassWindowSizeChanged;
   final ValueChanged<bool>? onAutoTimeSyncChanged;
+  final ValueChanged<bool>? onAutoConnectLastDeviceChanged;
   final ValueChanged<bool>? onFloatingInstallWindowEnabledChanged;
+  final ValueChanged<bool>? onAutoOpenDiagnosticLogChanged;
   final VoidCallback? onReplayOobe;
   final ValueChanged<Color>? onThemeSeedChanged;
   final VoidCallback? onEditAuthKey;
@@ -79,6 +87,15 @@ class TransferSettingsPage extends StatelessWidget {
             const Divider(height: 40),
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
+              secondary: const Icon(Icons.power_settings_new_outlined),
+              title: const Text('启动时自动连接上次设备'),
+              subtitle: const Text('启动后自动连接最近一次完成鉴权的设备；关闭后可在主页历史设备区域手动连接。'),
+              value: autoConnectLastDevice,
+              onChanged: onAutoConnectLastDeviceChanged,
+            ),
+            const Divider(height: 40),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
               secondary: const Icon(Icons.picture_in_picture_alt_outlined),
               title: const Text('启用悬浮安装窗'),
               subtitle: Text(
@@ -88,6 +105,19 @@ class TransferSettingsPage extends StatelessWidget {
               ),
               value: floatingInstallWindowEnabled,
               onChanged: onFloatingInstallWindowEnabledChanged,
+            ),
+            const Divider(height: 40),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              secondary: const Icon(Icons.article_outlined),
+              title: const Text('启动时自动打开诊断日志'),
+              subtitle: Text(
+                onAutoOpenDiagnosticLogChanged == null
+                    ? '诊断日志独立窗口目前仅支持 Windows 和 macOS。'
+                    : '下次启动 Wristload 时自动打开诊断日志独立窗口。',
+              ),
+              value: autoOpenDiagnosticLog,
+              onChanged: onAutoOpenDiagnosticLogChanged,
             ),
             const Divider(height: 40),
             ListTile(
@@ -158,11 +188,7 @@ class TransferSettingsPage extends StatelessWidget {
 }
 
 class ThemeColorSelector extends StatelessWidget {
-  const ThemeColorSelector({
-    required this.value,
-    this.onChanged,
-    super.key,
-  });
+  const ThemeColorSelector({required this.value, this.onChanged, super.key});
 
   final Color value;
   final ValueChanged<Color>? onChanged;
@@ -198,14 +224,16 @@ class ThemeColorSelector extends StatelessWidget {
           spacing: 14,
           runSpacing: 12,
           children: _choices
-              .map((choice) => _ThemeColorChoice(
-                    name: choice.name,
-                    color: choice.color,
-                    selected: choice.color.toARGB32() == value.toARGB32(),
-                    onTap: onChanged == null
-                        ? null
-                        : () => onChanged!(choice.color),
-                  ))
+              .map(
+                (choice) => _ThemeColorChoice(
+                  name: choice.name,
+                  color: choice.color,
+                  selected: choice.color.toARGB32() == value.toARGB32(),
+                  onTap: onChanged == null
+                      ? null
+                      : () => onChanged!(choice.color),
+                ),
+              )
               .toList(growable: false),
         ),
         const SizedBox(height: 20),
@@ -241,8 +269,8 @@ class _ThemeColorChoice extends StatelessWidget {
     final colors = Theme.of(context).colorScheme;
     final checkColor =
         ThemeData.estimateBrightnessForColor(color) == Brightness.light
-            ? Colors.black
-            : Colors.white;
+        ? Colors.black
+        : Colors.white;
     return Semantics(
       button: true,
       selected: selected,
@@ -266,10 +294,7 @@ class _ThemeColorChoice extends StatelessWidget {
                           decoration: BoxDecoration(
                             shape: BoxShape.circle,
                             color: colors.surface,
-                            border: Border.all(
-                              color: colors.primary,
-                              width: 2,
-                            ),
+                            border: Border.all(color: colors.primary, width: 2),
                           ),
                           child: DecoratedBox(
                             decoration: BoxDecoration(
@@ -298,10 +323,9 @@ class _ThemeColorChoice extends StatelessWidget {
             Text(
               name,
               maxLines: 1,
-              style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                    fontSize: 11,
-                    letterSpacing: 0,
-                  ),
+              style: Theme.of(
+                context,
+              ).textTheme.labelSmall?.copyWith(fontSize: 11, letterSpacing: 0),
             ),
           ],
         ),
@@ -311,10 +335,7 @@ class _ThemeColorChoice extends StatelessWidget {
 }
 
 class _ThemeColorPreview extends StatelessWidget {
-  const _ThemeColorPreview({
-    required this.colors,
-    required this.themeName,
-  });
+  const _ThemeColorPreview({required this.colors, required this.themeName});
 
   final ColorScheme colors;
   final String themeName;
@@ -336,9 +357,7 @@ class _ThemeColorPreview extends StatelessWidget {
           Text(
             '实时预览 · $themeName',
             key: const ValueKey('theme-preview-title'),
-            style: textTheme.titleMedium?.copyWith(
-              color: colors.onSurface,
-            ),
+            style: textTheme.titleMedium?.copyWith(color: colors.onSurface),
           ),
           const SizedBox(height: 18),
           Wrap(
@@ -381,10 +400,7 @@ class _ThemeColorPreview extends StatelessWidget {
               decoration: BoxDecoration(
                 color: colors.surfaceContainerHighest,
                 borderRadius: BorderRadius.circular(4),
-                border: Border.all(
-                  color: colors.outlineVariant,
-                  width: 0.5,
-                ),
+                border: Border.all(color: colors.outlineVariant, width: 0.5),
               ),
               child: Row(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -442,8 +458,10 @@ class _ThemeColorPreview extends StatelessWidget {
             children: [
               Container(
                 key: const ValueKey('theme-preview-navigation-pill'),
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 20,
+                  vertical: 10,
+                ),
                 decoration: BoxDecoration(
                   color: colors.secondaryContainer,
                   borderRadius: BorderRadius.circular(24),
@@ -503,16 +521,16 @@ class _ThemePreviewChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-        decoration: BoxDecoration(
-          border: Border.all(color: colors.primary),
-          borderRadius: BorderRadius.circular(12),
-        ),
-        child: Text(
-          label,
-          style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                color: colors.primary,
-              ),
-        ),
-      );
+    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+    decoration: BoxDecoration(
+      border: Border.all(color: colors.primary),
+      borderRadius: BorderRadius.circular(12),
+    ),
+    child: Text(
+      label,
+      style: Theme.of(
+        context,
+      ).textTheme.labelLarge?.copyWith(color: colors.primary),
+    ),
+  );
 }

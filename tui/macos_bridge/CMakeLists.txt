@@ -15,4 +15,5 @@ target_compile_options(wearable_macos_bridge PRIVATE -fobjc-arc)
 target_link_libraries(wearable_macos_bridge PRIVATE
   "-framework Foundation"
   "-framework IOBluetooth"
+  "-framework IOKit"
 )

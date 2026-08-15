@@ -15,6 +15,7 @@ import '../platform/security_scoped_file_access.dart';
 import 'device_controller.dart';
 import 'floating_install_snapshot_mapper.dart';
 import 'theme_controller.dart';
+import 'diagnostic_log_service.dart';
 
 const floatingInstallWindowArgument = 'floating-install-window';
 const floatingInstallChannelName = 'wristload/floating-install-window';
@@ -69,11 +70,27 @@ class FloatingWindowCoordinator with WindowListener {
   bool get enabled => _enabled;
 
   Future<void> updateTheme() async {
+    appLogger.trace(
+      '浮动安装窗口主题同步请求',
+      category: DiagnosticLogCategory.ui,
+      fields: <String, Object?>{'ready': _floatingReady, 'disposed': _disposed},
+    );
     if (_floatingReady && !_disposed) await _sendConfiguration();
   }
 
   Future<void> initialize() async {
-    if (_initialized || !Platform.isWindows) return;
+    if (_initialized || !Platform.isWindows) {
+      appLogger.debug(
+        '浮动安装窗口初始化跳过',
+        category: DiagnosticLogCategory.ui,
+        fields: <String, Object?>{
+          'initialized': _initialized,
+          'platform': Platform.operatingSystem,
+        },
+      );
+      return;
+    }
+    appLogger.info('浮动安装窗口初始化开始', category: DiagnosticLogCategory.ui);
     _initialized = true;
     await _channel.setMethodCallHandler(_handleFloatingCall);
     windowManager.addListener(this);
@@ -83,20 +100,43 @@ class FloatingWindowCoordinator with WindowListener {
     try {
       await _initializeTray();
     } on Object catch (error, stackTrace) {
-      debugPrint('System tray initialization failed: $error');
-      debugPrintStack(stackTrace: stackTrace);
+      appLogger.error(
+        '系统托盘初始化失败',
+        category: DiagnosticLogCategory.ui,
+        fields: <String, Object?>{
+          'errorType': error.runtimeType.toString(),
+          'stackTrace': stackTrace.toString(),
+        },
+      );
     }
 
     _enabled = await _preferences.readEnabled();
+    appLogger.info(
+      '浮动安装窗口初始化完成',
+      category: DiagnosticLogCategory.ui,
+      fields: <String, Object?>{'enabled': _enabled, 'trayReady': _trayReady},
+    );
     if (_enabled) await _ensureFloatingWindow(show: true);
   }
 
   Future<void> setEnabled(bool enabled) async {
-    if (!Platform.isWindows) return;
+    if (!Platform.isWindows) {
+      appLogger.debug(
+        '浮动安装窗口设置在当前平台不可用',
+        category: DiagnosticLogCategory.ui,
+        fields: <String, Object?>{'platform': Platform.operatingSystem},
+      );
+      return;
+    }
     if (!_initialized) await initialize();
     if (_enabled == enabled) return;
     _enabled = enabled;
     await _preferences.writeEnabled(enabled);
+    appLogger.info(
+      '浮动安装窗口开关已更新',
+      category: DiagnosticLogCategory.ui,
+      fields: <String, Object?>{'enabled': enabled},
+    );
     if (enabled) {
       await _ensureFloatingWindow(show: true);
     } else {
@@ -148,6 +188,11 @@ class FloatingWindowCoordinator with WindowListener {
   }
 
   Future<Object?> _handleFloatingCall(MethodCall call) async {
+    appLogger.trace(
+      '浮动安装窗口收到命令',
+      category: DiagnosticLogCategory.communication,
+      fields: <String, Object?>{'method': call.method},
+    );
     switch (call.method) {
       case 'ready':
         _floatingReady = true;
@@ -173,6 +218,11 @@ class FloatingWindowCoordinator with WindowListener {
   }
 
   Future<Map<String, Object?>> _importFiles(List<ScopedFileRef> paths) async {
+    appLogger.trace(
+      '浮动安装窗口文件导入开始',
+      category: DiagnosticLogCategory.communication,
+      fields: <String, Object?>{'fileCount': paths.length},
+    );
     final result = await _importer.prepare(
       paths,
       existingPaths: controller.installQueue.map((entry) => entry.request.path),
@@ -188,6 +238,16 @@ class FloatingWindowCoordinator with WindowListener {
       failureCount: result.failures.length,
     );
     onNotice?.call(notice);
+    appLogger.info(
+      '浮动安装窗口文件导入完成',
+      category: DiagnosticLogCategory.installation,
+      fields: <String, Object?>{
+        'addedCount': notice.addedCount,
+        'duplicateCount': notice.duplicateCount,
+        'unsupportedCount': notice.unsupportedCount,
+        'failureCount': notice.failureCount,
+      },
+    );
 
     // A drop onto the floating window means “install now”. The controller
     // still owns all authentication and compatibility gates.
@@ -204,7 +264,11 @@ class FloatingWindowCoordinator with WindowListener {
     final path = arguments is Map ? arguments['path'] as String? : null;
     for (final entry in controller.installQueue.reversed) {
       if (entry.canRetry &&
-          (path == null || _samePath(entry.request.path, path))) {
+        (path == null || _samePath(entry.request.path, path))) {
+        appLogger.info(
+          '浮动安装窗口重试队列项',
+          category: DiagnosticLogCategory.installation,
+        );
         return controller.retryQueueEntry(entry);
       }
     }
@@ -260,11 +324,23 @@ class FloatingWindowCoordinator with WindowListener {
   }
 
   Future<void> _invokeFloating(String method, Object? arguments) async {
+    appLogger.trace(
+      '浮动安装窗口发送命令',
+      category: DiagnosticLogCategory.communication,
+      fields: <String, Object?>{'method': method},
+    );
     try {
       await _channel.invokeMethod<void>(method, arguments);
     } on WindowChannelException catch (error) {
       // A secondary engine may still be starting, or may just have closed.
-      debugPrint('Floating-window channel $method failed: $error');
+      appLogger.error(
+        '浮动安装窗口通道调用失败',
+        category: DiagnosticLogCategory.communication,
+        fields: <String, Object?>{
+          'method': method,
+          'errorType': error.runtimeType.toString(),
+        },
+      );
       _floatingReady = false;
     }
   }
@@ -276,6 +352,11 @@ class FloatingWindowCoordinator with WindowListener {
     if (x is! num || y is! num || !x.isFinite || !y.isFinite) return;
     await _preferences.writePosition(
       FloatingWindowPosition(x: x.toDouble(), y: y.toDouble()),
+    );
+    appLogger.trace(
+      '浮动安装窗口位置已保存',
+      category: DiagnosticLogCategory.storage,
+      fields: <String, Object?>{'valid': true},
     );
   }
 
@@ -362,6 +443,7 @@ class FloatingWindowCoordinator with WindowListener {
   Future<void> _exitApplication() async {
     if (_exiting) return;
     _exiting = true;
+    appLogger.info('浮动安装窗口退出开始', category: DiagnosticLogCategory.ui);
     await _invokeFloating('destroy', null);
     if (_trayReady) {
       await _systemTray.destroy();
@@ -393,6 +475,7 @@ class FloatingWindowCoordinator with WindowListener {
       unawaited(_destroyMainWindow());
       return;
     }
+    appLogger.info('主窗口关闭请求转为托盘隐藏', category: DiagnosticLogCategory.ui);
     // Main-window close is a tray hide. The tray Exit action is the only
     // process-terminating path.
     unawaited(windowManager.hide());
@@ -407,6 +490,7 @@ class FloatingWindowCoordinator with WindowListener {
   Future<void> dispose() async {
     if (_disposed) return;
     _disposed = true;
+    appLogger.info('浮动安装窗口资源释放开始', category: DiagnosticLogCategory.ui);
     if (_initialized) {
       controller.removeListener(_publishSnapshot);
       windowManager.removeListener(this);

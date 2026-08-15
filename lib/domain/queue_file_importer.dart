@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'install_metadata_reader.dart';
 import 'install_models.dart';
 import 'install_task.dart';
+import '../application/diagnostic_log_service.dart';
 import '../platform/security_scoped_file_access.dart';
 
 /// Prepares selected files for appending to an installation queue.
@@ -28,15 +29,25 @@ class QueueFileImporter {
     Iterable<String> existingPaths = const [],
     InstallKind? expectedKind,
   }) async {
+    final sourceList = sourcePaths.toList(growable: false);
     final knownPaths = {
       for (final path in existingPaths) normalizePath(path),
     };
+    appLogger.trace(
+      '安装队列导入开始',
+      category: DiagnosticLogCategory.installation,
+      fields: <String, Object?>{
+        'sourceCount': sourceList.length,
+        'existingCount': knownPaths.length,
+        'expectedKind': expectedKind?.name,
+      },
+    );
     final requests = <InstallRequest>[];
     final failures = <QueueFileImportFailure>[];
     var duplicateCount = 0;
     var unsupportedCount = 0;
 
-    for (final input in sourcePaths) {
+    for (final input in sourceList) {
       final source = switch (input) {
         ScopedFileRef ref => ref,
         String path => ScopedFileRef(path: path),
@@ -57,10 +68,14 @@ class QueueFileImporter {
       // unsupported entries instead of prompting for access.
       if (sourceKind == null && !shouldResolveMacBookmark) {
         unsupportedCount++;
+        appLogger.warning(
+          '安装队列导入跳过不支持的文件类型',
+          category: DiagnosticLogCategory.installation,
+          fields: <String, Object?>{'extension': _extension(selectedPath)},
+        );
         continue;
       }
       var failurePath = selectedPath;
-      InstallRequest? preparedRequest;
       try {
         if (defaultTargetPlatform == TargetPlatform.macOS &&
             !normalizedSource.hasBookmark) {
@@ -74,12 +89,22 @@ class QueueFileImporter {
           final normalizedPath = normalizePath(resolvedPath);
           if (knownPaths.contains(normalizedPath)) {
             duplicateCount++;
+            appLogger.info(
+              '安装队列导入跳过重复文件',
+              category: DiagnosticLogCategory.installation,
+              fields: <String, Object?>{'extension': _extension(resolvedPath)},
+            );
             continue;
           }
 
           final kind = kindForPath(resolvedPath);
           if (kind == null) {
             unsupportedCount++;
+            appLogger.warning(
+              '安装队列导入解析后类型不支持',
+              category: DiagnosticLogCategory.installation,
+              fields: <String, Object?>{'extension': _extension(resolvedPath)},
+            );
             continue;
           }
           if (expectedKind != null && kind != expectedKind) {
@@ -99,11 +124,21 @@ class QueueFileImporter {
             path: resolvedPath,
             bookmark: lease.file.bookmark,
           );
-          preparedRequest = InstallRequest(
+          final preparedRequest = InstallRequest(
             kind: kind,
             path: resolvedPath,
             metadata: metadata,
             source: resolvedSource,
+          );
+          requests.add(preparedRequest);
+          appLogger.info(
+            '安装队列文件元数据读取完成',
+            category: DiagnosticLogCategory.installation,
+            fields: <String, Object?>{
+              'kind': kind.name,
+              'fileSize': metadata.fileSize,
+              'extension': _extension(resolvedPath),
+            },
           );
         } finally {
           try {
@@ -111,19 +146,37 @@ class QueueFileImporter {
           } on Object catch (error) {
             // Cleanup failure must not replace the import result. Do not log
             // paths or opaque bookmark contents.
-            debugPrint(
-              '文件访问权限释放失败（' +
-                  error.runtimeType.toString() +
-                  '），已保留导入结果。',
+            appLogger.error(
+              '文件访问权限释放失败，已保留导入结果',
+              category: DiagnosticLogCategory.security,
+              fields: <String, Object?>{
+                'errorType': error.runtimeType.toString(),
+              },
             );
           }
         }
-        final request = preparedRequest;
-        if (request != null) requests.add(request);
       } on Object catch (error) {
         failures.add(QueueFileImportFailure(path: failurePath, error: error));
+        appLogger.error(
+          '安装队列导入失败',
+          category: DiagnosticLogCategory.installation,
+          fields: <String, Object?>{
+            'errorType': error.runtimeType.toString(),
+            'extension': _extension(failurePath),
+          },
+        );
       }
     }
+    appLogger.info(
+      '安装队列导入完成',
+      category: DiagnosticLogCategory.installation,
+      fields: <String, Object?>{
+        'addedCount': requests.length,
+        'duplicateCount': duplicateCount,
+        'unsupportedCount': unsupportedCount,
+        'failureCount': failures.length,
+      },
+    );
 
     return QueueFileImportResult(
       requests: requests,
@@ -166,6 +219,12 @@ class QueueFileImporter {
     return defaultTargetPlatform == TargetPlatform.windows
         ? absolutePath.toLowerCase()
         : absolutePath;
+  }
+
+  static String _extension(String path) {
+    final name = path.split(RegExp(r'[/\\]')).last;
+    final dot = name.lastIndexOf('.');
+    return dot >= 0 && dot + 1 < name.length ? name.substring(dot + 1).toLowerCase() : '';
   }
 }
 

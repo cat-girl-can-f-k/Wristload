@@ -5,6 +5,41 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:wristload/presentation/home_widgets.dart';
 
 void main() {
+  testWidgets('主页诊断日志开关转发状态且平台不可用时禁用', (tester) async {
+    bool? changed;
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: DiagnosticLogToggle(
+          entryCount: 12,
+          enabled: false,
+          onChanged: (value) => changed = value,
+        ),
+      ),
+    ));
+
+    expect(find.text('独立诊断日志窗口'), findsOneWidget);
+    expect(find.textContaining('当前 12 条'), findsOneWidget);
+    final tile = tester.widget<SwitchListTile>(find.byType(SwitchListTile));
+    expect(tile.value, isFalse);
+    await tester.tap(find.text('独立诊断日志窗口'));
+    expect(changed, isTrue);
+
+    await tester.pumpWidget(const MaterialApp(
+      home: Scaffold(
+        body: DiagnosticLogToggle(
+          entryCount: 12,
+          enabled: true,
+          onChanged: null,
+        ),
+      ),
+    ));
+    final unavailable =
+        tester.widget<SwitchListTile>(find.byType(SwitchListTile));
+    expect(unavailable.value, isFalse);
+    expect(unavailable.onChanged, isNull);
+    expect(find.text('当前平台不支持独立日志窗口'), findsOneWidget);
+  });
+
   testWidgets('扫描结果按安装能力分组且其他设备可折叠', (tester) async {
     final installable = _discovery(
       address: 'A1:B2:C3:D4:E5:F6',

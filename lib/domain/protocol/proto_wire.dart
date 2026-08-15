@@ -127,7 +127,10 @@ class ProtoReader {
     return out;
   }
 
-  String readString() => String.fromCharCodes(readBytes());
+  /// Reads a protobuf UTF-8 string.  Protobuf string fields are encoded as
+  /// UTF-8 bytes; interpreting each byte as a Unicode code point corrupts
+  /// non-ASCII app names returned by the device.
+  String readString() => utf8.decode(readBytes());
 
   /// 读取下一个字段：返回 (fieldNumber, wireType)。
   /// 遇到无法消费的 wireType 时跳过字段。

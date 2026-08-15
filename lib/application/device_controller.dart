@@ -8,6 +8,8 @@ import 'package:flutter/foundation.dart';
 
 import '../domain/device_profile.dart';
 import '../domain/auth_key_binding.dart';
+import '../domain/last_device_store.dart';
+import '../domain/auto_connect_preference.dart';
 import '../domain/connection_issue.dart';
 import '../domain/install_models.dart';
 import '../domain/install_checkpoint_store.dart';
@@ -27,33 +29,44 @@ import '../platform/ble_transport.dart';
 import '../platform/auth_key_store.dart';
 import '../platform/system_time_info.dart';
 import '../platform/security_scoped_file_access.dart';
+import 'diagnostic_log_service.dart';
 
-typedef QueueInstallPreparer = Future<InstallRequest?> Function(
-  InstallRequest request,
-);
+typedef QueueInstallPreparer =
+    Future<InstallRequest?> Function(InstallRequest request);
 
 class DeviceController extends ChangeNotifier {
   DeviceController({
     BleTransport? transport,
     InstallCheckpointStore? checkpointStore,
     InstallMetadataReader? metadataReader,
-  })  : _transport = transport ?? BleTransport(),
-        _checkpointStore = checkpointStore ?? InstallCheckpointStore(),
-        _metadataReader = metadataReader ?? InstallMetadataReader() {
-    unawaited(_restoreAuthKey());
-    _authKeyBindingsRestore = _restoreAuthKeyBindings();
+    DiagnosticLogService? logger,
+  }) : _transport = transport ?? BleTransport(logger: logger ?? appLogger),
+       _checkpointStore = checkpointStore ?? InstallCheckpointStore(),
+       _metadataReader = metadataReader ?? InstallMetadataReader(),
+       _logger = logger ?? appLogger {
+    _authKeyBindingsReady = _restoreAuthKeyBindings();
+    unawaited(_authKeyBindingsReady);
+    _lastDeviceRestore = _restoreLastDeviceRecord();
+    unawaited(_lastDeviceRestore);
+    _autoConnectPreferenceReady = _restoreAutoConnectPreference();
+    unawaited(_autoConnectPreferenceReady);
     _transferSettingsReady = _restoreTransferSettings();
     _checkpointRestore = _restoreInstallCheckpoint();
+    _bluetoothInitialization = _initializeBluetoothState();
   }
 
   final BleTransport _transport;
   final ConnectionIssueTracker _connectionIssues = ConnectionIssueTracker();
   final InstallCheckpointStore _checkpointStore;
   final InstallMetadataReader _metadataReader;
+  final DiagnosticLogService _logger;
   late final Future<void> _transferSettingsReady;
   late final Future<void> _checkpointRestore;
-  late final Future<void> _authKeyBindingsRestore;
+  late final Future<void> _authKeyBindingsReady;
+  late final Future<void> _lastDeviceRestore;
+  late final Future<void> _autoConnectPreferenceReady;
   bool _disposed = false;
+  bool _hasActiveGattTransport = false;
 
   /// Completes after the persisted install checkpoint has been inspected.
   ///
@@ -61,10 +74,25 @@ class DeviceController extends ChangeNotifier {
   /// device, authenticates, or sends protocol data.
   Future<void> get checkpointRestoreReady => _checkpointRestore;
 
-  Future<void> get authKeyBindingsReady => _authKeyBindingsRestore;
+  /// Completes after persisted authkey/device bindings have been restored.
+  Future<void> get authKeyBindingsReady => _authKeyBindingsReady;
   StreamSubscription<DiscoveredEventArgs>? _scanSubscription;
+  StreamSubscription<BluetoothLowEnergyStateChangedEventArgs>?
+  _bluetoothStateSubscription;
   bool _isScanning = false;
+  int _scanGeneration = 0;
+  BluetoothLowEnergyState _bluetoothState = BluetoothLowEnergyState.unknown;
+  bool _bluetoothStateKnown = false;
+  bool _authorizationRequestInFlight = false;
+  late final Future<void> _bluetoothInitialization;
   Timer? _scanResultsFlushTimer;
+  Timer? _savedDeviceRequestTimer;
+  // High-frequency communication tracing must not rebuild every listening
+  // widget for each packet. Entries are still retained in full; only the UI
+  // notification is coalesced for a short interval.
+  Timer? _logNotifyTimer;
+  bool _logNotificationPending = false;
+  static const _logNotifyInterval = Duration(milliseconds: 100);
   final Map<String, DiscoveredEventArgs> _pendingScanResults = {};
 
   List<DiscoveredEventArgs> scanResults = const [];
@@ -73,6 +101,12 @@ class DeviceController extends ChangeNotifier {
   String? connectedClassicAddress;
   DeviceProfile? connectedProfile;
   Peripheral? _lastPeripheral;
+  bool _connectionAttemptInProgress = false;
+  bool _connectionTearingDown = false;
+  // The shell must not infer that every inactive state is a normal disconnect.
+  // A failed classic pairing/SDP/RFCOMM attempt should remain visible so the
+  // user can read the native failure and retry deliberately.
+  bool _resumeScanningAfterConnectionEnd = false;
   List<GATTService> services = const [];
   InstallTask? latestTask;
 
@@ -89,9 +123,35 @@ class DeviceController extends ChangeNotifier {
   bool watchAppsLoading = false;
   String? watchAppsError;
   int _sessionEpoch = 0;
+  // A quick-app read and an uninstall both own the same visible loading/error
+  // state. A disconnect clears [watchAppsLoading] immediately so a new
+  // session may start before an old RFCOMM waiter has finished. Keep separate
+  // read and operation generations so an old response, ACK, timeout, or
+  // finally block cannot overwrite the newer session's state.
+  int _quickAppReadGeneration = 0;
+  int _quickAppOperationGeneration = 0;
+  int? _quickAppsLoadedSessionEpoch;
   int? _statusRefreshEpoch;
+  LastDeviceRecord? _lastDeviceRecord;
+  String? _requestedSavedDeviceId;
+  String? _requestedSavedDeviceName;
+  bool _autoConnectInFlight = false;
+  int? _authKeyRejectedEpoch;
 
   bool get statusRefreshInProgress => _statusRefreshEpoch != null;
+
+  /// Monotonic identity of the authenticated connection used by the quick-app
+  /// page. UI work that awaits a controller command can use this to avoid
+  /// presenting the outcome of an operation from a previous connection.
+  int get quickAppSessionEpoch => _sessionEpoch;
+
+  /// True after this authenticated session has produced a device list, or an
+  /// uninstall request has been transport-confirmed and applied locally.
+  /// The page uses this to avoid issuing another automatic command merely
+  /// because the user changed navigation tabs. Explicit refreshes remain
+  /// available.
+  bool get quickAppsLoadedForCurrentSession =>
+      _quickAppsLoadedSessionEpoch == _sessionEpoch;
 
   /// A pending user-facing connection notice. Diagnostic details remain in
   /// [logs] and are never used as presentation state.
@@ -119,6 +179,15 @@ class DeviceController extends ChangeNotifier {
   void _advanceSessionEpoch() {
     _sessionEpoch++;
     _statusRefreshEpoch = null;
+    _quickAppReadGeneration++;
+    _quickAppOperationGeneration++;
+    _quickAppsLoadedSessionEpoch = null;
+    watchAppsLoading = false;
+    watchAppsError = null;
+    // A recovery task belongs to the session that scheduled it.  Invalidating
+    // the session must also prevent an older task from clearing state owned by
+    // a newer connection.
+    _postAuthRecoveryEpoch = null;
   }
 
   /// 安装队列（串行执行）。
@@ -213,12 +282,14 @@ class DeviceController extends ChangeNotifier {
       while (true) {
         // An explicit retry may target the requested item, while failed
         // history remains visible and does not block later waiting entries.
-        final preferred = preferredEntry != null &&
+        final preferred =
+            preferredEntry != null &&
                 installQueue.contains(preferredEntry) &&
                 preferredEntry.stage == QueueStage.waiting
             ? preferredEntry
             : null;
-        final next = preferred ??
+        final next =
+            preferred ??
             installQueue
                 .where((e) => e.stage == QueueStage.waiting)
                 .firstOrNull;
@@ -253,7 +324,8 @@ class DeviceController extends ChangeNotifier {
         notifyListeners();
         await startInstall(next.request);
         final task = latestTask;
-        final producedTask = task != null &&
+        final producedTask =
+            task != null &&
             !identical(task, taskBeforeInstall) &&
             task.kind == next.request.kind &&
             task.fileName == next.request.metadata.fileName &&
@@ -290,6 +362,11 @@ class DeviceController extends ChangeNotifier {
         if (next.stage == QueueStage.done) {
           await Future<void>.delayed(queueSuccessDisplayDuration);
           if (_disposed) break;
+          if (installQueue.contains(next) && next.stage == QueueStage.done) {
+            installQueue.remove(next);
+            _log('安装成功条目已从队列移除：' + next.request.metadata.fileName);
+            notifyListeners();
+          }
         }
 
         // Keep failed items for retry, but continue with later waiting items
@@ -307,9 +384,13 @@ class DeviceController extends ChangeNotifier {
   ConnectionMode connectionMode = ConnectionMode.modern;
 
   /// authkey（绑定 token，32 位 hex = 16 字节）。连接前由 UI 弹窗输入。
-  /// 校验规则：32 位十六进制字符。协议验证通过前只保存、不发送鉴权帧。
+  /// 校验规则：32 位十六进制字符。协议验证通过前仅保留在内存中；只有
+  /// f=27 成功后才会写入对应设备的安全存储。
   String? authKey;
+  String? _authKeyDeviceId;
   List<AuthKeyBinding> authKeyBindings = const [];
+  int _authKeyPersistenceGeneration = 0;
+  Future<void> _savedDeviceMutationTail = Future<void>.value();
 
   /// 运行日志（时间戳 + 消息），供真机验证时观察 BLE/协议行为。
   List<String> logs = const [];
@@ -317,22 +398,50 @@ class DeviceController extends ChangeNotifier {
   static final RegExp _authKeyPattern = RegExp(r'^[0-9a-fA-F]{32}$');
   static final _secureStorage = AuthKeyStore();
   static final _authKeyBindingStore = AuthKeyBindingStore();
+  static final _lastDeviceStore = LastDeviceStore();
+  static final _autoConnectPreferenceStore = AutoConnectPreferenceStore();
   static final _transferSettings = TransferSettingsStore();
 
   /// Delay between consecutive Mass writes. The negotiated L1 receive window
   /// still limits outstanding packets, so a small value does not bypass flow
   /// control or ACK validation.
   int segmentIntervalMs = 5;
-  int massWindowSize = 3;
+  int massWindowSize = 50;
   bool autoTimeSync = false;
+
+  /// Whether startup should reconnect the persisted last authenticated device.
+  /// Enabled by default to preserve the historical Wristload behavior.
+  bool autoConnectLastDeviceEnabled = AutoConnectPreferenceStore.defaultEnabled;
   bool _autoTimeSyncChangedByUser = false;
 
+  Future<void> get autoConnectPreferenceReady => _autoConnectPreferenceReady;
+
+  Future<void> _restoreAutoConnectPreference() async {
+    try {
+      autoConnectLastDeviceEnabled = await _autoConnectPreferenceStore.read();
+    } on Object catch (exception) {
+      autoConnectLastDeviceEnabled = AutoConnectPreferenceStore.defaultEnabled;
+      _log('读取启动自动连接偏好失败：$exception');
+    }
+    notifyListeners();
+  }
+
+  void setAutoConnectLastDeviceEnabled(bool enabled) {
+    if (autoConnectLastDeviceEnabled == enabled) return;
+    autoConnectLastDeviceEnabled = enabled;
+    unawaited(_autoConnectPreferenceStore.write(enabled));
+    _log('启动时自动连接上次设备已' + (enabled ? '开启' : '关闭') + '。');
+    notifyListeners();
+  }
+
   void _persistTransferSettings() {
-    unawaited(_transferSettings.write(
-      segmentIntervalMs: segmentIntervalMs,
-      massWindowSize: massWindowSize,
-      autoTimeSync: autoTimeSync,
-    ));
+    unawaited(
+      _transferSettings.write(
+        segmentIntervalMs: segmentIntervalMs,
+        massWindowSize: massWindowSize,
+        autoTimeSync: autoTimeSync,
+      ),
+    );
   }
 
   void setAutoTimeSync(bool value) {
@@ -357,13 +466,15 @@ class DeviceController extends ChangeNotifier {
   }
 
   void setMassWindowSize(int value) {
-    final clamped = value.clamp(1, 50);
+    final clamped = value.clamp(1, 50).toInt();
     if (massWindowSize == clamped) return;
     massWindowSize = clamped;
     _persistTransferSettings();
-    _log(clamped <= 3
-        ? '每窗口分片数已设为 $clamped（设备协商范围内）。'
-        : '每窗口分片数已设为 $clamped（实验模式，超过设备协商值 3）。');
+    _log(
+      clamped <= 3
+          ? '每窗口分片数已设为 $clamped（设备协商范围内）。'
+          : '每窗口分片数已设为 $clamped（实验模式，超过设备协商值 3）。',
+    );
     notifyListeners();
   }
 
@@ -383,74 +494,571 @@ class DeviceController extends ChangeNotifier {
     notifyListeners();
   }
 
-  bool get isConnected => connectedDevice != null;
+  /// A peripheral selected by the scanner is only a transport candidate.
+  ///
+  /// Desktop classic-Bluetooth pairing and RFCOMM socket setup can both
+  /// succeed before the device accepts the authkey handshake. Those stages
+  /// must never unlock the device page, installation controls, or the global
+  /// "connected" indicator. Legacy experimental GATT devices deliberately
+  /// retain their established-transport behavior because they do not yet have
+  /// a verified authkey protocol.
+  bool get isConnected {
+    if (connectedDevice == null) return false;
+    final profile = connectedProfile;
+    // A profile can be cleared while an old native callback is still in
+    // flight.  Treat that state as unverified instead of falling back to
+    // "connectedDevice != null", which was the source of phantom device
+    // pages on macOS.  Tests and established sessions without a profile still
+    // have to present an explicit verified session.
+    if (profile == null) return sessionReady;
+    return profile.generation != ProtocolGeneration.v2Vela || sessionReady;
+  }
+
+  /// True while a system pairing request, RFCOMM connection, or authkey
+  /// handshake is in flight.  This is intentionally distinct from
+  /// [isConnected] so the UI can show progress without exposing device
+  /// actions for an unverified candidate.
+  bool get isConnecting => _connectionAttemptInProgress || sppConnecting;
+
+  /// Native teardown must finish before a new scan or connection begins.
+  bool get isConnectionBusy => isConnecting || _connectionTearingDown;
+
+  /// True only after a user explicitly requests a disconnect. Pairing, SDP,
+  /// RFCOMM, and authentication failures deliberately leave this false so the
+  /// home page preserves their diagnostic context rather than hiding it with
+  /// a fresh scan.
+  bool get shouldResumeScanningAfterConnectionEnd =>
+      _resumeScanningAfterConnectionEnd;
 
   bool get isScanning => _isScanning;
 
+  BluetoothLowEnergyState get bluetoothState => _bluetoothState;
+
+  bool get bluetoothStateKnown => _bluetoothStateKnown;
+
+  bool get bluetoothAvailable =>
+      _bluetoothState == BluetoothLowEnergyState.poweredOn;
+
+  /// Whether BLE is conclusively unavailable for a disconnected device.
+  ///
+  /// A macOS saved-device RFCOMM session can authenticate before
+  /// CoreBluetooth publishes its first state transition.  In that window the
+  /// manager remains [unknown], which is an initialization state rather than
+  /// an adapter failure and must not be rendered as a red warning.
+  bool get bluetoothUnavailable =>
+      bluetoothStateKnown &&
+      (bluetoothState == BluetoothLowEnergyState.poweredOff ||
+          bluetoothState == BluetoothLowEnergyState.unauthorized ||
+          bluetoothState == BluetoothLowEnergyState.unsupported);
+
+  /// Unknown keeps the original scan behavior during adapter initialization.
+  bool get canScan => !_bluetoothStateKnown || bluetoothAvailable;
+
+  String get bluetoothStateMessage => switch (_bluetoothState) {
+    BluetoothLowEnergyState.poweredOff => '蓝牙已关闭，请在系统设置中开启蓝牙。',
+    BluetoothLowEnergyState.unauthorized => '蓝牙权限未授权，请允许 Wristload 使用蓝牙。',
+    BluetoothLowEnergyState.unsupported => '当前系统不支持蓝牙低功耗扫描。',
+    BluetoothLowEnergyState.unknown => '正在检测蓝牙状态…',
+    BluetoothLowEnergyState.poweredOn => '蓝牙可用。',
+  };
+
   bool get hasAuthKey => authKey != null;
 
-  Future<void> _restoreAuthKeyBindings() async {
+  Peripheral? get _connectionTarget => connectedDevice ?? _lastPeripheral;
+
+  /// Clears every field that can make a failed transport candidate look like
+  /// an active device. The authkey is deliberately retained: a failed
+  /// connection must not silently discard user input or a previously saved
+  /// credential.
+  void _clearConnectionCandidate({bool keepBusy = false}) {
+    connectedDevice = null;
+    _lastPeripheral = null;
+    connectedDeviceName = null;
+    connectedClassicAddress = null;
+    connectedProfile = null;
+    services = const [];
+    connectedFirmwareVersion = null;
+    lastTimeSyncSummary = null;
+    batteryPercent = null;
+    storageUsedBytes = null;
+    storageTotalBytes = null;
+    installedWatchApps = const [];
+    watchAppsLoading = false;
+    watchAppsError = null;
+    sessionReady = false;
+    _authenticatedAt = null;
+    _resumeAuthenticatedSession = false;
+    _sessionCipher = null;
+    _hasActiveGattTransport = false;
+    if (!keepBusy) {
+      sppConnecting = false;
+      _connectionAttemptInProgress = false;
+    }
+  }
+
+  void _finishFailedConnection(String message) {
+    error = message;
+    _resumeScanningAfterConnectionEnd = false;
+    _clearSppHandshakeState();
+    _clearConnectionCandidate();
+    _connectionTearingDown = false;
+    _postAuthRecoveryEpoch = null;
+    _log(message);
+    notifyListeners();
+  }
+
+  Future<void> _initializeBluetoothState() async {
     try {
-      authKeyBindings = await _authKeyBindingStore.read();
+      _bluetoothStateSubscription = _transport.bluetoothStateChanged.listen(
+        (event) => _handleBluetoothState(event.state),
+        onError: (Object error, StackTrace stackTrace) {
+          _logBluetooth(
+            '蓝牙状态监听失败：$error',
+            level: DiagnosticLogLevel.warning,
+            fields: <String, Object?>{
+              'errorType': error.runtimeType.toString(),
+            },
+          );
+        },
+      );
+      _handleBluetoothState(_transport.bluetoothState);
+    } on Object catch (error) {
+      // Unsupported test hosts should retain the original scan behavior.
+      _logBluetooth(
+        '蓝牙状态初始化不可用：$error',
+        level: DiagnosticLogLevel.debug,
+        fields: <String, Object?>{'errorType': error.runtimeType.toString()},
+      );
+      return;
+    }
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      await _requestBluetoothAuthorization();
+    }
+  }
+
+  Future<void> _requestBluetoothAuthorization() async {
+    if (_authorizationRequestInFlight || _disposed) return;
+    _authorizationRequestInFlight = true;
+    try {
+      final authorized = await _transport.requestBluetoothAuthorization();
+      _logBluetooth(
+        authorized ? '蓝牙权限已授权。' : '蓝牙权限未授权。',
+        level: authorized
+            ? DiagnosticLogLevel.info
+            : DiagnosticLogLevel.warning,
+        fields: <String, Object?>{'authorized': authorized},
+      );
+      if (!authorized) {
+        _handleBluetoothState(BluetoothLowEnergyState.unauthorized);
+      }
+    } on Object catch (error) {
+      _handleBluetoothState(BluetoothLowEnergyState.unauthorized);
+      _logBluetooth(
+        '蓝牙权限申请失败：$error',
+        level: DiagnosticLogLevel.warning,
+        fields: <String, Object?>{'errorType': error.runtimeType.toString()},
+      );
+    } finally {
+      _authorizationRequestInFlight = false;
+    }
+  }
+
+  void _handleBluetoothState(BluetoothLowEnergyState state) {
+    final changed = !_bluetoothStateKnown || _bluetoothState != state;
+    _bluetoothState = state;
+    _bluetoothStateKnown = true;
+    if (!changed) return;
+    _logBluetooth(
+      '蓝牙状态：${state.name}',
+      fields: <String, Object?>{
+        'state': state.name,
+        'available': state == BluetoothLowEnergyState.poweredOn,
+        'platform': defaultTargetPlatform.name,
+      },
+    );
+    if (state == BluetoothLowEnergyState.unauthorized &&
+        defaultTargetPlatform == TargetPlatform.android) {
+      unawaited(_requestBluetoothAuthorization());
+    }
+    if (state != BluetoothLowEnergyState.poweredOn && _isScanning) {
+      unawaited(stopScan());
+    }
+    notifyListeners();
+  }
+
+  void _logBluetooth(
+    String message, {
+    DiagnosticLogLevel level = DiagnosticLogLevel.info,
+    Map<String, Object?> fields = const <String, Object?>{},
+  }) {
+    final entry = switch (level) {
+      DiagnosticLogLevel.trace => _logger.trace(
+        message,
+        category: DiagnosticLogCategory.communication,
+        component: 'wristload.BleGattDriver',
+        event: 'bluetooth_state',
+        fields: fields,
+      ),
+      DiagnosticLogLevel.debug => _logger.debug(
+        message,
+        category: DiagnosticLogCategory.communication,
+        component: 'wristload.BleGattDriver',
+        event: 'bluetooth_state',
+        fields: fields,
+      ),
+      DiagnosticLogLevel.info => _logger.info(
+        message,
+        category: DiagnosticLogCategory.communication,
+        component: 'wristload.BleGattDriver',
+        event: 'bluetooth_state',
+        fields: fields,
+      ),
+      DiagnosticLogLevel.warning => _logger.warning(
+        message,
+        category: DiagnosticLogCategory.communication,
+        component: 'wristload.BleGattDriver',
+        event: 'bluetooth_state',
+        fields: fields,
+      ),
+      DiagnosticLogLevel.error => _logger.error(
+        message,
+        category: DiagnosticLogCategory.communication,
+        component: 'wristload.BleGattDriver',
+        event: 'bluetooth_state',
+        fields: fields,
+      ),
+      DiagnosticLogLevel.fatal => _logger.fatal(
+        message,
+        category: DiagnosticLogCategory.communication,
+        component: 'wristload.BleGattDriver',
+        event: 'bluetooth_state',
+        fields: fields,
+      ),
+    };
+    _appendLogEntry(entry);
+  }
+
+  Future<void> _restoreAuthKeyBindings() async {
+    final generation = _authKeyPersistenceGeneration;
+    try {
+      final bindings = await _authKeyBindingStore.read();
+      if (generation != _authKeyPersistenceGeneration) return;
+      authKeyBindings = bindings;
       notifyListeners();
     } on Object {
       _log('无法读取历史绑定设备列表');
     }
   }
 
+  Future<void> _restoreLastDeviceRecord() async {
+    try {
+      _lastDeviceRecord = await _lastDeviceStore.read();
+      if (_lastDeviceRecord != null) {
+        _log('已恢复上次连接设备标识；等待启动扫描匹配。');
+      }
+    } on Object catch (exception) {
+      _log('读取上次连接设备标识失败：$exception');
+    }
+  }
+
+  /// Requests a one-shot startup reconnect. Only an identity is persisted;
+  /// the authkey is read from secure storage after a matching scan result.
+  Future<bool> autoConnectLastDevice() async {
+    await _autoConnectPreferenceReady;
+    if (!autoConnectLastDeviceEnabled) {
+      _log('启动自动连接已关闭，跳过上次设备连接。');
+      return false;
+    }
+    await Future.wait(<Future<void>>[
+      _lastDeviceRestore,
+      _authKeyBindingsReady,
+    ]);
+    final record = _lastDeviceRecord;
+    if (_disposed || record == null || isConnectionBusy || isConnected) {
+      return false;
+    }
+    // On macOS a V2 binding has a confirmed CoreBluetooth-ID -> classic
+    // Bluetooth mapping. Reuse it directly, without waiting for a BLE
+    // advertisement that may not be emitted during application startup.
+    if (defaultTargetPlatform == TargetPlatform.macOS) {
+      AuthKeyBinding? binding;
+      for (final candidate in authKeyBindings) {
+        if (_sameDeviceId(candidate.id, record.id)) {
+          binding = candidate;
+          break;
+        }
+      }
+      if (binding != null) {
+        final profile = DeviceProfile.matchAdvertisementName(binding.name);
+        if (profile != null &&
+            profile.generation == ProtocolGeneration.v2Vela) {
+          _log('启动自动连接使用已保存 macOS 蓝牙 ID 直连，跳过扫描。');
+          return connectSavedDevice(binding);
+        }
+      }
+    }
+    _requestedSavedDeviceId = record.id;
+    _requestedSavedDeviceName = record.name;
+    _autoConnectInFlight = false;
+    _savedDeviceRequestTimer?.cancel();
+    _savedDeviceRequestTimer = Timer(const Duration(seconds: 12), () {
+      if (_requestedSavedDeviceId != null && !_autoConnectInFlight) {
+        _log('启动自动连接未在扫描窗口内找到上次设备。');
+        _requestedSavedDeviceId = null;
+        _requestedSavedDeviceName = null;
+      }
+    });
+    await beginScan();
+    unawaited(_tryConnectRequestedSavedDevice());
+    return _isScanning;
+  }
+
+  /// Starts a scan-backed connection for a device selected from the history.
+  /// A CoreBluetooth peripheral cannot be reconstructed from a stored UUID.
+  Future<bool> connectSavedDevice(AuthKeyBinding binding) async {
+    if (_disposed || isConnectionBusy || isConnected) return false;
+    await _authKeyBindingsReady;
+    if (!await useSavedAuthKeyForDevice(binding.id)) {
+      error = '已保存设备缺少可用 authkey，请手动输入后再连接。';
+      _log(error!);
+      notifyListeners();
+      return false;
+    }
+    // macOS CoreBluetooth peripherals cannot be reconstructed from a stored
+    // UUID, but the V2 SPP bridge deliberately persists the UUID -> paired
+    // classic-device mapping after authentication. Reuse that mapping
+    // directly for historical devices; this avoids a discovery window (and
+    // the fragile BLE advertisement refresh) while keeping GATT devices on
+    // the existing scan-backed path below.
+    if (defaultTargetPlatform == TargetPlatform.macOS) {
+      final profile = DeviceProfile.matchAdvertisementName(binding.name);
+      UUID? uuid;
+      try {
+        uuid = UUID.fromString(binding.id);
+      } on Object {
+        uuid = null;
+      }
+      if (profile != null &&
+          profile.generation == ProtocolGeneration.v2Vela &&
+          uuid != null) {
+        _requestedSavedDeviceId = null;
+        _requestedSavedDeviceName = null;
+        _savedDeviceRequestTimer?.cancel();
+        _savedDeviceRequestTimer = null;
+        _autoConnectInFlight = true;
+        final peripheral = _PersistedPeripheral(uuid);
+        _connectionIssues.selectTarget(binding.id);
+        _authKeyRejectedEpoch = null;
+        _resumeScanningAfterConnectionEnd = false;
+        _clearConnectionCandidate();
+        _connectionAttemptInProgress = true;
+        _connectionTearingDown = false;
+        _lastPeripheral = peripheral;
+        connectedDeviceName = binding.name.trim();
+        connectedClassicAddress = null;
+        connectedProfile = profile;
+        _log('历史设备使用 macOS 持久化蓝牙 ID 直连，跳过 BLE 扫描与系统配对。');
+        notifyListeners();
+        try {
+          await _connectDesktopV2(peripheral, profile, directIdentity: true);
+        } finally {
+          _autoConnectInFlight = false;
+        }
+        return true;
+      }
+      _log('历史设备 ID 或型号不可用于 macOS RFCOMM 直连，回退扫描匹配。');
+    }
+    _requestedSavedDeviceId = binding.id;
+    _requestedSavedDeviceName = binding.name;
+    _autoConnectInFlight = false;
+    _savedDeviceRequestTimer?.cancel();
+    _savedDeviceRequestTimer = Timer(const Duration(seconds: 20), () {
+      if (_requestedSavedDeviceId != null && !_autoConnectInFlight) {
+        _log('历史设备连接请求超时：扫描中未找到匹配设备。');
+        _requestedSavedDeviceId = null;
+        _requestedSavedDeviceName = null;
+        notifyListeners();
+      }
+    });
+    await beginScan();
+    unawaited(_tryConnectRequestedSavedDevice());
+    return true;
+  }
+
+  Future<void> _tryConnectRequestedSavedDevice() async {
+    final requestedId = _requestedSavedDeviceId;
+    if (_disposed ||
+        requestedId == null ||
+        _autoConnectInFlight ||
+        isConnectionBusy ||
+        isConnected) {
+      return;
+    }
+    final exact = scanResults.where(
+      (result) => _sameDeviceId(result.peripheral.uuid.toString(), requestedId),
+    );
+    DiscoveredEventArgs? match = exact.firstOrNull;
+    if (match == null && (_requestedSavedDeviceName?.isNotEmpty ?? false)) {
+      final name = _requestedSavedDeviceName!.trim().toLowerCase();
+      final named = scanResults
+          .where(
+            (result) =>
+                (result.advertisement.name ?? '').trim().toLowerCase() == name,
+          )
+          .toList(growable: false);
+      if (named.length == 1) match = named.single;
+    }
+    if (match == null) return;
+    _autoConnectInFlight = true;
+    try {
+      if (!await useSavedAuthKeyForDevice(match.peripheral.uuid.toString())) {
+        _log('历史设备匹配成功，但安全存储中没有 authkey；不会重复请求。');
+        return;
+      }
+      _log('已匹配保存设备，开始自动连接。');
+      await connect(match);
+    } finally {
+      _autoConnectInFlight = false;
+      _requestedSavedDeviceId = null;
+      _requestedSavedDeviceName = null;
+      _savedDeviceRequestTimer?.cancel();
+      _savedDeviceRequestTimer = null;
+    }
+  }
+
   Future<String?> readAuthKeyFor(String id) async {
     try {
-      return await _secureStorage.readFor(id);
+      final value = await _secureStorage.readFor(id);
+      if (value == null || !_authKeyPattern.hasMatch(value)) return null;
+      return value.toLowerCase();
     } on Object {
       return null;
     }
   }
 
-  Future<void> rememberAuthKeyBinding({
+  bool _sameDeviceId(String left, String right) =>
+      left.trim().toLowerCase() == right.trim().toLowerCase();
+
+  /// Whether the in-memory authkey can be used for [deviceId].  A null owner
+  /// represents a key deliberately applied by a tool and not yet associated
+  /// with a device; the next explicit connection may claim it for that device.
+  bool hasAuthKeyForDevice(String deviceId) =>
+      authKey != null &&
+      (_authKeyDeviceId == null || _sameDeviceId(_authKeyDeviceId!, deviceId));
+
+  /// Restores an authkey only from the secure record for [deviceId].  This
+  /// prevents a credential saved for one band from being silently reused for a
+  /// different discovered device.
+  Future<bool> useSavedAuthKeyForDevice(String deviceId) async {
+    final id = deviceId.trim();
+    if (id.isEmpty) return false;
+    if (authKey != null && _authKeyDeviceId == null) {
+      _authKeyDeviceId = id;
+      _log('已将当前运行中的 authkey 关联到本次选择的设备；验证成功后才会保存。');
+      notifyListeners();
+      return true;
+    }
+    if (hasAuthKeyForDevice(id)) return true;
+
+    final saved = await readAuthKeyFor(id);
+    if (saved == null) return false;
+    _authKeyPersistenceGeneration++;
+    authKey = saved;
+    _authKeyDeviceId = id;
+    error = null;
+    _log('已读取此设备已保存的 authkey；将进行应用层身份校验。');
+    notifyListeners();
+    return true;
+  }
+
+  /// Serializes every application-owned saved-device mutation.  The metadata
+  /// store contains the complete binding list, so per-device parallel writes
+  /// would still lose updates.  More importantly, a delete queued after an
+  /// f=27 save must be the final persistent operation for that device.
+  Future<T> _enqueueSavedDeviceMutation<T>(Future<T> Function() mutation) {
+    final queued = _savedDeviceMutationTail.then<T>((_) => mutation());
+    _savedDeviceMutationTail = queued.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace __) {},
+    );
+    return queued;
+  }
+
+  Future<void> _rememberAuthKeyBindingNow({
     required String id,
     required String name,
-    required String key,
+    required String normalizedKey,
   }) async {
-    final normalized = key.trim().toLowerCase();
-    if (!_authKeyPattern.hasMatch(normalized)) return;
     try {
-      await _secureStorage.writeFor(id, normalized);
+      await _secureStorage.writeFor(id, normalizedKey);
     } on Object {
       // Keep metadata even when platform secure storage is unavailable.
     }
     final next = [
-      ...authKeyBindings.where((binding) => binding.id != id),
-      AuthKeyBinding(
-        id: id,
-        name: name,
-        uuid: id,
-        updatedAt: DateTime.now(),
-      ),
+      ...authKeyBindings.where((binding) => !_sameDeviceId(binding.id, id)),
+      AuthKeyBinding(id: id, name: name, uuid: id, updatedAt: DateTime.now()),
     ]..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
     authKeyBindings = next;
-    await _authKeyBindingStore.write(next);
+    try {
+      await _authKeyBindingStore.write(next);
+    } on Object catch (exception) {
+      // This call can run after f=27 succeeds. A metadata persistence failure
+      // must not turn an authenticated RFCOMM session into an async error.
+      _log('设备 authkey 绑定元数据保存失败：$exception');
+    }
     notifyListeners();
   }
 
-  Future<void> removeAuthKeyBinding(String id) async {
-    final next = authKeyBindings.where((binding) => binding.id != id).toList();
-    if (next.length == authKeyBindings.length) return;
-    try {
-      await _secureStorage.deleteFor(id).timeout(
-            const Duration(milliseconds: 600),
-          );
-    } on Object {
-      // Metadata removal remains useful even when secure storage is unavailable.
+  /// Saves an explicitly edited binding without changing the active session's
+  /// in-memory authkey. This is also used after f=27 confirms authentication.
+  Future<void> rememberAuthKeyBinding({
+    required String id,
+    required String name,
+    required String key,
+  }) {
+    final deviceId = id.trim();
+    final normalized = key.trim().toLowerCase();
+    if (deviceId.isEmpty || !_authKeyPattern.hasMatch(normalized)) {
+      return Future<void>.value();
     }
-    authKeyBindings = next;
-    try {
-      await _authKeyBindingStore.write(next).timeout(
-            const Duration(milliseconds: 600),
-          );
-    } on Object {
-      // Keep the in-memory list authoritative for the current session.
-    }
-    notifyListeners();
+    _authKeyPersistenceGeneration++;
+    return _enqueueSavedDeviceMutation(
+      () => _rememberAuthKeyBindingNow(
+        id: deviceId,
+        name: name.trim().isEmpty ? '已保存设备' : name.trim(),
+        normalizedKey: normalized,
+      ),
+    );
+  }
+
+  /// Persists the records which are earned only after f=27 succeeds. Keeping
+  /// the classic identity and authkey mutation in the same queue means an
+  /// immediately-following user deletion always wins over this async work.
+  Future<void> _persistAuthenticatedDevice({
+    required Peripheral device,
+    required String advertisedName,
+    required String? key,
+  }) {
+    final normalized = key?.trim().toLowerCase();
+    _authKeyPersistenceGeneration++;
+    return _enqueueSavedDeviceMutation(() async {
+      if (defaultTargetPlatform == TargetPlatform.macOS) {
+        await _confirmMacOSRfcommIdentity(device, advertisedName);
+      }
+      if (normalized != null && _authKeyPattern.hasMatch(normalized)) {
+        await _rememberAuthKeyBindingNow(
+          id: device.uuid.toString(),
+          name: advertisedName.trim().isEmpty ? '已保存设备' : advertisedName,
+          normalizedKey: normalized,
+        );
+      }
+      final id = device.uuid.toString();
+      final name = advertisedName.trim().isEmpty
+          ? '已保存设备'
+          : advertisedName.trim();
+      await _lastDeviceStore.write(id: id, name: name);
+      _lastDeviceRecord = LastDeviceRecord(id: id, name: name);
+    });
   }
 
   bool get installInProgress => _installInProgress;
@@ -463,11 +1071,13 @@ class DeviceController extends ChangeNotifier {
   }
 
   void setConnectionMode(ConnectionMode mode) {
-    if (isConnected || connectionMode == mode) return;
+    if (isConnectionBusy || isConnected || connectionMode == mode) return;
     connectionMode = mode;
-    _log(mode == ConnectionMode.modern
-        ? '已切换到现代设备模式（V2 RFCOMM 安装）。'
-        : '已切换到经典设备实验模式；只开放安全连接与协议取证，不开放安装。');
+    _log(
+      mode == ConnectionMode.modern
+          ? '已切换到现代设备模式（V2 RFCOMM 安装）。'
+          : '已切换到经典设备实验模式；只开放安全连接与协议取证，不开放安装。',
+    );
     notifyListeners();
   }
 
@@ -476,24 +1086,191 @@ class DeviceController extends ChangeNotifier {
     _log(message);
   }
 
-  void _log(String message) {
-    final now = DateTime.now();
-    String two(int n) => n.toString().padLeft(2, '0');
-    final ts = '${two(now.hour)}:${two(now.minute)}:${two(now.second)}.'
-        '${now.millisecond.toString().padLeft(3, '0')}';
-    final next = [...logs, '[$ts] $message'];
+  void _appendLogEntry(DiagnosticLogEntry entry) {
+    final next = [...logs, entry.displayText];
     // Keep diagnostics useful without retaining an unbounded session history.
     logs = next.length <= 500 ? next : next.sublist(next.length - 500);
-    notifyListeners();
+
+    // Trace/debug/info records can arrive in bursts while RFCOMM is moving
+    // data. Schedule one rebuild per interval instead of one rebuild per
+    // packet. Error and fatal records remain immediate so failures are visible
+    // without delay. This changes only presentation scheduling, never the
+    // journal or transport path.
+    final urgent =
+        entry.level == DiagnosticLogLevel.error ||
+        entry.level == DiagnosticLogLevel.fatal;
+    // Keep the journal hot path allocation-free when no widget is listening.
+    // The next build reads the retained log state directly, so a delayed
+    // notification is unnecessary and would leave fake timers in tests.
+    if (_disposed || !hasListeners) return;
+    if (urgent) {
+      _logNotifyTimer?.cancel();
+      _logNotifyTimer = null;
+      _logNotificationPending = false;
+      notifyListeners();
+      return;
+    }
+    if (_logNotificationPending) return;
+    _logNotificationPending = true;
+    _logNotifyTimer = Timer(_logNotifyInterval, () {
+      _logNotifyTimer = null;
+      if (_disposed) {
+        _logNotificationPending = false;
+        return;
+      }
+      _logNotificationPending = false;
+      notifyListeners();
+    });
+  }
+
+  void _log(String message) {
+    final level = classifyLogLevel(message);
+    final category = classifyLogMessage(message);
+    final fields = <String, Object?>{'source': 'DeviceController'};
+    final entry = switch (level) {
+      DiagnosticLogLevel.trace => _logger.trace(
+        message,
+        category: category,
+        component: 'wristload.DeviceManager',
+        event: 'device_manager',
+        fields: fields,
+      ),
+      DiagnosticLogLevel.debug => _logger.debug(
+        message,
+        category: category,
+        component: 'wristload.DeviceManager',
+        event: 'device_manager',
+        fields: fields,
+      ),
+      DiagnosticLogLevel.info => _logger.info(
+        message,
+        category: category,
+        component: 'wristload.DeviceManager',
+        event: 'device_manager',
+        fields: fields,
+      ),
+      DiagnosticLogLevel.warning => _logger.warning(
+        message,
+        category: category,
+        component: 'wristload.DeviceManager',
+        event: 'device_manager',
+        fields: fields,
+      ),
+      DiagnosticLogLevel.error => _logger.error(
+        message,
+        category: category,
+        component: 'wristload.DeviceManager',
+        event: 'device_manager',
+        fields: fields,
+      ),
+      DiagnosticLogLevel.fatal => _logger.fatal(
+        message,
+        category: category,
+        component: 'wristload.DeviceManager',
+        event: 'device_manager',
+        fields: fields,
+      ),
+    };
+    _appendLogEntry(entry);
+  }
+
+  void _logQuickAppRead(
+    String message, {
+    DiagnosticLogLevel level = DiagnosticLogLevel.info,
+    required String event,
+    Map<String, Object?> fields = const <String, Object?>{},
+  }) {
+    final entry = switch (level) {
+      DiagnosticLogLevel.trace => _logger.trace(
+        message,
+        category: DiagnosticLogCategory.communication,
+        component: 'wristload.DeviceManager',
+        event: event,
+        fields: fields,
+      ),
+      DiagnosticLogLevel.debug => _logger.debug(
+        message,
+        category: DiagnosticLogCategory.communication,
+        component: 'wristload.DeviceManager',
+        event: event,
+        fields: fields,
+      ),
+      DiagnosticLogLevel.info => _logger.info(
+        message,
+        category: DiagnosticLogCategory.communication,
+        component: 'wristload.DeviceManager',
+        event: event,
+        fields: fields,
+      ),
+      DiagnosticLogLevel.warning => _logger.warning(
+        message,
+        category: DiagnosticLogCategory.communication,
+        component: 'wristload.DeviceManager',
+        event: event,
+        fields: fields,
+      ),
+      DiagnosticLogLevel.error => _logger.error(
+        message,
+        category: DiagnosticLogCategory.communication,
+        component: 'wristload.DeviceManager',
+        event: event,
+        fields: fields,
+      ),
+      DiagnosticLogLevel.fatal => _logger.fatal(
+        message,
+        category: DiagnosticLogCategory.communication,
+        component: 'wristload.DeviceManager',
+        event: event,
+        fields: fields,
+      ),
+    };
+    _appendLogEntry(entry);
+  }
+
+  void _logWire(
+    String direction,
+    List<int> bytes, {
+    String phase = 'rfcomm',
+    int? sequence,
+    int? channel,
+    int? opCode,
+    int? generation,
+  }) {
+    final fields = <String, Object?>{
+      'source': 'DeviceController',
+      'transport': 'RFCOMM/SPP',
+      'platform': defaultTargetPlatform.name,
+      'direction': direction,
+      'phase': phase,
+      'bytes': bytes.length,
+      'wireHex': _wireHex(bytes),
+      if (sequence != null) 'sequence': sequence,
+      if (channel != null) 'channel': channel,
+      if (opCode != null) 'opCode': opCode,
+      if (generation != null) 'generation': generation,
+    };
+    final entry = _logger.trace(
+      'RFCOMM $direction $phase',
+      category: DiagnosticLogCategory.communication,
+      component: 'wristload.DeviceManager',
+      event: 'rfcomm_${direction.toLowerCase()}_${phase.toLowerCase()}',
+      fields: fields,
+    );
+    _appendLogEntry(entry);
   }
 
   void clearLogs() {
     logs = const [];
+    _logger.clear();
     notifyListeners();
   }
 
-  /// 校验并保存 authkey。返回是否成功；失败时设置 [error] 并记录日志。
-  Future<bool> setAuthKey(String key) async {
+  /// 校验并设置本次连接使用的 authkey。
+  ///
+  /// 这里不持久化凭据。持久化必须等到设备 f=27 鉴权确认后，由
+  /// [rememberAuthKeyBinding] 写入该设备自己的安全存储项，避免取消配对或
+  /// RFCOMM 失败也留下可自动复用的密钥。
+  Future<bool> setAuthKey(String key, {String? deviceId}) async {
     final trimmed = key.trim();
     if (!_authKeyPattern.hasMatch(trimmed)) {
       error = 'authkey 必须是 32 位十六进制字符（收到 ${trimmed.length} 个字符）';
@@ -501,40 +1278,226 @@ class DeviceController extends ChangeNotifier {
       notifyListeners();
       return false;
     }
+    _authKeyPersistenceGeneration++;
     authKey = trimmed.toLowerCase();
+    final owner = deviceId?.trim();
+    _authKeyDeviceId = owner == null || owner.isEmpty ? null : owner;
+    // A user-initiated scan deliberately dismisses the prior failure. Failed
+    // pairing/SDP/RFCOMM attempts never invoke this path automatically.
+    _resumeScanningAfterConnectionEnd = false;
     error = null;
-    try {
-      await _secureStorage.write(authKey!);
-      _log('authkey 已保存：${trimmed.substring(0, 4)}…${trimmed.substring(28)} '
-          '（32 hex，16 字节）');
-    } on Object {
-      _log('安全存储写入失败；authkey 仅在本次运行中可用，下次需要重新输入。');
-    }
+    _log('authkey 已载入当前连接；设备确认后才会保存到安全存储。');
+    notifyListeners();
     return true;
   }
 
-  /// 从系统安全存储恢复 authkey。仅恢复到内存，不会输出完整内容。
-  Future<void> _restoreAuthKey() async {
-    try {
-      final saved = await _secureStorage.read();
-      if (saved == null || !_authKeyPattern.hasMatch(saved)) return;
-      authKey = saved.toLowerCase();
-      _log('已从系统安全存储恢复 authkey；无需重新输入。');
-    } on Object {
-      // 凭据库不可用时保持手动输入能力，且不把安全存储错误暴露为密钥内容。
-      _log('无法读取系统安全存储；可手动输入 authkey。');
+  /// Forget the authkey associated with [deviceId].
+  ///
+  /// Set [clearActiveKey] only when this is the currently authenticated (or
+  /// currently selected) device. Deleting a historical device must not erase
+  /// the credential currently used by another live session.
+  Future<bool> _forgetAuthKeyForDeviceNow(
+    String deviceId, {
+    bool clearActiveKey = true,
+    bool reportResult = true,
+  }) async {
+    final id = deviceId.trim();
+    final clearedActiveKey =
+        clearActiveKey &&
+        (id.isEmpty ||
+            _authKeyDeviceId == null ||
+            _sameDeviceId(_authKeyDeviceId!, id));
+    if (clearedActiveKey) {
+      authKey = null;
+      _authKeyDeviceId = null;
+      error = null;
     }
+    var persistentDeletionSucceeded = true;
+
+    if (id.isNotEmpty) {
+      try {
+        await _secureStorage.deleteFor(id);
+      } on Object catch (exception) {
+        persistentDeletionSucceeded = false;
+        _log('设备 authkey 删除失败（继续清理其他保存项）：$exception');
+      }
+    }
+    if (clearedActiveKey) {
+      try {
+        await _secureStorage.delete();
+      } on Object catch (exception) {
+        persistentDeletionSucceeded = false;
+        _log('旧版全局 authkey 删除失败：$exception');
+      }
+    }
+
+    if (id.isNotEmpty) {
+      final next = authKeyBindings
+          .where((binding) => !_sameDeviceId(binding.id, id))
+          .toList(growable: false);
+      authKeyBindings = next;
+      try {
+        await _authKeyBindingStore.write(next);
+      } on Object catch (exception) {
+        persistentDeletionSucceeded = false;
+        _log('设备 authkey 绑定元数据删除失败：$exception');
+      }
+      try {
+        await _lastDeviceStore.clearFor(id);
+        if (_lastDeviceRecord != null &&
+            _sameDeviceId(_lastDeviceRecord!.id, id)) {
+          _lastDeviceRecord = null;
+        }
+      } on Object catch (exception) {
+        persistentDeletionSucceeded = false;
+        _log('上次连接设备记录删除失败：$exception');
+      }
+    }
+    if (reportResult) {
+      _log(
+        persistentDeletionSucceeded
+            ? (id.isEmpty
+                  ? '已取消保存 authkey；下次连接需要手动输入。'
+                  : clearedActiveKey
+                  ? '已取消保存当前设备 authkey；下次连接需要手动输入。'
+                  : '已删除历史设备 authkey；当前设备凭据保持不变。')
+            : '部分已保存 authkey 信息未能清除；请查看诊断日志。',
+      );
+      notifyListeners();
+    }
+    return persistentDeletionSucceeded;
   }
 
-  Future<void> forgetAuthKey() async {
-    authKey = null;
-    await _secureStorage.delete();
-    _log('已从系统安全存储移除 authkey。');
+  Future<bool> forgetAuthKeyForDevice(
+    String deviceId, {
+    bool clearActiveKey = true,
+  }) {
+    _authKeyPersistenceGeneration++;
+    return _enqueueSavedDeviceMutation(
+      () =>
+          _forgetAuthKeyForDeviceNow(deviceId, clearActiveKey: clearActiveKey),
+    );
+  }
+
+  /// Deletes every application-owned saved record for [deviceId].
+  ///
+  /// This is intentionally separate from [disconnect]: it clears the authkey
+  /// records, binding metadata, and (on macOS) Wristload's
+  /// CoreBluetooth-to-classic identity association, while leaving the active
+  /// RFCOMM/GATT session and the operating system Bluetooth pairing untouched.
+  Future<bool> deleteSavedDevice(UUID deviceId) {
+    return deleteSavedDeviceById(deviceId.toString());
+  }
+
+  /// Deletes a saved-device record even when it originated from an older
+  /// binding format.  Valid UUIDs additionally remove Wristload's macOS
+  /// CoreBluetooth-to-classic mapping; malformed legacy ids still lose their
+  /// credentials and binding metadata.
+  Future<bool> deleteSavedDeviceById(String deviceId) {
+    final id = deviceId.trim();
+    if (id.isEmpty) {
+      _log('删除已保存设备被拒绝：设备标识为空。');
+      return Future<bool>.value(false);
+    }
+    final activeId = connectedDevice?.uuid.toString();
+    final clearActiveKey = sessionReady
+        ? activeId != null && _sameDeviceId(activeId, id)
+        : _authKeyDeviceId != null && _sameDeviceId(_authKeyDeviceId!, id);
+    UUID? uuid;
+    try {
+      uuid = UUID.fromString(id);
+    } on Object {
+      // Legacy malformed ids still have an authkey and binding to remove.
+    }
+    _authKeyPersistenceGeneration++;
+    return _enqueueSavedDeviceMutation(() async {
+      var deleted = await _forgetAuthKeyForDeviceNow(
+        id,
+        clearActiveKey: clearActiveKey,
+        reportResult: false,
+      );
+      if (uuid == null) {
+        _log('已保存设备没有可用的经典蓝牙标识；已删除本地凭据和历史绑定。');
+      } else {
+        try {
+          await _transport.forgetRfcommIdentity(uuid);
+        } on Object catch (exception) {
+          deleted = false;
+          _log('已保存设备经典蓝牙身份映射删除失败：$exception');
+        }
+      }
+      _log(
+        deleted
+            ? clearActiveKey
+                  ? '已删除当前设备的已保存记录；当前连接和系统蓝牙配对保持不变，下次连接需要手动输入 authkey。'
+                  : '已删除历史设备的已保存记录；当前连接和系统蓝牙配对保持不变。'
+            : '已从当前会话删除设备凭据，但部分已保存设备信息未能清除；重启后可能仍会恢复。',
+      );
+      notifyListeners();
+      return deleted;
+    });
+  }
+
+  /// Compatibility wrapper for callers that only need to remove a binding.
+  /// The richer deletion path also clears the saved-device and macOS identity
+  /// records owned by Wristload.
+  Future<void> removeAuthKeyBinding(String id) async {
+    await deleteSavedDeviceById(id);
+  }
+
+  /// Deletes the current device's application-owned saved state without
+  /// disconnecting it.
+  Future<bool> deleteCurrentSavedDevice() {
+    final device = connectedDevice;
+    if (device == null) {
+      _log('删除已保存设备被拒绝：当前没有已连接设备。');
+      return Future<bool>.value(false);
+    }
+    return deleteSavedDevice(device.uuid);
+  }
+
+  /// Forget the saved authkey for the currently displayed connected device.
+  Future<bool> forgetCurrentDeviceAuthKey() {
+    return forgetAuthKeyForDevice(
+      connectedDevice?.uuid.toString() ?? '',
+      clearActiveKey: true,
+    );
+  }
+
+  /// Forget the global/legacy authkey. Kept for callers that do not have a
+  /// device identifier (for example, settings or migration code).
+  Future<bool> forgetAuthKey() {
+    return forgetAuthKeyForDevice('', clearActiveKey: true);
   }
 
   Future<void> beginScan() async {
     if (_isScanning) {
       _log('BLE 扫描已在进行，忽略重复请求。');
+      return;
+    }
+    if (isConnectionBusy) {
+      _log('BLE 扫描请求被延后：设备连接或断开尚未完成。');
+      return;
+    }
+    // Startup scanning and Android's runtime permission dialog can otherwise
+    // race each other and produce a transient `permission_pending` failure.
+    await _bluetoothInitialization;
+    if (isConnectionBusy) {
+      _log('BLE 扫描请求已取消：设备连接或断开尚未完成。');
+      return;
+    }
+    final unavailable =
+        _bluetoothStateKnown &&
+        _bluetoothState != BluetoothLowEnergyState.poweredOn &&
+        _bluetoothState != BluetoothLowEnergyState.unknown;
+    if (unavailable) {
+      error = bluetoothStateMessage;
+      _logBluetooth(
+        '扫描请求被拒绝：蓝牙不可用。',
+        level: DiagnosticLogLevel.warning,
+        fields: <String, Object?>{'state': _bluetoothState.name},
+      );
+      notifyListeners();
       return;
     }
     error = null;
@@ -543,48 +1506,57 @@ class DeviceController extends ChangeNotifier {
     _scanResultsFlushTimer?.cancel();
     _scanResultsFlushTimer = null;
     _isScanning = true;
+    _scanGeneration++;
     _log('开始 BLE 扫描…');
     try {
       await _scanSubscription?.cancel();
-      _scanSubscription = _transport.discoveries.listen((result) {
-        if (!_isScanning) return;
-        final name = (result.advertisement.name ?? '').trim();
-        if (name.isEmpty) return;
-        final id = result.peripheral.uuid.toString();
-        final pending = _pendingScanResults[id];
-        DiscoveredEventArgs? published;
-        for (final item in scanResults) {
-          if (item.peripheral.uuid.toString() == id) {
-            published = item;
-            break;
+      _scanSubscription = _transport.discoveries.listen(
+        (result) {
+          if (!_isScanning) return;
+          final name = (result.advertisement.name ?? '').trim();
+          if (name.isEmpty) return;
+          final id = result.peripheral.uuid.toString();
+          final pending = _pendingScanResults[id];
+          DiscoveredEventArgs? published;
+          for (final item in scanResults) {
+            if (item.peripheral.uuid.toString() == id) {
+              published = item;
+              break;
+            }
           }
-        }
-        final previous = pending ?? published;
-        final previousName = (previous?.advertisement.name ?? '').trim();
-        // RSSI changes arrive many times per second. Only rebuild when a device
-        // is new or a later scan response provides a different/better name.
-        if (previous != null && previousName == name) return;
-        _pendingScanResults[id] = result;
-        _scanResultsFlushTimer ??= Timer(
-          const Duration(milliseconds: 250),
-          _flushScanResults,
-        );
-      }, onError: (Object value) {
-        _isScanning = false;
-        _scanResultsFlushTimer?.cancel();
-        _scanResultsFlushTimer = null;
-        error = '扫描失败：$value';
-        _log('扫描失败：$value');
-        notifyListeners();
-      });
+          final previous = pending ?? published;
+          final previousName = (previous?.advertisement.name ?? '').trim();
+          // RSSI changes arrive many times per second. Only rebuild when a device
+          // is new or a later scan response provides a different/better name.
+          if (previous != null && previousName == name) return;
+          _pendingScanResults[id] = result;
+          _scanResultsFlushTimer ??= Timer(
+            const Duration(milliseconds: 250),
+            _flushScanResults,
+          );
+        },
+        onError: (Object value) {
+          _isScanning = false;
+          _scanResultsFlushTimer?.cancel();
+          _scanResultsFlushTimer = null;
+          error = '扫描失败：$value';
+          _log('扫描失败：$value');
+          notifyListeners();
+        },
+      );
       await _transport.startScan();
       if (!_isScanning) {
         await _transport.stopScan();
         return;
       }
-      _log(defaultTargetPlatform == TargetPlatform.windows
-          ? '扫描已启动（已识别的 V2 设备将直接使用 RFCOMM，不经过 GATT）。'
-          : '扫描已启动（点击连接将先读取 GATT 版本）。');
+      final desktopV2UsesRfcomm =
+          defaultTargetPlatform == TargetPlatform.windows ||
+          defaultTargetPlatform == TargetPlatform.macOS;
+      _log(
+        desktopV2UsesRfcomm
+            ? '扫描已启动（已识别的 V2 设备将直接使用 RFCOMM，不经过 GATT）。'
+            : '扫描已启动（点击连接将先读取 GATT 版本）。',
+      );
     } catch (exception) {
       _isScanning = false;
       _scanResultsFlushTimer?.cancel();
@@ -595,9 +1567,53 @@ class DeviceController extends ChangeNotifier {
     }
   }
 
+  /// Performs the macOS startup discovery warm-up.
+  ///
+  /// CoreBluetooth can report an initialized central before its first
+  /// discovery session has actually started delivering advertisements. A
+  /// short first session followed by a clean stop/restart gives the native
+  /// run loop a chance to settle and avoids leaving the app in the state where
+  /// the first home-page scan silently returns no devices. This is deliberately
+  /// separate from [beginScan] so user-triggered scans retain their original
+  /// lifecycle.
+  Future<void> beginStartupScan() async {
+    if (_disposed || isConnectionBusy || isConnected || _isScanning) return;
+    await _bluetoothInitialization;
+    if (_disposed ||
+        isConnectionBusy ||
+        isConnected ||
+        _isScanning ||
+        !canScan) {
+      return;
+    }
+
+    await beginScan();
+    if (_disposed || !_isScanning || isConnectionBusy || isConnected) return;
+    final startupGeneration = _scanGeneration;
+
+    // Keep the first native discovery session alive for at least one run-loop
+    // turn. The generation check makes a user stop/restart win over warm-up.
+    await Future<void>.delayed(const Duration(milliseconds: 350));
+    if (_disposed ||
+        !_isScanning ||
+        _scanGeneration != startupGeneration ||
+        isConnectionBusy ||
+        isConnected) {
+      return;
+    }
+
+    _log('启动扫描预热：重启 BLE 扫描以刷新 macOS 发现会话。');
+    await stopScan();
+    if (_disposed || isConnectionBusy || isConnected || !canScan) return;
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    if (_disposed || isConnectionBusy || isConnected || _isScanning) return;
+    await beginScan();
+  }
+
   Future<void> stopScan() async {
     if (!_isScanning) return;
     _isScanning = false;
+    _scanGeneration++;
     _flushScanResults();
     notifyListeners();
     try {
@@ -619,23 +1635,33 @@ class DeviceController extends ChangeNotifier {
     );
     updates.addAll(_pendingScanResults);
     _pendingScanResults.clear();
-    final indexed =
-        updates.values.toList(growable: false).asMap().entries.toList();
+    final indexed = updates.values
+        .toList(growable: false)
+        .asMap()
+        .entries
+        .toList();
     indexed.sort((left, right) {
-      final leftKnown = DeviceProfile.matchAdvertisementName(
+      final leftKnown =
+          DeviceProfile.matchAdvertisementName(
             left.value.advertisement.name ?? '',
           ) !=
           null;
-      final rightKnown = DeviceProfile.matchAdvertisementName(
+      final rightKnown =
+          DeviceProfile.matchAdvertisementName(
             right.value.advertisement.name ?? '',
           ) !=
           null;
       if (leftKnown != rightKnown) return leftKnown ? -1 : 1;
       return left.key.compareTo(right.key);
     });
-    scanResults =
-        indexed.map((entry) => entry.value).take(20).toList(growable: false);
+    scanResults = indexed
+        .map((entry) => entry.value)
+        .take(20)
+        .toList(growable: false);
     notifyListeners();
+    if (_isScanning) {
+      unawaited(_tryConnectRequestedSavedDevice());
+    }
   }
 
   Future<void> connect(DiscoveredEventArgs result) async {
@@ -665,31 +1691,54 @@ class DeviceController extends ChangeNotifier {
       notifyListeners();
       return;
     }
-    if (!hasAuthKey) {
+    if (!hasAuthKeyForDevice(result.peripheral.uuid.toString())) {
       error = '连接被拒绝：请输入 32 位 authkey 以进行设备身份校验。';
       _log(error!);
       notifyListeners();
       return;
     }
+    if (isConnectionBusy || isConnected) {
+      error = isConnectionBusy ? '连接被拒绝：上一条连接或断开操作尚未完成。' : '连接被拒绝：请先断开当前设备。';
+      _log(error!);
+      notifyListeners();
+      return;
+    }
     _connectionIssues.selectTarget(result.peripheral.uuid.toString());
+    _authKeyRejectedEpoch = null;
+    // A new explicit attempt supersedes a previously scheduled recovery scan.
+    _resumeScanningAfterConnectionEnd = false;
+    // A scan result is only a candidate. Publish a connecting state before
+    // opening macOS pairing so the UI never treats it as an active device.
+    _clearConnectionCandidate();
+    _connectionAttemptInProgress = true;
+    _connectionTearingDown = false;
+    _lastPeripheral = result.peripheral;
     connectedDeviceName = advertisedName;
     connectedClassicAddress = null;
     connectedProfile = profile;
     _log('设备名称校验通过：$advertisedName → ${profile.displayName}。');
-    if (defaultTargetPlatform == TargetPlatform.windows &&
+    notifyListeners();
+    if ((defaultTargetPlatform == TargetPlatform.windows ||
+            defaultTargetPlatform == TargetPlatform.macOS) &&
         profile.generation == ProtocolGeneration.v2Vela) {
-      await _connectWindowsV2(result.peripheral, profile);
+      await _connectDesktopV2(result.peripheral, profile);
       return;
     }
     await _connectPeripheral(result.peripheral);
   }
 
-  /// Known Windows targets are V2 devices. RFCOMM carries the real pairing,
-  /// authentication and install protocol, while GATT only repeats a version
-  /// probe and is prone to stale Windows "connected" state failures.
-  Future<void> _connectWindowsV2(
-      Peripheral peripheral, DeviceProfile profile) async {
+  /// Desktop V2 targets use classic Bluetooth SPP as the primary transport.
+  /// macOS must not create a temporary GATT connection: CoreBluetooth UUIDs
+  /// are opaque and are not the classic device identity.
+  Future<void> _connectDesktopV2(
+    Peripheral peripheral,
+    DeviceProfile profile, {
+    bool directIdentity = false,
+  }) async {
     _advanceSessionEpoch();
+    _hasActiveGattTransport = false;
+    final connectionSession = _sessionEpoch;
+    _connectionAttemptInProgress = true;
     error = null;
     sessionReady = false;
     connectedFirmwareVersion = null;
@@ -701,21 +1750,49 @@ class DeviceController extends ChangeNotifier {
     // Allow one transport-only reconnect while retaining the confirmed keys.
     _postAuthReconnectAttempts = 0;
     _authenticatedAt = null;
-    _log('已识别 ${profile.displayName}（V2），Windows 使用无 GATT 快速连接。');
+    final platformName = defaultTargetPlatform == TargetPlatform.macOS
+        ? 'macOS'
+        : 'Windows';
+    _log('已识别 ${profile.displayName}（V2），$platformName 使用无 GATT 的经典蓝牙 SPP 连接。');
     try {
-      await _transport.stopScan();
+      if (!directIdentity) {
+        await _transport.stopScan();
+      }
+      if (connectionSession != _sessionEpoch) return;
       _isScanning = false;
       _scanResultsFlushTimer?.cancel();
       _scanResultsFlushTimer = null;
+      services = const [];
+      if (defaultTargetPlatform == TargetPlatform.macOS) {
+        // Pairing is native and can fail before connectSpp() has a chance to
+        // attach the EventChannel. Start the idempotent listener here so the
+        // selector, pairing delegate, and eventual SDP events all reach the
+        // diagnostic journal for this exact connection attempt.
+        _transport.listenRfcommData();
+        _log('已启用 macOS 经典蓝牙原生日志；等待系统配对与 SPP 建链事件。');
+      }
+      if (directIdentity) {
+        _log('已复用已确认的 macOS 经典蓝牙身份映射；直接建立 RFCOMM。');
+      } else {
+        _log('先检查系统经典蓝牙配对，再建立 RFCOMM；不创建临时 GATT 链路。');
+        connectedClassicAddress = await _transport.pairDevice(
+          peripheral.uuid,
+          advertisedName: connectedDeviceName,
+        );
+        if (connectionSession != _sessionEpoch) return;
+      }
+      // System pairing is not a successful application connection. Do not
+      // publish a connected device until the pairing request has completed,
+      // otherwise a cancelled macOS dialog leaves the home page showing a
+      // false "connected" state.
       connectedDevice = peripheral;
       _lastPeripheral = peripheral;
-      services = const [];
-      _log('直接检查系统配对并建立 RFCOMM；不创建临时 GATT 链路。');
+      _log('经典蓝牙配对状态已确认；开始 SPP/RFCOMM 应用层鉴权。');
       await connectSpp();
     } on Object catch (exception) {
-      sessionReady = false;
-      error = 'Windows V2 快速连接失败：$exception';
-      _log(error!);
+      if (connectionSession != _sessionEpoch) return;
+      _finishFailedConnection('$platformName V2 快速连接失败：$exception');
+      return;
     }
     notifyListeners();
   }
@@ -727,6 +1804,8 @@ class DeviceController extends ChangeNotifier {
   }) async {
     var ownsGattConnection = false;
     _advanceSessionEpoch();
+    final connectionSession = _sessionEpoch;
+    _connectionAttemptInProgress = true;
     error = null;
     sessionReady = false;
     connectedFirmwareVersion = null;
@@ -739,20 +1818,36 @@ class DeviceController extends ChangeNotifier {
     _log('正在连接 ${peripheral.uuid}（authkey 已就绪，等待应用层身份校验）…');
     try {
       await _transport.stopScan();
+      if (connectionSession != _sessionEpoch) return;
       _isScanning = false;
       _scanResultsFlushTimer?.cancel();
       _scanResultsFlushTimer = null;
       if (resetWindowsPairing) {
-        final removedOldPairing =
-            await _transport.unpairIfPaired(peripheral.uuid);
+        final removedOldPairing = await _transport.unpairIfPaired(
+          peripheral.uuid,
+        );
         if (removedOldPairing) {
           _log('检测到 Windows 旧配对，已在连接前删除设备记录。');
           _log('等待系统释放旧蓝牙链路后重新连接…');
           await Future<void>.delayed(const Duration(milliseconds: 800));
+          if (connectionSession != _sessionEpoch) return;
         }
       }
       services = await _transport.connectAndDiscover(peripheral);
       ownsGattConnection = true;
+      _hasActiveGattTransport = true;
+      if (connectionSession != _sessionEpoch) {
+        try {
+          await _transport
+              .disconnect(peripheral)
+              .timeout(const Duration(seconds: 5));
+        } on Object {
+          // A newer connection lifecycle owns presentation state.
+        } finally {
+          _hasActiveGattTransport = false;
+        }
+        return;
+      }
       connectedDevice = peripheral;
       _lastPeripheral = peripheral;
       _log('GATT 已连接，发现 ${services.length} 个服务：');
@@ -761,6 +1856,7 @@ class DeviceController extends ChangeNotifier {
       }
       await _inspectMiWearService();
       await _readStandardBatteryLevel();
+      if (connectionSession != _sessionEpoch) return;
       if (connectedProfile?.generation != ProtocolGeneration.v2Vela) {
         final transport = switch (connectedProfile?.generation) {
           ProtocolGeneration.v1Vela => '旧 Vela V1',
@@ -769,13 +1865,18 @@ class DeviceController extends ChangeNotifier {
         };
         _log('旧设备实验连接完成：已保留 GATT 链路用于服务枚举与取证（$transport）。');
         _log('该型号的独立鉴权与安装协议尚未完成真机验证，不会发送猜测性私有帧。');
+        _connectionAttemptInProgress = false;
+        _connectionTearingDown = false;
+        notifyListeners();
         return;
       }
-      _log('GATT 链路已建立。应用层 authkey 身份校验尚待真机帧验证，'
-          '私有帧仍受安全门控保护，当前未宣称“设备已就绪”。');
+      _log(
+        'GATT 链路已建立。应用层 authkey 身份校验尚待真机帧验证，'
+        '私有帧仍受安全门控保护，当前未宣称“设备已就绪”。',
+      );
       final desktopPairing =
           defaultTargetPlatform == TargetPlatform.windows ||
-              defaultTargetPlatform == TargetPlatform.macOS;
+          defaultTargetPlatform == TargetPlatform.macOS;
       if (desktopPairing) {
         final platformName = defaultTargetPlatform == TargetPlatform.macOS
             ? 'macOS'
@@ -793,29 +1894,41 @@ class DeviceController extends ChangeNotifier {
       }
       // 官方 SPP 连接是独立的经典蓝牙主通道。版本读取完成后释放并行 GATT
       // 连接，避免 Windows 同时维持 LE 与 RFCOMM 时回收串口 socket。
-      await _transport.disconnect(peripheral);
-      ownsGattConnection = false;
+      try {
+        await _transport
+            .disconnect(peripheral)
+            .timeout(const Duration(seconds: 5));
+      } finally {
+        ownsGattConnection = false;
+        _hasActiveGattTransport = false;
+      }
       _log('版本读取完成，已释放临时 GATT 链路；后续保持独立 SPP 长连接。');
       _log('开始自动建立 SPP 与 authkey 会话，无需再次点击。');
       await connectSpp();
     } catch (exception) {
+      if (connectionSession != _sessionEpoch) return;
       if (ownsGattConnection) {
         try {
-          await _transport.disconnect(peripheral);
+          await _transport
+              .disconnect(peripheral)
+              .timeout(const Duration(seconds: 5));
         } on Object {
           // 保留最初的连接/配对错误；这里仅释放本次建立的临时 GATT。
         }
+        _hasActiveGattTransport = false;
       }
-      error = '连接或发现服务失败：$exception';
-      _log('连接失败：$exception');
       if (defaultTargetPlatform == TargetPlatform.windows) {
-        _log('提示：GattCommunicationStatus=1 表示设备不可达（Unreachable）——'
-            '常见于 Windows 蓝牙缓存/bonding 损坏。建议：手环亮屏并靠近电脑，'
-            'Windows「设置→蓝牙」删除该设备记录后重新扫描连接，或重启 Windows 蓝牙。');
+        _log(
+          '提示：GattCommunicationStatus=1 表示设备不可达（Unreachable）——'
+          '常见于 Windows 蓝牙缓存/bonding 损坏。建议：手环亮屏并靠近电脑，'
+          'Windows「设置→蓝牙」删除该设备记录后重新扫描连接，或重启 Windows 蓝牙。',
+        );
       } else if (defaultTargetPlatform == TargetPlatform.macOS) {
         _log('提示：请确认已授予 Wristload 蓝牙权限，并在系统蓝牙设置中完成目标设备配对。');
       }
       _log('不会在 GATT 失败后回退发送 RFCOMM 协议帧；请先完成 HCI 验证。');
+      _finishFailedConnection('连接或发现服务失败：$exception');
+      return;
     }
     notifyListeners();
   }
@@ -845,23 +1958,28 @@ class DeviceController extends ChangeNotifier {
 
     if (levelCharacteristic == null) {
       _log(
-          'Standard Battery Service (180F/2A19) not available; battery unknown.');
+        'Standard Battery Service (180F/2A19) not available; battery unknown.',
+      );
       return;
     }
     try {
-      final data =
-          await _transport.readCharacteristic(device, levelCharacteristic);
+      final data = await _transport.readCharacteristic(
+        device,
+        levelCharacteristic,
+      );
       final level = parseBatteryLevel(data);
       if (level == null) {
         _log(
-            'Battery Level characteristic returned an invalid value; battery unknown.');
+          'Battery Level characteristic returned an invalid value; battery unknown.',
+        );
         return;
       }
       batteryPercent = level;
       _log('Battery Level (2A19) = $level%');
     } catch (exception) {
       _log(
-          'Battery Level characteristic read failed; battery unknown: $exception');
+        'Battery Level characteristic read failed; battery unknown: $exception',
+      );
     }
   }
 
@@ -893,8 +2011,9 @@ class DeviceController extends ChangeNotifier {
         writeUuid => ' ← 写入特征',
         _ => '',
       };
-      final properties =
-          characteristic.properties.map((property) => property.name).join('|');
+      final properties = characteristic.properties
+          .map((property) => property.name)
+          .join('|');
       _log('    特征 $uuid$role  属性: $properties');
     }
     GATTCharacteristic? versionChar;
@@ -911,8 +2030,9 @@ class DeviceController extends ChangeNotifier {
     }
     try {
       final data = await _transport.readCharacteristic(device, versionChar);
-      final hex =
-          data.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+      final hex = data
+          .map((b) => b.toRadixString(16).padLeft(2, '0'))
+          .join(' ');
       if (data.length >= 3) {
         final version = '${data[0]}.${data[1]}.${data[2]}';
         connectedFirmwareVersion = version;
@@ -937,26 +2057,30 @@ class DeviceController extends ChangeNotifier {
       return;
     }
     if (!kSppAuthProtocolVerified) {
-      _log('SPP 鉴权被阻止：尚未完成真机验证。');
+      _finishFailedConnection('SPP 鉴权被阻止：尚未完成真机验证。');
       return;
     }
     // SPP 主通道独立于 GATT：GATT 成功时用 connectedDevice，
     // GATT 失败回退时用 _lastPeripheral（仅需 MAC）。
     final device = connectedDevice ?? _lastPeripheral;
     if (device == null) {
-      _log('SPP 连接被拒绝：未连接设备');
+      _finishFailedConnection('SPP 连接被拒绝：未找到连接目标。');
       return;
     }
     final connectionEpoch = ++_sppConnectionEpoch;
     _closingFailedSppEpoch = null;
     sessionReady = false;
+    _connectionAttemptInProgress = true;
+    _connectionTearingDown = false;
     sppConnecting = true;
     _authenticatedAt = null;
     _resumeAuthenticatedSession = resumeSession && _sessionCipher != null;
     notifyListeners();
-    _log(_resumeAuthenticatedSession
-        ? 'SPP（RFCOMM 串口）重连：${device.uuid}（复用已确认会话）…'
-        : 'SPP（RFCOMM 串口）连接：${device.uuid}…');
+    _log(
+      _resumeAuthenticatedSession
+          ? 'SPP（RFCOMM 串口）重连：${device.uuid}（复用已确认会话）…'
+          : 'SPP（RFCOMM 串口）连接：${device.uuid}…',
+    );
     _sppAcc = Accumulator();
     _sppSeq = 0;
     _sppAwaitingAuthConfirm = false;
@@ -989,10 +2113,7 @@ class DeviceController extends ChangeNotifier {
       };
       _log('  $platformName 的 BLE 连接不等于经典蓝牙 SPP 配对；若手环弹出请求，请在手环上确认。');
       final classicAddress = await _transport
-          .connectRfcomm(
-            device.uuid,
-            advertisedName: connectedDeviceName,
-          )
+          .connectRfcomm(device.uuid, advertisedName: connectedDeviceName)
           .timeout(
             const Duration(seconds: 2),
             onTimeout: () => throw TimeoutException(
@@ -1013,11 +2134,7 @@ class DeviceController extends ChangeNotifier {
       await _sppSendL1Start(connectionEpoch, device);
     } catch (exception) {
       if (_isCurrentSppConnection(connectionEpoch)) {
-        await _cleanupFailedSppConnect(
-          device,
-          exception,
-          connectionEpoch,
-        );
+        await _cleanupFailedSppConnect(device, exception, connectionEpoch);
       }
       if (exception is TimeoutException &&
           exception.duration == const Duration(seconds: 2)) {
@@ -1039,7 +2156,12 @@ class DeviceController extends ChangeNotifier {
   Timer? _sppWatchdog;
   DateTime? _authenticatedAt;
   int _postAuthReconnectAttempts = 0;
-  bool _recoveringPostAuthClose = false;
+
+  /// The session epoch that owns an in-flight post-auth RFCOMM recovery.
+  /// A boolean is insufficient here: an older recovery's finally block can
+  /// otherwise clear the marker for a newly started session.
+  int? _postAuthRecoveryEpoch;
+  bool get _recoveringPostAuthClose => _postAuthRecoveryEpoch != null;
   int _sppConnectionEpoch = 0;
   int? _closingFailedSppEpoch;
   int? _pendingAuthConfirmEpoch;
@@ -1092,7 +2214,10 @@ class DeviceController extends ChangeNotifier {
       // Re-read the complete package metadata while this single lease is held.
       // This validates size and both digests without trusting checkpoint fields
       // that may have been written by an older app version.
-      final metadata = await _metadataReader.readWithLease(checkpoint.kind, lease);
+      final metadata = await _metadataReader.readWithLease(
+        checkpoint.kind,
+        lease,
+      );
       if (_disposed) return;
       if (metadata.fileSize != checkpoint.fileSize ||
           metadata.md5Hex != checkpoint.md5Hex ||
@@ -1117,27 +2242,29 @@ class DeviceController extends ChangeNotifier {
       // Persist the resolved path and a refreshed security-scoped bookmark
       // before exposing the retry item to the UI.
       if (_disposed) return;
-      await _checkpointStore.save(InstallCheckpoint(
-        kind: checkpoint.kind,
-        path: source.path,
-        fileSize: metadata.fileSize,
-        md5Hex: metadata.md5Hex,
-        sha256Hex: metadata.sha256Hex,
-        dataType: expectedDataType,
-        lastAcknowledgedSegment: checkpoint.lastAcknowledgedSegment,
-        phase: checkpoint.phase,
-        faceId: metadata.faceId,
-        packageName: metadata.packageName,
-        versionCode: metadata.versionCode,
-        bookmark: source.bookmark,
-      ));
+      await _checkpointStore.save(
+        InstallCheckpoint(
+          kind: checkpoint.kind,
+          path: source.path,
+          fileSize: metadata.fileSize,
+          md5Hex: metadata.md5Hex,
+          sha256Hex: metadata.sha256Hex,
+          dataType: expectedDataType,
+          lastAcknowledgedSegment: checkpoint.lastAcknowledgedSegment,
+          phase: checkpoint.phase,
+          faceId: metadata.faceId,
+          packageName: metadata.packageName,
+          versionCode: metadata.versionCode,
+          bookmark: source.bookmark,
+        ),
+      );
       if (_disposed) return;
 
       _lastInstallRequest = request;
-      installQueue.add(QueueEntry(
-        request: request,
-        stage: QueueStage.stateUnknown,
-      )..message = '检测到上次未完成安装；请重新连接设备后手动重试。');
+      installQueue.add(
+        QueueEntry(request: request, stage: QueueStage.stateUnknown)
+          ..message = '检测到上次未完成安装；请重新连接设备后手动重试。',
+      );
       _log('已恢复上次安装记录；未自动连接或发送数据。');
     } on Object catch (exception) {
       if (!_disposed) {
@@ -1163,6 +2290,7 @@ class DeviceController extends ChangeNotifier {
       _handleRfcommEof(connectionEpoch);
       return;
     }
+    _logWire('RX', data, phase: 'stream', generation: connectionEpoch);
     _log('RFCOMM 收到 ${data.length}B：${_hex(data)}');
     if (_sppAwaitingVersion) {
       final packet = SppProtocol.parseSppPacket(data);
@@ -1193,28 +2321,30 @@ class DeviceController extends ChangeNotifier {
 
   void _handleRfcommEof(int connectionEpoch) {
     if (!_isCurrentSppConnection(connectionEpoch)) return;
-    _sppConnectionEpoch++;
-    sppConnecting = false;
-    _clearSppHandshakeState();
+    final device = connectedDevice ?? _lastPeripheral;
     if (!sessionReady && _sessionCipher == null) {
       _log('RFCOMM 已关闭（EOF）。');
-      notifyListeners();
+      if (device == null) {
+        _finishFailedConnection('RFCOMM 在设备身份验证前关闭。');
+      } else {
+        unawaited(
+          _cleanupFailedSppConnect(
+            device,
+            StateError('RFCOMM 在设备身份验证前关闭'),
+            connectionEpoch,
+          ),
+        );
+      }
       return;
     }
     final authenticatedAt = _authenticatedAt;
-    final isTransportTransition = authenticatedAt != null &&
+    final isTransportTransition =
+        authenticatedAt != null &&
         DateTime.now().difference(authenticatedAt) <
             const Duration(seconds: 2) &&
         _postAuthReconnectAttempts == 0 &&
         !_recoveringPostAuthClose &&
         !_installInProgress;
-    _advanceSessionEpoch();
-    sessionReady = false;
-    _authenticatedAt = null;
-    if (!isTransportTransition) {
-      _sessionCipher = null;
-      _resumeAuthenticatedSession = false;
-    }
     final exception = StateError('RFCOMM 远端已关闭');
     final installFailure = _installTransportFailure;
     if (_installInProgress &&
@@ -1230,12 +2360,28 @@ class DeviceController extends ChangeNotifier {
     _pendingMassAckOrder.clear();
     _pendingMassProgress.clear();
     if (isTransportTransition) {
+      _sppConnectionEpoch++;
+      _advanceSessionEpoch();
+      // A few V2 devices replace the first RFCOMM socket just after f=27.
+      // Keep this state explicitly busy so the shell does not navigate home
+      // or restart BLE scanning between the two authenticated transports.
+      _connectionAttemptInProgress = true;
+      sppConnecting = false;
+      _clearSppHandshakeState();
+      sessionReady = false;
+      _authenticatedAt = null;
       _postAuthReconnectAttempts++;
       _log('检测到 f=27 后的 RFCOMM 传输切换；保留已确认会话密钥并自动重建链路。');
       unawaited(_recoverPostAuthRfcomm(_sessionEpoch));
     } else {
       _connectionIssues.recordUnexpectedDisconnect();
       _log('RFCOMM 长连接已被远端关闭；当前鉴权会话失效。');
+      if (device == null) {
+        _finishFailedConnection('RFCOMM 长连接已被远端关闭。');
+      } else {
+        unawaited(_cleanupFailedSppConnect(device, exception, connectionEpoch));
+      }
+      return;
     }
     notifyListeners();
   }
@@ -1243,14 +2389,16 @@ class DeviceController extends ChangeNotifier {
   Future<void> _recoverPostAuthRfcomm(int recoverySessionEpoch) async {
     final device = connectedDevice ?? _lastPeripheral;
     if (device == null ||
-        _recoveringPostAuthClose ||
+        _postAuthRecoveryEpoch != null ||
         recoverySessionEpoch != _sessionEpoch) {
       return;
     }
-    _recoveringPostAuthClose = true;
+    _postAuthRecoveryEpoch = recoverySessionEpoch;
     try {
       try {
-        await _transport.disconnectRfcomm(device.uuid);
+        await _transport
+            .disconnectRfcomm(device.uuid)
+            .timeout(const Duration(seconds: 5));
       } on Object {
         // 设备已经关闭旧 socket 时，本地清理仍可能返回错误。
       }
@@ -1264,18 +2412,17 @@ class DeviceController extends ChangeNotifier {
       _log('正在重建持久 SPP 传输；不会重复系统配对或 f=26/f=27。');
       await connectSpp(resumeSession: true);
     } on Object catch (exception) {
-      _resumeAuthenticatedSession = false;
-      _sessionCipher = null;
-      _log('持久 SPP 会话重建失败：$exception');
+      if (recoverySessionEpoch == _sessionEpoch) {
+        _finishFailedConnection('持久 SPP 会话重建失败：$exception');
+      }
     } finally {
-      _recoveringPostAuthClose = false;
+      if (_postAuthRecoveryEpoch == recoverySessionEpoch) {
+        _postAuthRecoveryEpoch = null;
+      }
     }
   }
 
-  Future<void> _sppSendL1Start(
-    int connectionEpoch,
-    Peripheral device,
-  ) async {
+  Future<void> _sppSendL1Start(int connectionEpoch, Peripheral device) async {
     if (!_isCurrentSppConnection(connectionEpoch)) return;
     final start = SppProtocol.buildL1StartRequest();
     _log('  L1START_REQ：${_hex(start)}');
@@ -1286,11 +2433,13 @@ class DeviceController extends ChangeNotifier {
       _sppWatchdog?.cancel();
       _sppWatchdog = Timer(const Duration(seconds: 15), () {
         if (!_isCurrentSppConnection(connectionEpoch)) return;
-        unawaited(_cleanupFailedSppConnect(
-          device,
-          TimeoutException('15 秒内无 L1START_RSP'),
-          connectionEpoch,
-        ));
+        unawaited(
+          _cleanupFailedSppConnect(
+            device,
+            TimeoutException('15 秒内无 L1START_RSP'),
+            connectionEpoch,
+          ),
+        );
       });
     } catch (exception) {
       _log('L1START 发送失败：$exception');
@@ -1307,11 +2456,7 @@ class DeviceController extends ChangeNotifier {
     } on Object catch (exception) {
       if (_isCurrentSppConnection(connectionEpoch) &&
           _closingFailedSppEpoch != connectionEpoch) {
-        await _cleanupFailedSppConnect(
-          device,
-          exception,
-          connectionEpoch,
-        );
+        await _cleanupFailedSppConnect(device, exception, connectionEpoch);
       }
     }
   }
@@ -1326,6 +2471,13 @@ class DeviceController extends ChangeNotifier {
       return;
     }
     _closingFailedSppEpoch = connectionEpoch;
+    // Invalidate the attempt before awaiting native cleanup.  Native streams
+    // can deliver late data/onDone after disconnect; those callbacks must not
+    // be able to restart a handshake or re-publish a candidate device.
+    final subscription = _sppSub;
+    _sppSub = null;
+    final invalidatedEpoch = ++_sppConnectionEpoch;
+    _connectionTearingDown = true;
     sessionReady = false;
     _sppAwaitingVersion = false;
     _clearPendingAuthConfirm();
@@ -1337,9 +2489,19 @@ class DeviceController extends ChangeNotifier {
     }
     _resumeAuthenticatedSession = false;
     _sessionCipher = null;
-    _log('SPP 连接失败：$exception');
+    final failureMessage = 'SPP 连接失败：$exception';
+    _log(failureMessage);
     try {
-      await _transport.disconnectRfcomm(device.uuid);
+      if (subscription != null) {
+        try {
+          await subscription.cancel();
+        } on Object catch (cancelError) {
+          _log('RFCOMM 数据流取消失败：$cancelError');
+        }
+      }
+      await _transport
+          .disconnectRfcomm(device.uuid)
+          .timeout(const Duration(seconds: 5));
       _log('失败的 RFCOMM 链路已关闭，可以重新连接。');
     } on Object catch (cleanupError) {
       _log('RFCOMM 失败清理未完成：$cleanupError');
@@ -1347,11 +2509,33 @@ class DeviceController extends ChangeNotifier {
       if (_closingFailedSppEpoch == connectionEpoch) {
         _closingFailedSppEpoch = null;
       }
-      if (_isCurrentSppConnection(connectionEpoch)) {
-        sppConnecting = false;
-        notifyListeners();
+      if (_sppConnectionEpoch == invalidatedEpoch) {
+        _finishFailedConnection(failureMessage);
       }
     }
+  }
+
+  Future<void> _handleAuthKeyRejected(
+    Peripheral device,
+    int connectionEpoch,
+    String reason,
+  ) async {
+    if (_authKeyRejectedEpoch == connectionEpoch) return;
+    _authKeyRejectedEpoch = connectionEpoch;
+    final id = device.uuid.toString();
+    final name = (connectedDeviceName ?? connectedProfile?.displayName)?.trim();
+    _log('设备拒绝 authkey；清除该设备凭据并要求重新输入（reason=$reason）。');
+    final published = _connectionIssues.recordAuthKeyMismatch(
+      targetId: id,
+      targetName: name,
+    );
+    if (published) notifyListeners();
+    await forgetAuthKeyForDevice(id, clearActiveKey: true);
+    await _cleanupFailedSppConnect(
+      device,
+      StateError('设备拒绝 authkey 身份验证：$reason'),
+      connectionEpoch,
+    );
   }
 
   void _clearSppHandshakeState() {
@@ -1373,13 +2557,17 @@ class DeviceController extends ChangeNotifier {
     switch (packet.type) {
       case SppProtocol.typeCmd:
         final cmd = packet.payload.isEmpty ? -1 : packet.payload[0];
-        _log('SPP CMD 帧：cmd=$cmd（1=L1START_REQ 2=L1START_RSP），'
-            'payload=${_hex(packet.payload)}');
+        _log(
+          'SPP CMD 帧：cmd=$cmd（1=L1START_REQ 2=L1START_RSP），'
+          'payload=${_hex(packet.payload)}',
+        );
         if (cmd == SppProtocol.cmdL1StartRsp) {
           if (_resumeAuthenticatedSession && _sessionCipher != null) {
             _resumeAuthenticatedSession = false;
             sessionReady = true;
             sppConnecting = false;
+            _connectionAttemptInProgress = false;
+            _connectionTearingDown = false;
             _sppWatchdog?.cancel();
             _sppWatchdog = null;
             _log('L1START_RSP 收到——传输层已恢复；复用已确认的会话密钥，不重复 f=26/f=27。');
@@ -1402,8 +2590,9 @@ class DeviceController extends ChangeNotifier {
         if (massIndex >= 0) {
           // L1 uses cumulative ACKs for a receive window. ACK N confirms every
           // queued Mass frame through N, not only the frame whose seq equals N.
-          final confirmed =
-              _pendingMassAckOrder.sublist(0, massIndex + 1).toList();
+          final confirmed = _pendingMassAckOrder
+              .sublist(0, massIndex + 1)
+              .toList();
           _pendingMassAckOrder.removeRange(0, massIndex + 1);
           _MassProgressMarker? latestProgress;
           for (final sequence in confirmed) {
@@ -1452,8 +2641,8 @@ class DeviceController extends ChangeNotifier {
     final opCode = packet.payload[1];
     final data = packet.payload.sublist(2);
     _log('  DATA channel=$channel opCode=$opCode data=${_hex(data)}');
-    final isPlainPbWrite = channel == SppProtocol.channelPb &&
-        opCode == SppProtocol.opCodeWrite;
+    final isPlainPbWrite =
+        channel == SppProtocol.channelPb && opCode == SppProtocol.opCodeWrite;
     if (channel == SppProtocol.channelPb &&
         opCode == SppProtocol.opCodeWriteEnc) {
       _inspectEncryptedBusinessFrame(data);
@@ -1461,8 +2650,10 @@ class DeviceController extends ChangeNotifier {
     }
     final parsed = XiaomiAuth.parse(data);
     if (parsed != null) {
-      _log('  Command：type=${parsed.type} subtype=${parsed.subtype} '
-          'watchNonce=${parsed.watchNonce != null}');
+      _log(
+        '  Command：type=${parsed.type} subtype=${parsed.subtype} '
+        'watchNonce=${parsed.watchNonce != null}',
+      );
       if (isPlainPbWrite &&
           parsed.type == XiaomiAuth.commandType &&
           parsed.subtype == XiaomiAuth.cmdNonce &&
@@ -1473,14 +2664,17 @@ class DeviceController extends ChangeNotifier {
           !sessionReady) {
         _sppAwaitingAuthConfirm = true;
         _log('  收到设备随机数与签名，开始本地验签后自动发送 f=27 sendAppConfirm…');
-        unawaited(_sppSendAuthConfirm(
-          connectionEpoch: connectionEpoch,
-          phoneNonce: _pendingPhoneNonce!,
-          watchNonce: parsed.watchNonce!,
-          watchHmac: parsed.watchHmac ?? const [],
-        ));
+        unawaited(
+          _sppSendAuthConfirm(
+            connectionEpoch: connectionEpoch,
+            phoneNonce: _pendingPhoneNonce!,
+            watchNonce: parsed.watchNonce!,
+            watchHmac: parsed.watchHmac ?? const [],
+          ),
+        );
       } else if (parsed.subtype == XiaomiAuth.cmdAuth) {
-        final belongsToCurrentHandshake = isPlainPbWrite &&
+        final belongsToCurrentHandshake =
+            isPlainPbWrite &&
             parsed.type == XiaomiAuth.commandType &&
             _pendingAuthConfirmEpoch == connectionEpoch &&
             _sppAwaitingAuthConfirm &&
@@ -1503,21 +2697,30 @@ class DeviceController extends ChangeNotifier {
         _pendingSessionKeys = null;
         _sppWatchdog?.cancel();
         _sppWatchdog = null;
-        sppConnecting = false;
         if (confirmed) {
           _sessionCipher = SessionCipher(keys);
           _log('  已启用 WRITE_ENC 业务通道与只读解密诊断。');
           _authenticatedAt = DateTime.now();
           sessionReady = true;
+          sppConnecting = false;
+          _connectionAttemptInProgress = false;
+          _connectionTearingDown = false;
           final authenticatedDevice = connectedDevice ?? _lastPeripheral;
-          final authenticatedName = connectedDeviceName;
-          if (defaultTargetPlatform == TargetPlatform.macOS &&
-              authenticatedDevice != null &&
-              authenticatedName != null) {
-            unawaited(_confirmMacOSRfcommIdentity(
-              authenticatedDevice,
-              authenticatedName,
-            ));
+          final authenticatedName =
+              (connectedDeviceName ?? connectedProfile?.displayName ?? '已验证设备')
+                  .trim();
+          if (authenticatedDevice != null) {
+            // Saving the post-auth identity and key is deliberately queued
+            // with deletion. If the user removes this saved device before
+            // either native write completes, the deletion is guaranteed to
+            // run last and cannot be undone by this asynchronous callback.
+            unawaited(
+              _persistAuthenticatedDevice(
+                device: authenticatedDevice,
+                advertisedName: authenticatedName,
+                key: authKey,
+              ),
+            );
           }
           _connectionIssues.authenticated();
           // f=27 confirms the authenticated session. Do not send a speculative
@@ -1529,11 +2732,26 @@ class DeviceController extends ChangeNotifier {
           _sessionCipher = null;
         }
         _log('  f=27 设备响应（confirmed=$confirmed，status=${parsed.status}）');
-        _log(confirmed
-            ? '  ★ 鉴权完成（device ready）——会话密钥已建立；可使用已验证的安装流程'
-            : '  ✕ 设备未确认鉴权，未将连接标记为就绪');
+        _log(
+          confirmed
+              ? '  ★ 鉴权完成（device ready）——会话密钥已建立；可使用已验证的安装流程'
+              : '  ✕ 设备未确认鉴权，未将连接标记为就绪',
+        );
         if (confirmed && _sessionCipher != null) {
           unawaited(_refreshAuthenticatedDeviceStatus());
+        } else {
+          final device = connectedDevice ?? _lastPeripheral;
+          if (device == null) {
+            _finishFailedConnection('设备拒绝 authkey 身份验证。');
+          } else {
+            unawaited(
+              _handleAuthKeyRejected(
+                device,
+                connectionEpoch,
+                'f=27 status=${parsed.authStatus}',
+              ),
+            );
+          }
         }
       }
     } else {
@@ -1572,8 +2790,10 @@ class DeviceController extends ChangeNotifier {
     }
     final parsed = XiaomiAuth.parse(plaintext);
     if (parsed?.type != null && parsed?.subtype != null) {
-      _log('  WRITE_ENC 解密命中：type=${parsed!.type} '
-          'subtype=${parsed.subtype} plain=${_hex(plaintext)}');
+      _log(
+        '  WRITE_ENC 解密命中：type=${parsed!.type} '
+        'subtype=${parsed.subtype} plain=${_hex(plaintext)}',
+      );
       return;
     }
     _log('  WRITE_ENC 未解析为已知 Command；不改变会话或发送状态。');
@@ -1589,12 +2809,14 @@ class DeviceController extends ChangeNotifier {
     final device = connectedDevice;
     if (device == null) {
       _clearPendingAuthConfirm();
+      _finishFailedConnection('f=27 身份验证失败：连接目标已丢失。');
       return;
     }
     final secretKey = XiaomiAuth.secretKeyFromHex(authKey ?? '');
     if (secretKey == null) {
       _clearPendingAuthConfirm();
       _log('f=27 被拒绝：authkey 无效');
+      await _handleAuthKeyRejected(device, connectionEpoch, '本地 authkey 格式无效');
       return;
     }
     final cmd = XiaomiAuth.buildAuthStep3Command(
@@ -1607,6 +2829,11 @@ class DeviceController extends ChangeNotifier {
     if (cmd == null) {
       _clearPendingAuthConfirm();
       _log('  ✗ 设备签名校验失败（HMAC 不匹配——authkey 与设备不匹配？）');
+      await _handleAuthKeyRejected(
+        device,
+        connectionEpoch,
+        'watch nonce HMAC 不匹配',
+      );
       return;
     }
     _pendingSessionKeys = SessionKeys.fromHkdf(
@@ -1614,6 +2841,13 @@ class DeviceController extends ChangeNotifier {
     );
     _pendingAuthConfirmEpoch = connectionEpoch;
     final frame = SppProtocol.buildDataFrame(_sppSeq++, cmd);
+    _logWire(
+      'TX',
+      frame,
+      phase: 'AUTH_F27',
+      sequence: _sppSeq - 1,
+      generation: connectionEpoch,
+    );
     _log('发送 f=27（seq=${_sppSeq - 1}，${frame.length}B）：${_hex(frame)}');
     try {
       await _transport.rfcommWrite(device.uuid, frame);
@@ -1629,22 +2863,20 @@ class DeviceController extends ChangeNotifier {
             _sppAwaitingAuthConfirm &&
             _pendingAuthConfirmEpoch == connectionEpoch) {
           _clearPendingAuthConfirm();
-          unawaited(_cleanupFailedSppConnect(
-            device,
-            TimeoutException('15 秒内无 f=27 响应'),
-            connectionEpoch,
-          ));
+          unawaited(
+            _cleanupFailedSppConnect(
+              device,
+              TimeoutException('15 秒内无 f=27 响应'),
+              connectionEpoch,
+            ),
+          );
         }
       });
     } catch (exception) {
       if (!_isCurrentSppConnection(connectionEpoch)) return;
       _clearPendingAuthConfirm();
       _log('f=27 发送失败：$exception');
-      await _cleanupFailedSppConnect(
-        device,
-        exception,
-        connectionEpoch,
-      );
+      await _cleanupFailedSppConnect(device, exception, connectionEpoch);
     }
   }
 
@@ -1669,11 +2901,21 @@ class DeviceController extends ChangeNotifier {
   Future<void> _sppSendAuthStep1(int connectionEpoch) async {
     if (!_isCurrentSppConnection(connectionEpoch)) return;
     final device = connectedDevice;
-    if (device == null) return;
+    if (device == null) {
+      _finishFailedConnection('f=26 身份验证失败：连接目标已丢失。');
+      return;
+    }
     final nonce = List<int>.generate(16, (_) => _random.nextInt(256));
     _pendingPhoneNonce = nonce;
     final command = XiaomiAuth.buildNonceCommand(nonce);
     final frame = SppProtocol.buildDataFrame(_sppSeq++, command);
+    _logWire(
+      'TX',
+      frame,
+      phase: 'AUTH_F26',
+      sequence: _sppSeq - 1,
+      generation: connectionEpoch,
+    );
     _log('发送 f=26（seq=${_sppSeq - 1}，${frame.length}B）：${_hex(frame)}');
     try {
       await _transport.rfcommWrite(device.uuid, frame);
@@ -1682,20 +2924,18 @@ class DeviceController extends ChangeNotifier {
       _sppWatchdog?.cancel();
       _sppWatchdog = Timer(const Duration(seconds: 15), () {
         if (!_isCurrentSppConnection(connectionEpoch)) return;
-        unawaited(_cleanupFailedSppConnect(
-          device,
-          TimeoutException('15 秒内无 watchNonce'),
-          connectionEpoch,
-        ));
+        unawaited(
+          _cleanupFailedSppConnect(
+            device,
+            TimeoutException('15 秒内无 watchNonce'),
+            connectionEpoch,
+          ),
+        );
       });
     } catch (exception) {
       if (!_isCurrentSppConnection(connectionEpoch)) return;
       _log('f=26 发送失败：$exception');
-      await _cleanupFailedSppConnect(
-        device,
-        exception,
-        connectionEpoch,
-      );
+      await _cleanupFailedSppConnect(device, exception, connectionEpoch);
     }
   }
 
@@ -1704,7 +2944,15 @@ class DeviceController extends ChangeNotifier {
     final device = connectedDevice;
     if (device == null) return;
     try {
-      await _transport.rfcommWrite(device.uuid, SppProtocol.buildAck(seq));
+      final frame = SppProtocol.buildAck(seq);
+      _logWire(
+        'TX',
+        frame,
+        phase: 'ACK',
+        sequence: seq,
+        generation: connectionEpoch,
+      );
+      await _transport.rfcommWrite(device.uuid, frame);
       _log('  ACK 已发送（seq=$seq）');
     } catch (exception) {
       _log('ACK 发送失败：$exception');
@@ -1714,69 +2962,110 @@ class DeviceController extends ChangeNotifier {
   List<int>? _pendingPhoneNonce;
   final _random = Random();
 
-  String _hex(List<int> bytes) =>
-      bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+  String _hex(List<int> bytes) {
+    // Protocol frames can contain auth material, nonces and session-encrypted
+    // payloads. Keep forensic correlation without persisting recoverable
+    // bytes in the diagnostic journal.
+    final digest = sha256.convert(bytes).toString().substring(0, 16);
+    return '<redacted bytes=${bytes.length} sha256=$digest>';
+  }
+
+  String _wireHex(List<int> bytes) => bytes
+      .map((b) => b.toRadixString(16).padLeft(2, '0').toUpperCase())
+      .join(' ');
 
   Future<void> disconnect() async {
+    if (_connectionTearingDown) {
+      _log('断开请求已在进行，忽略重复操作。');
+      return;
+    }
     _advanceSessionEpoch();
     _sppConnectionEpoch++;
     _closingFailedSppEpoch = null;
     _clearSppHandshakeState();
-    if (_installInProgress) {
-      await cancelInstall();
-      _log('RFCOMM/GATT 正在断开：安装已停止，设备可能保留部分数据。');
-    }
-    final device = connectedDevice;
-    if (device != null) {
-      try {
-        await _transport.disconnectRfcomm(device.uuid);
-      } on Object {
-        // RFCOMM 可能已经由设备关闭；仍继续清理 GATT/界面状态。
-      }
-      try {
-        await _transport.disconnect(device);
-      } on Object {
-        // Windows V2 快速路径不创建 GATT 连接，断开失败不影响 RFCOMM 清理。
-      }
-      _log('已断开 ${connectedDeviceName ?? device.uuid.toString()}');
-    }
-    connectedDevice = null;
-    connectedDeviceName = null;
-    connectedClassicAddress = null;
-    connectedProfile = null;
-    sessionReady = false;
-    sppConnecting = false;
-    _sppWatchdog?.cancel();
-    _sppWatchdog = null;
+    final sppSubscription = _sppSub;
+    _sppSub = null;
+    // The selected scan result may still be waiting on the macOS pairing
+    // sheet, in which case only _lastPeripheral is populated. Capture it
+    // before clearing presentation state so an explicit cancel can still
+    // release every native transport that was opened for the candidate.
+    final device = _connectionTarget;
+    final hadGattTransport = _hasActiveGattTransport;
+    final deviceLabel = connectedDeviceName ?? device?.uuid.toString();
+    // A deliberate cancel/disconnect is the one transition that should return
+    // to discovery automatically. Initial connection failures never set this.
+    _resumeScanningAfterConnectionEnd =
+        device != null || _connectionAttemptInProgress || sppConnecting;
+    // Clear presentation/session state before waiting on native Bluetooth.
+    // Otherwise the UI remains in the connected card while macOS tears down
+    // RFCOMM/GATT, and a late connection callback can make it appear connected.
+    _connectionTearingDown = device != null;
+    _clearConnectionCandidate();
     _scanResultsFlushTimer?.cancel();
     _scanResultsFlushTimer = null;
-    _authenticatedAt = null;
-    _recoveringPostAuthClose = false;
-    _resumeAuthenticatedSession = false;
-    _sessionCipher = null;
     _isScanning = false;
-    services = const [];
-    connectedFirmwareVersion = null;
-    lastTimeSyncSummary = null;
-    batteryPercent = null;
-    storageUsedBytes = null;
-    storageTotalBytes = null;
     _connectionIssues.reset();
     notifyListeners();
+    try {
+      if (sppSubscription != null) {
+        try {
+          await sppSubscription.cancel();
+        } on Object catch (exception) {
+          _log('断开时取消 RFCOMM 数据流失败：$exception');
+        }
+      }
+      if (_installInProgress) {
+        await cancelInstall();
+        _log('RFCOMM/GATT 正在断开：安装已停止，设备可能保留部分数据。');
+      }
+      if (device != null) {
+        try {
+          await _transport
+              .disconnectRfcomm(device.uuid)
+              .timeout(const Duration(seconds: 5));
+        } on Object {
+          // RFCOMM may already have been closed by the remote device; GATT
+          // cleanup and the user-visible state transition must still finish.
+        }
+        if (hadGattTransport) {
+          try {
+            await _transport
+                .disconnect(device)
+                .timeout(const Duration(seconds: 5));
+          } on Object {
+            // Native GATT teardown is best-effort; state reset must not wait
+            // indefinitely for a completion callback.
+          }
+        }
+        _log('已断开 ${deviceLabel ?? device.uuid}');
+      }
+    } finally {
+      _connectionTearingDown = false;
+      _hasActiveGattTransport = false;
+      _connectionAttemptInProgress = false;
+      sppConnecting = false;
+      notifyListeners();
+    }
   }
 
   /// Rebuilds the device connection and performs a fresh authentication.
   /// The selected device is retained so callers do not need to scan again.
   Future<void> reconnect() async {
-    if (sppConnecting) return;
+    if (isConnectionBusy) return;
     final device = connectedDevice ?? _lastPeripheral;
     if (device == null) {
       error = '没有可重新连接的设备，请先扫描并选择设备。';
       _log(error!);
+      notifyListeners();
       return;
     }
     _advanceSessionEpoch();
+    _resumeScanningAfterConnectionEnd = false;
+    final reconnectSession = _sessionEpoch;
+    _sppConnectionEpoch++;
     error = null;
+    _connectionAttemptInProgress = true;
+    _connectionTearingDown = true;
     sessionReady = false;
     _authenticatedAt = null;
     _resumeAuthenticatedSession = false;
@@ -1787,13 +3076,36 @@ class DeviceController extends ChangeNotifier {
     _sppWatchdog = null;
     notifyListeners();
     _log('正在重新建立设备连接并重新验证身份…');
+    var handedOffToSpp = false;
     try {
-      await _transport.disconnectRfcomm(device.uuid);
-    } on Object catch (exception) {
-      _log('清理旧 RFCOMM 链路时返回：$exception');
+      try {
+        await _transport
+            .disconnectRfcomm(device.uuid)
+            .timeout(const Duration(seconds: 5));
+      } on Object catch (exception) {
+        _log('清理旧 RFCOMM 链路时返回：$exception');
+      }
+      if (reconnectSession != _sessionEpoch || device != _connectionTarget) {
+        return;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+      if (reconnectSession != _sessionEpoch || device != _connectionTarget) {
+        return;
+      }
+      _connectionTearingDown = false;
+      // connectSpp now owns the busy state, including its failure cleanup.
+      // Mark that transfer of ownership before awaiting it so this method's
+      // finally block cannot clear a newly-created attempt.
+      handedOffToSpp = true;
+      await connectSpp();
+    } finally {
+      if (!handedOffToSpp && reconnectSession == _sessionEpoch) {
+        _connectionAttemptInProgress = false;
+        _connectionTearingDown = false;
+        sppConnecting = false;
+        notifyListeners();
+      }
     }
-    await Future<void>.delayed(const Duration(milliseconds: 250));
-    await connectSpp();
   }
 
   Future<void> startInstall(InstallRequest request) async {
@@ -1846,20 +3158,29 @@ class DeviceController extends ChangeNotifier {
       sessionReady = false;
       _sessionCipher = null;
       _connectionIssues.recordUnexpectedDisconnect();
-      _publishTask(request, InstallStage.stateUnknown,
-          '设备未在规定时间响应；已停止发送，设备状态未知。${exception.message ?? ''}');
+      _publishTask(
+        request,
+        InstallStage.stateUnknown,
+        '设备未在规定时间响应；已停止发送，设备状态未知。${exception.message ?? ''}',
+      );
     } on _InvalidDeviceResponse catch (exception) {
       sessionReady = false;
       _sessionCipher = null;
       _connectionIssues.recordUnexpectedDisconnect();
-      _publishTask(request, InstallStage.stateUnknown,
-          '设备响应无法验证；已停止发送，设备状态未知：${exception.message}');
+      _publishTask(
+        request,
+        InstallStage.stateUnknown,
+        '设备响应无法验证；已停止发送，设备状态未知：${exception.message}',
+      );
     } on Object catch (exception) {
       sessionReady = false;
       _sessionCipher = null;
       _connectionIssues.recordUnexpectedDisconnect();
       _publishTask(
-          request, InstallStage.stateUnknown, '传输已停止，设备状态未知：$exception');
+        request,
+        InstallStage.stateUnknown,
+        '传输已停止，设备状态未知：$exception',
+      );
     } finally {
       for (final waiter in _completionWaiters.toList()) {
         await waiter.cancel();
@@ -2000,14 +3321,58 @@ class DeviceController extends ChangeNotifier {
 
   /// Reads the installed quick-app list from the authenticated device.
   Future<List<WatchAppItem>> refreshInstalledWatchApps() async {
-    if (watchAppsLoading) return installedWatchApps;
+    if (watchAppsLoading) {
+      _logQuickAppRead(
+        '快应用列表读取已在进行，复用当前请求。',
+        level: DiagnosticLogLevel.trace,
+        event: 'quick_app_list_deduplicated',
+      );
+      return installedWatchApps;
+    }
     if (!sessionReady || _sessionCipher == null) {
+      watchAppsError = '请先完成设备鉴权';
+      _logQuickAppRead(
+        '快应用列表读取被拒绝：设备鉴权会话未就绪。',
+        level: DiagnosticLogLevel.warning,
+        event: 'quick_app_list_rejected',
+        fields: <String, Object?>{
+          'sessionReady': sessionReady,
+          'sessionCipherReady': _sessionCipher != null,
+        },
+      );
+      notifyListeners();
+      return installedWatchApps;
+    }
+    final sessionEpoch = _sessionEpoch;
+    final sessionCipher = _sessionCipher;
+    if (sessionCipher == null) {
+      // This can only happen when a connection callback changes the session
+      // between the guard above and this synchronous point. Keep the visible
+      // result deterministic rather than force-unwrapping a stale cipher.
       watchAppsError = '请先完成设备鉴权';
       notifyListeners();
       return installedWatchApps;
     }
+    final requestGeneration = ++_quickAppReadGeneration;
+
+    bool isCurrentRequest() =>
+        requestGeneration == _quickAppReadGeneration &&
+        sessionEpoch == _sessionEpoch &&
+        sessionReady &&
+        identical(_sessionCipher, sessionCipher);
+
     watchAppsLoading = true;
     watchAppsError = null;
+    _logQuickAppRead(
+      '读取设备快应用列表。',
+      event: 'quick_app_list_request',
+      fields: <String, Object?>{
+        'command': ZauCommand.appList,
+        'sub': ZauCommand.appListSub,
+        'sessionEpoch': sessionEpoch,
+        'requestGeneration': requestGeneration,
+      },
+    );
     notifyListeners();
     try {
       final response = await _requestBusiness(
@@ -2016,35 +3381,127 @@ class DeviceController extends ChangeNotifier {
         ZauCommand.appListSub,
       );
       final payload = response.payload;
+      _logQuickAppRead(
+        '收到设备快应用列表响应。',
+        level: DiagnosticLogLevel.trace,
+        event: 'quick_app_list_response',
+        fields: <String, Object?>{
+          'responseCommand': response.command,
+          'responseSub': response.sub,
+          'payloadField': payload?.$1,
+          'payloadBytes': payload?.$2.length,
+          'sessionEpoch': sessionEpoch,
+          'requestGeneration': requestGeneration,
+        },
+      );
+      if (!isCurrentRequest()) {
+        _logQuickAppRead(
+          '已忽略过期会话的快应用列表响应。',
+          level: DiagnosticLogLevel.trace,
+          event: 'quick_app_list_stale',
+          fields: <String, Object?>{
+            'requestSessionEpoch': sessionEpoch,
+            'currentSessionEpoch': _sessionEpoch,
+            'requestGeneration': requestGeneration,
+            'currentGeneration': _quickAppReadGeneration,
+          },
+        );
+        return installedWatchApps;
+      }
       if (payload == null || payload.$1 != 22) {
         throw const FormatException('设备快应用列表缺少 v8s 载荷');
       }
-      installedWatchApps = List<WatchAppItem>.unmodifiable(
-        V8s.parseInstalledApps(payload.$2),
+      final parsed = V8s.parseInstalledApps(payload.$2);
+      installedWatchApps = List<WatchAppItem>.unmodifiable(parsed);
+      _quickAppsLoadedSessionEpoch = sessionEpoch;
+      _logQuickAppRead(
+        '设备快应用列表读取完成。',
+        event: 'quick_app_list_parsed',
+        fields: <String, Object?>{
+          'appCount': parsed.length,
+          'removableCount': parsed.where((app) => app.canRemove).length,
+        },
       );
       return installedWatchApps;
     } on Object catch (exception) {
+      if (!isCurrentRequest()) {
+        _logQuickAppRead(
+          '已忽略过期会话的快应用列表读取失败。',
+          level: DiagnosticLogLevel.trace,
+          event: 'quick_app_list_stale',
+          fields: <String, Object?>{
+            'requestSessionEpoch': sessionEpoch,
+            'currentSessionEpoch': _sessionEpoch,
+            'requestGeneration': requestGeneration,
+            'currentGeneration': _quickAppReadGeneration,
+            'errorType': exception.runtimeType.toString(),
+          },
+        );
+        return installedWatchApps;
+      }
       watchAppsError = '读取快应用列表失败：$exception';
-      _log(watchAppsError!);
+      _logQuickAppRead(
+        '读取设备快应用列表失败。',
+        level: DiagnosticLogLevel.error,
+        event: 'quick_app_list_failed',
+        fields: <String, Object?>{
+          'errorType': exception.runtimeType.toString(),
+          'exception': exception.toString(),
+        },
+      );
       return installedWatchApps;
     } finally {
-      watchAppsLoading = false;
-      notifyListeners();
+      // A later request owns the loading flag. Never let an old timeout or
+      // delayed response make a new read appear finished.
+      if (requestGeneration == _quickAppReadGeneration) {
+        watchAppsLoading = false;
+        notifyListeners();
+      }
     }
   }
 
   Future<bool> uninstallWatchApp(WatchAppItem app) async {
     if (!app.canRemove || watchAppsLoading) return false;
-    if (!sessionReady || _sessionCipher == null) {
+    final sessionCipher = _sessionCipher;
+    if (!sessionReady || sessionCipher == null) {
       watchAppsError = '请先完成设备鉴权';
       notifyListeners();
       return false;
     }
+
+    final sessionEpoch = _sessionEpoch;
+    final operationGeneration = ++_quickAppOperationGeneration;
+    // An old app-list response may already be on its way when an uninstall is
+    // confirmed. It must not put the removed item back into the local list.
+    _quickAppReadGeneration++;
+
+    bool isCurrentOperation() =>
+        operationGeneration == _quickAppOperationGeneration &&
+        sessionEpoch == _sessionEpoch &&
+        sessionReady &&
+        identical(_sessionCipher, sessionCipher);
+
     watchAppsLoading = true;
     watchAppsError = null;
+    _logQuickAppRead(
+      '发送设备快应用卸载命令。',
+      event: 'quick_app_uninstall_request',
+      fields: <String, Object?>{
+        'command': ZauCommand.appList,
+        'sub': ZauCommand.uninstallAppSub,
+        'packageName': app.packageName,
+        'sessionEpoch': sessionEpoch,
+        'operationGeneration': operationGeneration,
+      },
+    );
     notifyListeners();
     try {
-      await _requestBusiness(
+      // Xiaomi's uninstall API is a fire-and-ack operation.  The reference
+      // client completes its callback from the transport/contact success
+      // path; V2 devices commonly do not emit a second encrypted 20/3
+      // business response.  Waiting for that optional response turns an
+      // already accepted uninstall into a 12-second false timeout.
+      await _sendBusinessNoResponse(
         Zau(
           command: ZauCommand.appList,
           sub: ZauCommand.uninstallAppSub,
@@ -2053,21 +3510,90 @@ class DeviceController extends ChangeNotifier {
             fingerprint: app.fingerprint,
           ),
         ),
-        ZauCommand.appList,
-        ZauCommand.uninstallAppSub,
       );
-      // Release the in-flight flag before re-querying; otherwise the refresh
-      // is treated as a duplicate request and returns the stale list.
-      watchAppsLoading = false;
-      await refreshInstalledWatchApps();
+      if (!isCurrentOperation()) {
+        _logQuickAppRead(
+          '已忽略过期会话的快应用卸载 ACK。',
+          level: DiagnosticLogLevel.trace,
+          event: 'quick_app_uninstall_stale',
+          fields: <String, Object?>{
+            'result': 'ack',
+            'packageName': app.packageName,
+            'operationSessionEpoch': sessionEpoch,
+            'currentSessionEpoch': _sessionEpoch,
+            'operationGeneration': operationGeneration,
+            'currentOperationGeneration': _quickAppOperationGeneration,
+          },
+        );
+        return false;
+      }
+
+      // The RFCOMM ACK is the completion boundary for this command.  Update
+      // the visible list immediately and leave a later explicit refresh to
+      // reconcile with the device; a refresh timeout must never turn this
+      // acknowledged uninstall back into a failure.
+      final previousCount = installedWatchApps.length;
+      installedWatchApps = List<WatchAppItem>.unmodifiable(
+        installedWatchApps.where(
+          (installed) => installed.packageName != app.packageName,
+        ),
+      );
+      _quickAppsLoadedSessionEpoch = sessionEpoch;
+      _logQuickAppRead(
+        '卸载命令已收到 SPP ACK；本地列表已更新。',
+        event: 'quick_app_uninstall_ack',
+        fields: <String, Object?>{
+          'command': ZauCommand.appList,
+          'sub': ZauCommand.uninstallAppSub,
+          'packageName': app.packageName,
+          'removedLocal': previousCount != installedWatchApps.length,
+          'remainingCount': installedWatchApps.length,
+          'sessionEpoch': sessionEpoch,
+          'operationGeneration': operationGeneration,
+        },
+      );
       return true;
     } on Object catch (exception) {
+      if (!isCurrentOperation()) {
+        _logQuickAppRead(
+          '已忽略过期会话的快应用卸载失败。',
+          level: DiagnosticLogLevel.trace,
+          event: 'quick_app_uninstall_stale',
+          fields: <String, Object?>{
+            'result': 'error',
+            'packageName': app.packageName,
+            'operationSessionEpoch': sessionEpoch,
+            'currentSessionEpoch': _sessionEpoch,
+            'operationGeneration': operationGeneration,
+            'currentOperationGeneration': _quickAppOperationGeneration,
+            'errorType': exception.runtimeType.toString(),
+          },
+        );
+        return false;
+      }
       watchAppsError = '卸载快应用失败：$exception';
-      _log(watchAppsError!);
+      _logQuickAppRead(
+        watchAppsError!,
+        level: DiagnosticLogLevel.error,
+        event: 'quick_app_uninstall_failed',
+        fields: <String, Object?>{
+          'packageName': app.packageName,
+          'sessionEpoch': sessionEpoch,
+          'operationGeneration': operationGeneration,
+          'errorType': exception.runtimeType.toString(),
+          'exception': exception.toString(),
+        },
+      );
       return false;
     } finally {
-      watchAppsLoading = false;
-      notifyListeners();
+      // A disconnect or a new session may have begun while RFCOMM was waiting
+      // for its ACK. Only the operation which still owns the visible state may
+      // complete it.
+      if (operationGeneration == _quickAppOperationGeneration &&
+          sessionEpoch == _sessionEpoch) {
+        watchAppsLoading = false;
+        notifyListeners();
+      }
     }
   }
 
@@ -2097,23 +3623,26 @@ class DeviceController extends ChangeNotifier {
       // resolved for the platform that owns the lease.
       final resolvedPath = lease.file.path;
       final resolvedBookmark = lease.file.bookmark;
-      final sourceChanged = resolvedPath != checkpoint.path ||
+      final sourceChanged =
+          resolvedPath != checkpoint.path ||
           !listEquals(resolvedBookmark, checkpoint.bookmark);
       if (sourceChanged) {
-        await _checkpointStore.save(InstallCheckpoint(
-          kind: checkpoint.kind,
-          path: resolvedPath,
-          fileSize: checkpoint.fileSize,
-          md5Hex: checkpoint.md5Hex,
-          sha256Hex: checkpoint.sha256Hex,
-          dataType: checkpoint.dataType,
-          lastAcknowledgedSegment: checkpoint.lastAcknowledgedSegment,
-          phase: checkpoint.phase,
-          faceId: checkpoint.faceId,
-          packageName: checkpoint.packageName,
-          versionCode: checkpoint.versionCode,
-          bookmark: resolvedBookmark,
-        ));
+        await _checkpointStore.save(
+          InstallCheckpoint(
+            kind: checkpoint.kind,
+            path: resolvedPath,
+            fileSize: checkpoint.fileSize,
+            md5Hex: checkpoint.md5Hex,
+            sha256Hex: checkpoint.sha256Hex,
+            dataType: checkpoint.dataType,
+            lastAcknowledgedSegment: checkpoint.lastAcknowledgedSegment,
+            phase: checkpoint.phase,
+            faceId: checkpoint.faceId,
+            packageName: checkpoint.packageName,
+            versionCode: checkpoint.versionCode,
+            bookmark: resolvedBookmark,
+          ),
+        );
       }
       if (sourceChanged) {
         _refreshRetryRequestSources(
@@ -2121,8 +3650,10 @@ class DeviceController extends ChangeNotifier {
           ScopedFileRef(path: resolvedPath, bookmark: resolvedBookmark),
         );
       }
-      _log('检查点有效：已确认片 ${checkpoint.lastAcknowledgedSegment}，'
-          '重新认证后将重新 MassPrepare，由设备决定是否给出可信断点。');
+      _log(
+        '检查点有效：已确认片 ${checkpoint.lastAcknowledgedSegment}，'
+        '重新认证后将重新 MassPrepare，由设备决定是否给出可信断点。',
+      );
     } on Object {
       _log('恢复检查失败：源文件不存在、没有访问权限或无法更新检查点，设备状态未知。');
     } finally {
@@ -2130,9 +3661,9 @@ class DeviceController extends ChangeNotifier {
         await lease?.close();
       } on Object catch (cleanupError) {
         if (!_disposed) {
-          _log('恢复检查点后释放文件访问权限失败（' +
-              cleanupError.runtimeType.toString() +
-              '）。');
+          _log(
+            '恢复检查点后释放文件访问权限失败（' + cleanupError.runtimeType.toString() + '）。',
+          );
         }
       }
     }
@@ -2150,13 +3681,13 @@ class DeviceController extends ChangeNotifier {
         request.metadata.sha256Hex == checkpoint.sha256Hex;
 
     InstallRequest withSource(InstallRequest request) => InstallRequest(
-          kind: request.kind,
-          path: source.path,
-          metadata: request.metadata,
-          source: source,
-          unsupportedLuaConfirmed: request.unsupportedLuaConfirmed,
-          watchfaceResolutionConfirmed: request.watchfaceResolutionConfirmed,
-        );
+      kind: request.kind,
+      path: source.path,
+      metadata: request.metadata,
+      source: source,
+      unsupportedLuaConfirmed: request.unsupportedLuaConfirmed,
+      watchfaceResolutionConfirmed: request.watchfaceResolutionConfirmed,
+    );
 
     final lastRequest = _lastInstallRequest;
     if (lastRequest != null && matchesCheckpoint(lastRequest)) {
@@ -2183,26 +3714,31 @@ class DeviceController extends ChangeNotifier {
       return;
     }
     final queuedEntry = installQueue.reversed
-        .where((entry) =>
-            entry.canRetry &&
-            entry.request.kind == request.kind &&
-            entry.request.path == request.path &&
-            entry.request.metadata.md5Hex == request.metadata.md5Hex)
+        .where(
+          (entry) =>
+              entry.canRetry &&
+              entry.request.kind == request.kind &&
+              entry.request.path == request.path &&
+              entry.request.metadata.md5Hex == request.metadata.md5Hex,
+        )
         .firstOrNull;
     if (queuedEntry != null) {
       await _retryQueueEntry(queuedEntry);
       return;
     }
     final checkpoint = await _checkpointStore.load();
-    final checkpointMatches = checkpoint != null &&
+    final checkpointMatches =
+        checkpoint != null &&
         checkpoint.kind == request.kind &&
         checkpoint.path == request.path &&
         checkpoint.fileSize == request.metadata.fileSize &&
         checkpoint.md5Hex == request.metadata.md5Hex &&
         checkpoint.sha256Hex == request.metadata.sha256Hex;
     if (checkpointMatches) {
-      _log('继续传输同一文件：本地已确认片 '
-          '${checkpoint.lastAcknowledgedSegment}；将由设备 MassPrepare 决定续传偏移。');
+      _log(
+        '继续传输同一文件：本地已确认片 '
+        '${checkpoint.lastAcknowledgedSegment}；将由设备 MassPrepare 决定续传偏移。',
+      );
     } else {
       _log('重新发送同一文件：没有可用本地检查点；将由设备 MassPrepare 决定续传偏移。');
     }
@@ -2252,9 +3788,7 @@ class DeviceController extends ChangeNotifier {
       } on Object catch (error) {
         // Cleanup failure must not replace install success or its primary
         // failure; avoid logging sensitive paths or bookmark contents.
-        _log('安装后释放文件访问权限失败（' +
-            error.runtimeType.toString() +
-            '）。');
+        _log('安装后释放文件访问权限失败（' + error.runtimeType.toString() + '）。');
       }
     }
   }
@@ -2290,10 +3824,13 @@ class DeviceController extends ChangeNotifier {
     if (request.kind == InstallKind.watchface) {
       final preinstall = await _requestBusiness(
         Zau(
-            command: ZauCommand.setFace,
-            sub: 4,
-            payload: A9u.withFileInfo(
-                faceId: metadata.faceId!, fileSize: bytes.length)),
+          command: ZauCommand.setFace,
+          sub: 4,
+          payload: A9u.withFileInfo(
+            faceId: metadata.faceId!,
+            fileSize: bytes.length,
+          ),
+        ),
         ZauCommand.setFace,
         4,
       );
@@ -2307,12 +3844,14 @@ class DeviceController extends ChangeNotifier {
     } else {
       final preinstall = await _requestBusiness(
         Zau(
-            command: ZauCommand.prepareInstallApp,
-            sub: 1,
-            payload: V8s.prepareRequest(
-                packageName: metadata.packageName!,
-                versionCode: metadata.versionCode!,
-                packageSize: bytes.length)),
+          command: ZauCommand.prepareInstallApp,
+          sub: 1,
+          payload: V8s.prepareRequest(
+            packageName: metadata.packageName!,
+            versionCode: metadata.versionCode!,
+            packageSize: bytes.length,
+          ),
+        ),
         ZauCommand.prepareInstallApp,
         1,
       );
@@ -2328,11 +3867,13 @@ class DeviceController extends ChangeNotifier {
     _checkCancelled();
     final prepared = await _requestBusiness(
       Zau(
-          command: ZauCommand.massTransfer,
-          payload: O1h.prepareRequest(
-              dataType: dataType,
-              fileMd5: _hexToBytes(metadata.md5Hex),
-              fileLength: bytes.length)),
+        command: ZauCommand.massTransfer,
+        payload: O1h.prepareRequest(
+          dataType: dataType,
+          fileMd5: _hexToBytes(metadata.md5Hex),
+          fileLength: bytes.length,
+        ),
+      ),
       ZauCommand.massTransfer,
       0,
     );
@@ -2341,7 +3882,8 @@ class DeviceController extends ChangeNotifier {
     final massInfo = O1h.parsePrepareResponse(response.$2);
     if (massInfo.prepareStatus != 0) {
       throw _DeviceInstallFailed(
-          'MassPrepare 被设备拒绝，状态=${massInfo.prepareStatus}');
+        'MassPrepare 被设备拒绝，状态=${massInfo.prepareStatus}',
+      );
     }
     // The APK names this value remainLength, but passes it directly as the
     // already-sent file offset to MassDataDispatcher. A fresh transfer returns
@@ -2354,8 +3896,8 @@ class DeviceController extends ChangeNotifier {
     final segmentLength = massInfo.expectedSliceLength > 4
         ? massInfo.expectedSliceLength
         : preinstallSliceLength > 4
-            ? preinstallSliceLength
-            : defaultMassSegmentLength;
+        ? preinstallSliceLength
+        : defaultMassSegmentLength;
     _log('MassPrepare 通过：续传偏移=$sentLength B，片长=$segmentLength B');
     final transferPlan = sentLength == bytes.length
         ? null
@@ -2367,24 +3909,25 @@ class DeviceController extends ChangeNotifier {
             sentLength: sentLength,
           );
     final totalSegments = transferPlan?.totalSegments ?? 0;
-    await _checkpointStore.save(InstallCheckpoint(
-      kind: request.kind,
-      path: lease.file.path,
-      fileSize: metadata.fileSize,
-      md5Hex: metadata.md5Hex,
-      sha256Hex: metadata.sha256Hex,
-      dataType: dataType,
-      lastAcknowledgedSegment: 0,
-      phase: 'transferring',
-      faceId: metadata.faceId,
-      packageName: metadata.packageName,
-      versionCode: metadata.versionCode,
-      bookmark: lease.file.bookmark,
-    ));
-    // The device negotiated a three-packet L1 receive window. The UI can raise
-    // this experimental window for throughput testing. Complete L1 frames are
-    // concatenated into one RFCOMM stream write; frame boundaries, sequence
-    // numbers, cumulative ACK handling, and timeout behavior stay unchanged.
+    await _checkpointStore.save(
+      InstallCheckpoint(
+        kind: request.kind,
+        path: lease.file.path,
+        fileSize: metadata.fileSize,
+        md5Hex: metadata.md5Hex,
+        sha256Hex: metadata.sha256Hex,
+        dataType: dataType,
+        lastAcknowledgedSegment: 0,
+        phase: 'transferring',
+        faceId: metadata.faceId,
+        packageName: metadata.packageName,
+        versionCode: metadata.versionCode,
+        bookmark: lease.file.bookmark,
+      ),
+    );
+    // Complete L1 frames are concatenated into one RFCOMM stream write;
+    // frame boundaries, sequence numbers, cumulative ACK handling, and
+    // timeout behavior stay unchanged for the selected transfer window.
     final massAckWindow = massWindowSize;
     var confirmedFileBytes = sentLength;
     _beginTransferTiming(confirmedBytes: sentLength);
@@ -2406,8 +3949,10 @@ class DeviceController extends ChangeNotifier {
       while (batch.length < massAckWindow && iterator.moveNext()) {
         final segment = iterator.current;
         batch.add(segment);
-        queuedFileBytes =
-            min(bytes.length, queuedFileBytes + segment.fileByteCount);
+        queuedFileBytes = min(
+          bytes.length,
+          queuedFileBytes + segment.fileByteCount,
+        );
         confirmedBytesBySegment[segment.index] = queuedFileBytes;
       }
       if (batch.isEmpty) break;
@@ -2435,50 +3980,59 @@ class DeviceController extends ChangeNotifier {
       );
       final confirmed = batch.last;
       confirmedFileBytes = queuedFileBytes;
-      await _checkpointStore.save(InstallCheckpoint(
+      await _checkpointStore.save(
+        InstallCheckpoint(
+          kind: request.kind,
+          path: lease.file.path,
+          fileSize: metadata.fileSize,
+          md5Hex: metadata.md5Hex,
+          sha256Hex: metadata.sha256Hex,
+          dataType: dataType,
+          lastAcknowledgedSegment: confirmed.index,
+          phase: 'transferring',
+          faceId: metadata.faceId,
+          packageName: metadata.packageName,
+          versionCode: metadata.versionCode,
+          bookmark: lease.file.bookmark,
+        ),
+      );
+      if (confirmed.index < totalSegments) {
+        await Future<void>.delayed(Duration(milliseconds: segmentIntervalMs));
+      }
+    }
+    _finishTransferTiming();
+    _publishTask(
+      request,
+      InstallStage.awaitingDevice,
+      '文件已确认发送，正在等待设备安装结果。',
+      currentSegment: totalSegments,
+      totalSegments: totalSegments,
+      confirmedBytes: bytes.length,
+      queuedSegment: totalSegments,
+      queuedBytes: bytes.length,
+      totalBytes: bytes.length,
+      bytesPerSecond: _confirmedBytesPerSecond,
+    );
+    await _checkpointStore.save(
+      InstallCheckpoint(
         kind: request.kind,
         path: lease.file.path,
         fileSize: metadata.fileSize,
         md5Hex: metadata.md5Hex,
         sha256Hex: metadata.sha256Hex,
         dataType: dataType,
-        lastAcknowledgedSegment: confirmed.index,
-        phase: 'transferring',
+        lastAcknowledgedSegment: totalSegments,
+        phase: 'awaitingDevice',
         faceId: metadata.faceId,
         packageName: metadata.packageName,
         versionCode: metadata.versionCode,
         bookmark: lease.file.bookmark,
-      ));
-      if (confirmed.index < totalSegments) {
-        await Future<void>.delayed(Duration(milliseconds: segmentIntervalMs));
-      }
-    }
-    _finishTransferTiming();
-    _publishTask(request, InstallStage.awaitingDevice, '文件已确认发送，正在等待设备安装结果。',
-        currentSegment: totalSegments,
-        totalSegments: totalSegments,
-        confirmedBytes: bytes.length,
-        queuedSegment: totalSegments,
-        queuedBytes: bytes.length,
-        totalBytes: bytes.length,
-        bytesPerSecond: _confirmedBytesPerSecond);
-    await _checkpointStore.save(InstallCheckpoint(
-      kind: request.kind,
-      path: lease.file.path,
-      fileSize: metadata.fileSize,
-      md5Hex: metadata.md5Hex,
-      sha256Hex: metadata.sha256Hex,
-      dataType: dataType,
-      lastAcknowledgedSegment: totalSegments,
-      phase: 'awaitingDevice',
-      faceId: metadata.faceId,
-      packageName: metadata.packageName,
-      versionCode: metadata.versionCode,
-      bookmark: lease.file.bookmark,
-    ));
+      ),
+    );
     if (watchCompletion != null) {
       final result = await _withInstallCancellation(
-          watchCompletion.future.timeout(const Duration(minutes: 5)));
+        watchCompletion.future.timeout(const Duration(minutes: 5)),
+      );
       final payload = result.payload;
       if (payload == null) throw StateError('表盘完成事件缺少载荷');
       final parsed = A9u.parse(payload.$2);
@@ -2487,22 +4041,28 @@ class DeviceController extends ChangeNotifier {
         throw _DeviceInstallFailed('设备拒绝表盘安装，状态=${parsed.code}');
       }
       await _requestBusiness(
-          Zau(
-              command: ZauCommand.setFace,
-              sub: 1,
-              payload: A9u.withFaceId(metadata.faceId!)),
-          ZauCommand.setFace,
-          1);
+        Zau(
+          command: ZauCommand.setFace,
+          sub: 1,
+          payload: A9u.withFaceId(metadata.faceId!),
+        ),
+        ZauCommand.setFace,
+        1,
+      );
       await _clearCheckpointBestEffort();
-      _publishTask(request, InstallStage.succeeded,
-          '表盘已安装并已请求切换 faceId=${metadata.faceId}');
+      _publishTask(
+        request,
+        InstallStage.succeeded,
+        '表盘已安装并已请求切换 faceId=${metadata.faceId}',
+      );
       return;
     }
     late final Zau appResultMessage;
     late final ({int code, String packageName}) appResult;
     try {
       appResultMessage = await _withInstallCancellation(
-          appCompletion!.future.timeout(const Duration(seconds: 120)));
+        appCompletion!.future.timeout(const Duration(seconds: 120)),
+      );
       final appPayload = appResultMessage.payload;
       if (appPayload == null) {
         throw const FormatException('快应用安装结果缺少载荷');
@@ -2513,11 +4073,15 @@ class DeviceController extends ChangeNotifier {
     }
     if (appResult.code != 0) {
       throw _DeviceInstallFailed(
-          '设备报告快应用安装失败：包名=${appResult.packageName}，状态=${appResult.code}');
+        '设备报告快应用安装失败：包名=${appResult.packageName}，状态=${appResult.code}',
+      );
     }
     await _clearCheckpointBestEffort();
     _publishTask(
-        request, InstallStage.succeeded, '快应用已安装：${appResult.packageName}');
+      request,
+      InstallStage.succeeded,
+      '快应用已安装：${appResult.packageName}',
+    );
   }
 
   void _validateInstallRequest(InstallRequest request) {
@@ -2568,19 +4132,23 @@ class DeviceController extends ChangeNotifier {
   }) async {
     final expectedCommand = responseCommand ?? command;
     final expectedSub = responseSub ?? sub;
-    final waiter = _BusinessWaiter(_businessResponses.stream,
-        (item) => item.command == expectedCommand && item.sub == expectedSub);
+    final waiter = _BusinessWaiter(
+      _businessResponses.stream,
+      (item) => item.command == expectedCommand && item.sub == expectedSub,
+    );
     final plaintext = message.encode();
     final encrypted = _sessionCipher!.encryptOutbound(plaintext);
     _log('发送业务命令 $command/$sub：PB=${_hex(plaintext)}');
     try {
       await _writeL2(
-          channel: SppProtocol.channelPb,
-          opCode: SppProtocol.opCodeWriteEnc,
-          payload: encrypted,
-          timeout: const Duration(seconds: 12));
+        channel: SppProtocol.channelPb,
+        opCode: SppProtocol.opCodeWriteEnc,
+        payload: encrypted,
+        timeout: const Duration(seconds: 12),
+      );
       return await _withInstallCancellation(
-          waiter.future.timeout(const Duration(seconds: 12)));
+        waiter.future.timeout(const Duration(seconds: 12)),
+      );
     } finally {
       await waiter.cancel();
     }
@@ -2749,7 +4317,8 @@ class DeviceController extends ChangeNotifier {
 
   _BusinessWaiter _listenBusiness(int command, int sub) =>
       _registerCompletionWaiter(
-          (item) => item.command == command && item.sub == sub);
+        (item) => item.command == command && item.sub == sub,
+      );
 
   /// 官方客户端等待 command=20/sub=2 的设备安装结果，并以包名关联任务。
   /// 结果可能来自其他应用，因此不能只按命令号取第一条消息。
@@ -2795,21 +4364,27 @@ class DeviceController extends ChangeNotifier {
     }
   }
 
-  Future<void> _writeL2(
-      {required int channel,
-      required int opCode,
-      required List<int> payload,
-      required Duration timeout}) async {
+  Future<void> _writeL2({
+    required int channel,
+    required int opCode,
+    required List<int> payload,
+    required Duration timeout,
+  }) async {
     final queued = await _queueL2(
-        channel: channel, opCode: opCode, payload: payload, timeout: timeout);
+      channel: channel,
+      opCode: opCode,
+      payload: payload,
+      timeout: timeout,
+    );
     await queued.acknowledged;
   }
 
-  Future<_QueuedL2Write> _queueL2(
-      {required int channel,
-      required int opCode,
-      required List<int> payload,
-      required Duration timeout}) async {
+  Future<_QueuedL2Write> _queueL2({
+    required int channel,
+    required int opCode,
+    required List<int> payload,
+    required Duration timeout,
+  }) async {
     _checkCancelled();
     final device = connectedDevice ?? _lastPeripheral;
     if (device == null || !sessionReady) throw StateError('认证会话已失效');
@@ -2821,8 +4396,12 @@ class DeviceController extends ChangeNotifier {
       _pendingMassAckOrder.add(sequence);
     }
     try {
-      final frame = SppProtocol.buildDataFrame(sequence, payload,
-          channel: channel, opCode: opCode);
+      final frame = SppProtocol.buildDataFrame(
+        sequence,
+        payload,
+        channel: channel,
+        opCode: opCode,
+      );
       if (channel == SppProtocol.channelMass) {
         final total = payload.length >= 2 ? payload[0] | (payload[1] << 8) : 0;
         final index = payload.length >= 4 ? payload[2] | (payload[3] << 8) : 0;
@@ -2830,8 +4409,10 @@ class DeviceController extends ChangeNotifier {
           _log('  Mass TX seq=$sequence 片=$index/$total，${payload.length}B');
         }
       } else {
-        _log('  RFCOMM TX seq=$sequence channel=$channel opCode=$opCode '
-            'frame=${_hex(frame)}');
+        _log(
+          '  RFCOMM TX seq=$sequence channel=$channel opCode=$opCode '
+          'frame=${_hex(frame)}',
+        );
       }
       await _transport.rfcommWrite(device.uuid, frame);
       final acknowledged = ack.future.timeout(timeout).whenComplete(() {
@@ -2883,12 +4464,14 @@ class DeviceController extends ChangeNotifier {
         totalBytes: totalBytes,
       );
       queued.add((sequence, ack));
-      frames.addAll(SppProtocol.buildDataFrame(
-        sequence,
-        segment.data,
-        channel: SppProtocol.channelMass,
-        opCode: SppProtocol.opCodeWrite,
-      ));
+      frames.addAll(
+        SppProtocol.buildDataFrame(
+          sequence,
+          segment.data,
+          channel: SppProtocol.channelMass,
+          opCode: SppProtocol.opCodeWrite,
+        ),
+      );
     }
 
     final first = segments.first;
@@ -2896,8 +4479,10 @@ class DeviceController extends ChangeNotifier {
     if (first.index == 1 ||
         last.index == last.total ||
         segments.any((segment) => segment.index % 25 == 0)) {
-      _log('  Mass TX 窗口 ${first.index}–${last.index}/${last.total}，'
-          '${frames.length}B（单次 RFCOMM 写入）');
+      _log(
+        '  Mass TX 窗口 ${first.index}–${last.index}/${last.total}，'
+        '${frames.length}B（单次 RFCOMM 写入）',
+      );
     }
 
     try {
@@ -2961,34 +4546,42 @@ class DeviceController extends ChangeNotifier {
   void _updateTransferSpeed(int confirmedBytes) {
     final now = DateTime.now();
     final previousAt = _lastSpeedSampleAt;
-    final elapsedMicros =
-        previousAt == null ? 0 : now.difference(previousAt).inMicroseconds;
+    final elapsedMicros = previousAt == null
+        ? 0
+        : now.difference(previousAt).inMicroseconds;
     final byteDelta = confirmedBytes - _lastSpeedSampleBytes;
     if (elapsedMicros > 0 && byteDelta > 0) {
       final instant =
           byteDelta * Duration.microsecondsPerSecond / elapsedMicros;
       final previous = _confirmedBytesPerSecond;
-      _confirmedBytesPerSecond =
-          previous == null ? instant : previous * 0.65 + instant * 0.35;
+      _confirmedBytesPerSecond = previous == null
+          ? instant
+          : previous * 0.65 + instant * 0.35;
     }
     _lastSpeedSampleAt = now;
     _lastSpeedSampleBytes = confirmedBytes;
   }
 
-  void _publishTask(InstallRequest request, InstallStage stage, String message,
-      {int? currentSegment,
-      int? totalSegments,
-      int? confirmedBytes,
-      int? queuedSegment,
-      int? queuedBytes,
-      int? totalBytes,
-      double? bytesPerSecond}) {
+  void _publishTask(
+    InstallRequest request,
+    InstallStage stage,
+    String message, {
+    int? currentSegment,
+    int? totalSegments,
+    int? confirmedBytes,
+    int? queuedSegment,
+    int? queuedBytes,
+    int? totalBytes,
+    double? bytesPerSecond,
+  }) {
     final previous = latestTask;
-    final sameTask = previous != null &&
+    final sameTask =
+        previous != null &&
         previous.kind == request.kind &&
         previous.fileName == request.metadata.fileName &&
         previous.md5Hex == request.metadata.md5Hex;
-    final keepProgress = sameTask &&
+    final keepProgress =
+        sameTask &&
         stage != InstallStage.validating &&
         stage != InstallStage.waitingForProtocol;
     final resolvedCurrentSegment =
@@ -3008,34 +4601,37 @@ class DeviceController extends ChangeNotifier {
     final transferElapsed = _currentTransferElapsed;
     final transferredBytes =
         (resolvedConfirmedBytes ?? 0) - _transferStartConfirmedBytes;
-    final averageBytesPerSecond = transferElapsed != null &&
+    final averageBytesPerSecond =
+        transferElapsed != null &&
             transferElapsed.inMicroseconds > 0 &&
             transferredBytes > 0
         ? transferredBytes *
-            Duration.microsecondsPerSecond /
-            transferElapsed.inMicroseconds
+              Duration.microsecondsPerSecond /
+              transferElapsed.inMicroseconds
         : null;
     latestTask = InstallTask(
-        kind: request.kind,
-        fileName: request.metadata.fileName,
-        stage: stage,
-        message: message,
-        targetDeviceName: connectedDeviceName ?? connectedProfile?.displayName,
-        md5Hex: request.metadata.md5Hex,
-        faceId: request.metadata.faceId,
-        packageName: request.metadata.packageName,
-        versionCode: request.metadata.versionCode,
-        currentSegment: resolvedCurrentSegment,
-        totalSegments: resolvedTotalSegments,
-        confirmedBytes: resolvedConfirmedBytes,
-        queuedSegment: resolvedQueuedSegment,
-        queuedBytes: resolvedQueuedBytes,
-        totalBytes: resolvedTotalBytes,
-        bytesPerSecond: resolvedSpeed,
-        elapsed: _installStopwatch?.elapsed,
-        transferElapsed: transferElapsed,
-        averageBytesPerSecond: averageBytesPerSecond);
-    final shouldLog = stage != InstallStage.transferring ||
+      kind: request.kind,
+      fileName: request.metadata.fileName,
+      stage: stage,
+      message: message,
+      targetDeviceName: connectedDeviceName ?? connectedProfile?.displayName,
+      md5Hex: request.metadata.md5Hex,
+      faceId: request.metadata.faceId,
+      packageName: request.metadata.packageName,
+      versionCode: request.metadata.versionCode,
+      currentSegment: resolvedCurrentSegment,
+      totalSegments: resolvedTotalSegments,
+      confirmedBytes: resolvedConfirmedBytes,
+      queuedSegment: resolvedQueuedSegment,
+      queuedBytes: resolvedQueuedBytes,
+      totalBytes: resolvedTotalBytes,
+      bytesPerSecond: resolvedSpeed,
+      elapsed: _installStopwatch?.elapsed,
+      transferElapsed: transferElapsed,
+      averageBytesPerSecond: averageBytesPerSecond,
+    );
+    final shouldLog =
+        stage != InstallStage.transferring ||
         currentSegment == 1 ||
         currentSegment == totalSegments ||
         (currentSegment != null && currentSegment % 25 == 0);
@@ -3047,17 +4643,22 @@ class DeviceController extends ChangeNotifier {
   }
 
   List<int> _hexToBytes(String hex) => [
-        for (var index = 0; index < hex.length; index += 2)
-          int.parse(hex.substring(index, index + 2), radix: 16),
-      ];
+    for (var index = 0; index < hex.length; index += 2)
+      int.parse(hex.substring(index, index + 2), radix: 16),
+  ];
 
   @override
   void dispose() {
     _disposed = true;
+    _logNotifyTimer?.cancel();
+    _logNotifyTimer = null;
+    _logNotificationPending = false;
+    _advanceSessionEpoch();
     _sppConnectionEpoch++;
     _closingFailedSppEpoch = null;
     _clearSppHandshakeState();
     unawaited(_scanSubscription?.cancel());
+    unawaited(_bluetoothStateSubscription?.cancel());
     unawaited(_sppSub?.cancel());
     _sppSub = null;
     for (final waiter in _completionWaiters) {
@@ -3072,6 +4673,16 @@ class DeviceController extends ChangeNotifier {
     unawaited(_transport.disposeRfcommStream());
     super.dispose();
   }
+}
+
+/// Lightweight peripheral identity used only by the macOS RFCOMM bridge.
+/// CoreBluetooth GATT operations still require a real scan result; this type
+/// is never passed to the GATT plugin.
+class _PersistedPeripheral implements Peripheral {
+  const _PersistedPeripheral(this.uuid);
+
+  @override
+  final UUID uuid;
 }
 
 class _InstallCancelled implements Exception {
@@ -3103,21 +4714,24 @@ class _QueuedL2Write {
 /// charging file-transfer time against the device-install timeout.
 class _BusinessWaiter {
   _BusinessWaiter(Stream<Zau> stream, bool Function(Zau) predicate) {
-    _subscription = stream.listen((item) {
-      if (_completer.isCompleted) return;
-      try {
-        if (!predicate(item)) return;
-        _completer.complete(item);
-        unawaited(_subscription.cancel());
-      } on Object catch (error, stackTrace) {
-        _completer.completeError(error, stackTrace);
-        unawaited(_subscription.cancel());
-      }
-    }, onError: (Object error, StackTrace stackTrace) {
-      if (!_completer.isCompleted) {
-        _completer.completeError(error, stackTrace);
-      }
-    });
+    _subscription = stream.listen(
+      (item) {
+        if (_completer.isCompleted) return;
+        try {
+          if (!predicate(item)) return;
+          _completer.complete(item);
+          unawaited(_subscription.cancel());
+        } on Object catch (error, stackTrace) {
+          _completer.completeError(error, stackTrace);
+          unawaited(_subscription.cancel());
+        }
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        if (!_completer.isCompleted) {
+          _completer.completeError(error, stackTrace);
+        }
+      },
+    );
   }
 
   final Completer<Zau> _completer = Completer<Zau>();

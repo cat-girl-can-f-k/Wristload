@@ -33,6 +33,7 @@ final class JsonLineMacBluetoothTransport implements MacBluetoothTransport {
       StreamController<MacBluetoothTransportSnapshot>.broadcast(sync: true);
   final Map<String, _PendingRequest> _pending = {};
   final Set<String> _retiredConnectionIds = {};
+  final Map<String, Completer<void>> _connectionTerminals = {};
 
   Process? _process;
   StreamSubscription<String>? _stdoutSubscription;
@@ -228,6 +229,8 @@ final class JsonLineMacBluetoothTransport implements MacBluetoothTransport {
     }
     final connectionId = _newScopedId('c', ++_connectionCounter);
     _connectionId = connectionId;
+    final terminal = Completer<void>();
+    _connectionTerminals[connectionId] = terminal;
     try {
       final response = await _request(
         'connect',
@@ -253,12 +256,21 @@ final class JsonLineMacBluetoothTransport implements MacBluetoothTransport {
       _setSnapshot(connected: false, message: 'RFCOMM 连接超时。');
       _scheduleConnectionCleanup(connectionId);
       rethrow;
-    } on Object {
+    } on Object catch (error) {
       // Native connect failures may arrive before `closed`; keep the ID
-      // retired and serialize an explicit cleanup before allowing reconnect.
+      // retired, but let the helper's guaranteed error -> cleanup -> closed
+      // sequence settle before sending a redundant disconnect.
       _retiredConnectionIds.add(connectionId);
-      _scheduleConnectionCleanup(connectionId);
       _setSnapshot(connected: false, message: 'RFCOMM 连接失败。');
+      if (error is MacBluetoothNativeException) {
+        try {
+          await terminal.future.timeout(const Duration(seconds: 1));
+        } on Object {
+          _scheduleConnectionCleanup(connectionId);
+        }
+      } else {
+        _scheduleConnectionCleanup(connectionId);
+      }
       rethrow;
     }
   }
@@ -472,12 +484,29 @@ final class JsonLineMacBluetoothTransport implements MacBluetoothTransport {
     }
     final connectionId = event['connectionId'];
     if (connectionId is String &&
-        _retiredConnectionIds.contains(connectionId)) {
+        _retiredConnectionIds.contains(connectionId) &&
+        eventName != 'closed' &&
+        eventName != 'connection.stage' &&
+        eventName != 'error' &&
+        eventName != 'disconnect.done') {
       // A timed-out connect is explicitly cancelled. Do not surface late
       // connect/error/data events from that generation to a newer session.
       return;
     }
     switch (eventName) {
+      case 'connection.stage':
+        if (event['connectionId'] != _connectionId &&
+            !_retiredConnectionIds.contains(event['connectionId'])) {
+          return;
+        }
+        final stage = event['stage'];
+        if (stage is String) {
+          _setSnapshot(
+            connected: false,
+            message: _connectionStageMessage(stage, event),
+          );
+        }
+        return;
       case 'device':
         if (event['scanId'] != _scanId) return;
         try {
@@ -505,10 +534,22 @@ final class JsonLineMacBluetoothTransport implements MacBluetoothTransport {
         }
         return;
       case 'closed':
-        if (event['connectionId'] != _connectionId) return;
+        if (connectionId is! String) return;
+        final terminal = _connectionTerminals.remove(connectionId);
+        if (terminal != null && !terminal.isCompleted) terminal.complete();
+        _retiredConnectionIds.remove(connectionId);
+        if (connectionId != _connectionId) return;
         _connectionId = null;
-        _setSnapshot(connected: false, message: 'RFCOMM 远端已关闭。');
-        _input.add(Uint8List(0));
+        final reason = event['reason'];
+        _setSnapshot(
+          connected: false,
+          message: reason == 'remote'
+              ? 'RFCOMM 远端已关闭。'
+              : reason == 'error'
+                  ? 'RFCOMM 连接已在原生错误后清理。'
+                  : 'RFCOMM 已在本地清理。',
+        );
+        if (reason == 'remote') _input.add(Uint8List(0));
         return;
       case 'error':
         if (!requestHandled) {
@@ -544,6 +585,24 @@ final class JsonLineMacBluetoothTransport implements MacBluetoothTransport {
   }
 
   static int? _asInt(Object? value) => value is num ? value.toInt() : null;
+
+  static String _connectionStageMessage(
+    String stage,
+    Map<String, Object?> event,
+  ) {
+    final channel = _asInt(event['channel']);
+    return switch (stage) {
+      'sdp.started' => '正在查询 SDP 服务端点。',
+      'sdp.completed' => 'SDP 查询已返回，正在解析 RFCOMM 端点。',
+      'sdp.timeout' => 'SDP 查询未收到 macOS 终止回调。',
+      'rfcomm.open.started' =>
+        '正在打开 RFCOMM 通道${channel == null ? '' : ' $channel'}。',
+      'rfcomm.open.completed' => 'RFCOMM 打开回调已返回。',
+      'rfcomm.open.timeout' => 'RFCOMM 打开未收到 macOS 终止回调。',
+      'cleanup.completed' => 'RFCOMM 原生连接状态已清理。',
+      _ => 'RFCOMM 连接阶段：$stage',
+    };
+  }
 
   String _newScopedId(String prefix, int counter) =>
       '${_helperSessionId ?? 'starting'}-$prefix$counter';
@@ -598,6 +657,10 @@ final class JsonLineMacBluetoothTransport implements MacBluetoothTransport {
     _connectionId = null;
     _disconnecting = null;
     _retiredConnectionIds.clear();
+    for (final terminal in _connectionTerminals.values) {
+      if (!terminal.isCompleted) terminal.complete();
+    }
+    _connectionTerminals.clear();
     _scanId = null;
     final error = MacBluetoothProtocolException(message);
     for (final request in _pending.values) {
@@ -660,6 +723,10 @@ final class JsonLineMacBluetoothTransport implements MacBluetoothTransport {
       _pending.clear();
       _disconnecting = null;
       _retiredConnectionIds.clear();
+      for (final terminal in _connectionTerminals.values) {
+        if (!terminal.isCompleted) terminal.complete();
+      }
+      _connectionTerminals.clear();
       await _stdoutSubscription?.cancel();
       await _stderrSubscription?.cancel();
       _snapshot = const MacBluetoothTransportSnapshot(

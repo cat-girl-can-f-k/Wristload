@@ -309,8 +309,10 @@ abstract final class A9u {
 
   /// 解析表盘预装响应/结果。返回 (kind, code/id…)。
   /// kind：success → code；error → errorCode；installResult → (id, code)。
-  static ({String kind, int code, String? faceId}) parse(List<int> data,
-      [IntEncoding enc = IntEncoding.varint]) {
+  static ({String kind, int code, String? faceId}) parse(
+    List<int> data, [
+    IntEncoding enc = IntEncoding.varint,
+  ]) {
     final r = ProtoReader(data);
     while (!r.isAtEnd) {
       final (field, wt) = r.readFieldHeader();
@@ -366,7 +368,10 @@ abstract final class V8s {
   }) {
     if (packageName.trim().isEmpty) {
       throw ArgumentError.value(
-          packageName, 'packageName', 'must not be empty');
+        packageName,
+        'packageName',
+        'must not be empty',
+      );
     }
     final app = ProtoWriter()
       ..writeString(1, packageName)
@@ -375,17 +380,35 @@ abstract final class V8s {
     return (22, v8s.bytes);
   }
 
-  /// Parses v8s.field1=m8s[] from command=20/sub=0.
+  /// Parses command=20/sub=0 response data.
+  ///
+  /// The RPK oneof uses `v8s.field1` as a list wrapper. Each installed app is
+  /// then carried by a repeated `field1` inside that wrapper. Keeping the two
+  /// levels explicit prevents the wrapper bytes from being decoded as an app
+  /// package name.
   static List<WatchAppItem> parseInstalledApps(List<int> data) {
     final apps = <WatchAppItem>[];
-    final outer = ProtoReader(data);
-    while (!outer.isAtEnd) {
-      final (field, wire) = outer.readFieldHeader();
+    final v8s = ProtoReader(data);
+    var foundListWrapper = false;
+    while (!v8s.isAtEnd) {
+      final (field, wire) = v8s.readFieldHeader();
       if (field == 1 && wire == 2) {
-        apps.add(_parseInstalledApp(outer.readBytes()));
+        foundListWrapper = true;
+        final wrapper = ProtoReader(v8s.readBytes());
+        while (!wrapper.isAtEnd) {
+          final (entryField, entryWire) = wrapper.readFieldHeader();
+          if (entryField == 1 && entryWire == 2) {
+            apps.add(_parseInstalledApp(wrapper.readBytes()));
+          } else {
+            wrapper.skipField(entryWire);
+          }
+        }
       } else {
-        outer.skipField(wire);
+        v8s.skipField(wire);
       }
+    }
+    if (!foundListWrapper) {
+      throw const FormatException('设备快应用列表缺少列表容器');
     }
     return apps;
   }
@@ -442,8 +465,9 @@ abstract final class V8s {
 
   /// 解析预装响应 k8s：返回 (status, expectedSliceLength)。
   static ({int status, int expectedSliceLength}) parsePrepareResponse(
-      List<int> data,
-      [IntEncoding enc = IntEncoding.varint]) {
+    List<int> data, [
+    IntEncoding enc = IntEncoding.varint,
+  ]) {
     // v8s response is normally carried as v8s.field3 = k8s.
     final outer = ProtoReader(data);
     while (!outer.isAtEnd) {
@@ -543,8 +567,7 @@ abstract final class O1h {
 
   /// 解析 MassPrepare 响应 u1h：返回 (prepareStatus, remainLength, expectedSliceLength)。
   static ({int prepareStatus, int remainLength, int expectedSliceLength})
-      parsePrepareResponse(List<int> data,
-          [IntEncoding enc = IntEncoding.varint]) {
+  parsePrepareResponse(List<int> data, [IntEncoding enc = IntEncoding.varint]) {
     // o1h response is normally carried as o1h.field2 = u1h.
     final outer = ProtoReader(data);
     while (!outer.isAtEnd) {

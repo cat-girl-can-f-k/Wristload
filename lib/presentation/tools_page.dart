@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../application/device_controller.dart';
+import '../application/diagnostic_log_service.dart';
 import '../domain/device_tools.dart';
 import '../platform/scoped_file_picker.dart';
 import '../platform/security_scoped_file_access.dart';
@@ -42,6 +43,11 @@ class _ToolsPageState extends State<ToolsPage> {
     final result =
         await ScopedFilePicker.pickFiles(allowedExtensions: const ['zip']);
     if (!mounted || result == null || result.isEmpty) return;
+    appLogger.info(
+      '工具页 ZIP 文件已选择',
+      category: DiagnosticLogCategory.ui,
+      fields: <String, Object?>{'fileCount': result.length},
+    );
     setState(() {
       _zipFile = result.single;
       _zipFileSize = null;
@@ -60,6 +66,11 @@ class _ToolsPageState extends State<ToolsPage> {
         _zipFile = lease.file;
       }
       final bytes = await File(lease.file.path).readAsBytes();
+      appLogger.trace(
+        '工具 ZIP 文件读取完成',
+        category: DiagnosticLogCategory.storage,
+        fields: <String, Object?>{'bytes': bytes.length},
+      );
       if (identical(_zipFile, lease.file)) {
         _zipFileSize = bytes.length;
       }
@@ -70,9 +81,11 @@ class _ToolsPageState extends State<ToolsPage> {
       } on Object catch (cleanupError) {
         // Scope release is cleanup; preserve bytes already read and avoid
         // exposing paths or opaque bookmark contents in diagnostics.
-        debugPrint('工具文件访问权限释放失败（' +
-            cleanupError.runtimeType.toString() +
-            '）。');
+        appLogger.error(
+          '工具文件访问权限释放失败',
+          category: DiagnosticLogCategory.security,
+          fields: <String, Object?>{'errorType': cleanupError.runtimeType.toString()},
+        );
       }
     }
   }
@@ -88,6 +101,11 @@ class _ToolsPageState extends State<ToolsPage> {
     try {
       final bytes = await _readZip(file);
       final candidates = extractAuthKeysFromZip(bytes);
+      appLogger.info(
+        '工具 ZIP authkey 候选解析完成',
+        category: DiagnosticLogCategory.security,
+        fields: <String, Object?>{'candidateCount': candidates.length},
+      );
       if (candidates.isEmpty) {
         throw const FormatException('未找到 32 位 authkey');
       }
@@ -98,6 +116,11 @@ class _ToolsPageState extends State<ToolsPage> {
         });
       }
     } on Object catch (error) {
+      appLogger.error(
+        '工具 ZIP authkey 提取失败',
+        category: DiagnosticLogCategory.security,
+        fields: <String, Object?>{'errorType': error.runtimeType.toString()},
+      );
       if (mounted) setState(() => _authError = '文件无效或未找到 authkey：$error');
     } finally {
       if (mounted) setState(() => _extracting = false);
@@ -118,6 +141,11 @@ class _ToolsPageState extends State<ToolsPage> {
     final key = _authKey;
     if (key == null) return;
     final applied = await widget.controller.setAuthKey(key);
+    appLogger.info(
+      applied ? '工具 authkey 已应用' : '工具 authkey 应用失败',
+      category: DiagnosticLogCategory.security,
+      fields: <String, Object?>{'valid': applied},
+    );
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(applied ? 'authkey 已应用到当前会话' : 'authkey 无效')),
@@ -320,7 +348,8 @@ class _ToolsPageState extends State<ToolsPage> {
                       borderRadius: BorderRadius.circular(12),
                     ),
                     child: Text(
-                      '在您计算解锁码之前，我们强烈建议您先尝试使用连续插拔设备充电器百余次的方法让设备重启三次触发保护恢复出厂设置这种更便捷的方法删除密码。',
+                      // '在您计算解锁码之前，我们强烈建议您先尝试使用连续插拔设备充电器百余次的方法让设备重启三次触发保护恢复出厂设置这种更便捷的方法删除密码。' //一点都错
+                      '警告！在输入正确解锁码之后，你的设备会直接被清空所有设置，恢复出厂。',
                       style: theme.textTheme.bodyMedium
                           ?.copyWith(color: theme.colorScheme.onErrorContainer),
                     ),
@@ -468,4 +497,4 @@ String _formatSize(int bytes) {
   return '${(bytes / 1024).toStringAsFixed(1)} KB';
 }
 
-String _zipFileName(String path) => path.split(RegExp(r'[/\]')).last;
+String _zipFileName(String path) => path.split(RegExp(r'[/\\]')).last;

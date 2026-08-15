@@ -123,5 +123,43 @@ void main() {
       await Future<void>.delayed(Duration.zero);
       expect(events.map((e) => (e as KeyPress).name), ['中', '文']);
     });
+
+    test('decodes SGR mouse press and release without affecting keys',
+        () async {
+      send('a\x1b[<0;17;9M\x1b[<3;17;9mb');
+      await Future<void>.delayed(Duration.zero);
+
+      expect((events[0] as KeyPress).name, 'a');
+      final press = events[1] as MouseEvent;
+      expect(press.action, MouseAction.press);
+      expect(press.button, MouseButton.left);
+      expect(press.column, 17);
+      expect(press.row, 9);
+      final release = events[2] as MouseEvent;
+      expect(release.action, MouseAction.release);
+      expect(release.button, isNull);
+      expect((events[3] as KeyPress).name, 'b');
+    });
+
+    test('decodes SGR mouse wheel direction and modifiers', () async {
+      send('\x1b[<68;3;4M\x1b[<81;3;4M');
+      await Future<void>.delayed(Duration.zero);
+
+      final up = events[0] as MouseEvent;
+      expect(up.action, MouseAction.scroll);
+      expect(up.scrollDirection, MouseScrollDirection.up);
+      expect(up.shift, isTrue);
+      final down = events[1] as MouseEvent;
+      expect(down.scrollDirection, MouseScrollDirection.down);
+      expect(down.control, isTrue);
+    });
+
+    test('keeps malformed SGR reports as ordinary CSI events', () async {
+      send('\x1b[<1;2M');
+      await Future<void>.delayed(Duration.zero);
+
+      final event = events.single as KeyPress;
+      expect(event.name, 'csi-<1;2M');
+    });
   });
 }

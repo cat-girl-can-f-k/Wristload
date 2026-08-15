@@ -8,6 +8,7 @@ import 'key_event.dart';
 /// Handles:
 /// - ASCII control characters (Enter, Tab, Backspace, Escape)
 /// - ANSI escape sequences (arrows, Home, End, F1-F12, etc.)
+/// - SGR mouse reports (ESC [ < b ; x ; y M/m)
 /// - Bracketed paste events (ESC [ 200 ~ ... ESC [ 201 ~)
 class KeyDecoder {
   KeyDecoder({
@@ -143,9 +144,80 @@ class KeyDecoder {
     final finalByte = _buffer[end];
     _buffer.removeRange(0, end + 1);
 
+    final mouse = _decodeSgrMouse(params, finalByte);
+    if (mouse != null) return mouse;
+
     final name = _csiName(params, finalByte);
     return KeyPress(name,
         raw: '\x1b[${params}${String.fromCharCode(finalByte)}');
+  }
+
+  MouseEvent? _decodeSgrMouse(String params, int finalByte) {
+    if ((finalByte != 0x4d && finalByte != 0x6d) || !params.startsWith('<')) {
+      return null;
+    }
+
+    final fields = params.substring(1).split(';');
+    if (fields.length != 3) return null;
+    final buttonCode = int.tryParse(fields[0]);
+    final column = int.tryParse(fields[1]);
+    final row = int.tryParse(fields[2]);
+    if (buttonCode == null ||
+        column == null ||
+        row == null ||
+        buttonCode < 0 ||
+        column < 1 ||
+        row < 1) {
+      return null;
+    }
+
+    final shift = (buttonCode & 4) != 0;
+    final alt = (buttonCode & 8) != 0;
+    final control = (buttonCode & 16) != 0;
+    final wheel = (buttonCode & 64) != 0;
+    final motion = (buttonCode & 32) != 0;
+    final baseCode = buttonCode & 3;
+
+    if (wheel) {
+      final direction = switch (baseCode) {
+        0 => MouseScrollDirection.up,
+        1 => MouseScrollDirection.down,
+        2 => MouseScrollDirection.left,
+        _ => MouseScrollDirection.right,
+      };
+      return MouseEvent(
+        action: MouseAction.scroll,
+        column: column,
+        row: row,
+        rawButtonCode: buttonCode,
+        scrollDirection: direction,
+        shift: shift,
+        alt: alt,
+        control: control,
+      );
+    }
+
+    final button = switch (baseCode) {
+      0 => MouseButton.left,
+      1 => MouseButton.middle,
+      2 => MouseButton.right,
+      _ => null,
+    };
+    final action = finalByte == 0x6d || baseCode == 3
+        ? MouseAction.release
+        : motion
+            ? MouseAction.move
+            : MouseAction.press;
+    return MouseEvent(
+      action: action,
+      column: column,
+      row: row,
+      rawButtonCode: buttonCode,
+      button: button,
+      shift: shift,
+      alt: alt,
+      control: control,
+    );
   }
 
   KeyEvent? _decodeSs3() {
