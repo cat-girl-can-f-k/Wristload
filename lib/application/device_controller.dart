@@ -1784,13 +1784,12 @@ class DeviceController extends ChangeNotifier {
         log: _log,
       );
       if (connectionSession != _sessionEpoch) return;
-      // System pairing is not a successful application connection. Do not
-      // publish a connected device until the pairing request has completed,
-      // otherwise a cancelled macOS dialog leaves the home page showing a
-      // false "connected" state.
+      // Platform preparation is not a successful application connection. On
+      // macOS it resolves pairing/identity here; Windows deliberately performs
+      // its single pairing ceremony inside connectRfcomm below.
       connectedDevice = peripheral;
       _lastPeripheral = peripheral;
-      _log('经典蓝牙配对状态已确认；开始 SPP/RFCOMM 应用层鉴权。');
+      _log('$platformName 连接准备完成；开始 SPP/RFCOMM 建链与应用层鉴权。');
       await connectSpp();
     } on Object catch (exception) {
       if (connectionSession != _sessionEpoch) return;

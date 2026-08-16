@@ -324,6 +324,7 @@ class FloatingWindowCoordinator with WindowListener {
   }
 
   Future<void> _invokeFloating(String method, Object? arguments) async {
+    if (!_floatingReady || _disposed || _floatingWindow == null) return;
     appLogger.trace(
       '浮动安装窗口发送命令',
       category: DiagnosticLogCategory.communication,
@@ -333,14 +334,23 @@ class FloatingWindowCoordinator with WindowListener {
       await _channel.invokeMethod<void>(method, arguments);
     } on WindowChannelException catch (error) {
       // A secondary engine may still be starting, or may just have closed.
-      appLogger.error(
-        '浮动安装窗口通道调用失败',
-        category: DiagnosticLogCategory.communication,
-        fields: <String, Object?>{
-          'method': method,
-          'errorType': error.runtimeType.toString(),
-        },
-      );
+      final fields = <String, Object?>{
+        'method': method,
+        'errorType': error.runtimeType.toString(),
+      };
+      if (method == 'setAlwaysOnTop') {
+        appLogger.debug(
+          '浮动安装窗口已关闭或通道尚未就绪，跳过置顶同步',
+          category: DiagnosticLogCategory.communication,
+          fields: fields,
+        );
+      } else {
+        appLogger.warning(
+          '浮动安装窗口通道调用未完成',
+          category: DiagnosticLogCategory.communication,
+          fields: fields,
+        );
+      }
       _floatingReady = false;
     }
   }
@@ -459,12 +469,16 @@ class FloatingWindowCoordinator with WindowListener {
 
   @override
   void onWindowFocus() {
-    unawaited(_invokeFloating('setAlwaysOnTop', false));
+    if (_enabled && _floatingReady && !_disposed) {
+      unawaited(_invokeFloating('setAlwaysOnTop', false));
+    }
   }
 
   @override
   void onWindowBlur() {
-    if (_enabled) unawaited(_invokeFloating('setAlwaysOnTop', true));
+    if (_enabled && _floatingReady && !_disposed) {
+      unawaited(_invokeFloating('setAlwaysOnTop', true));
+    }
   }
 
   @override

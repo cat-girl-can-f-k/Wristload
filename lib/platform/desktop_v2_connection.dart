@@ -7,8 +7,8 @@ typedef DesktopV2ConnectionLog = void Function(String message);
 /// Platform-owned preparation for a V2 desktop RFCOMM session.
 ///
 /// The controller owns common connection state and the SPP/authkey handshake.
-/// Each desktop platform owns only the identity resolution and system-pairing
-/// sequence required before that handshake starts.
+/// Each desktop platform owns only the identity resolution and pairing strategy
+/// required before or during the RFCOMM connection.
 abstract interface class DesktopV2Connection {
   const DesktopV2Connection();
 

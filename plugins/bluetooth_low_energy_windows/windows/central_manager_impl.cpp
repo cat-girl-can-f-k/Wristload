@@ -4,6 +4,45 @@
 
 namespace bluetooth_low_energy_windows
 {
+	namespace
+	{
+		std::string PairingStatusName(
+			winrt::Windows::Devices::Enumeration::DevicePairingResultStatus status)
+		{
+			switch (static_cast<int>(status))
+			{
+			case 0: return "Paired";
+			case 1: return "NotReadyToPair";
+			case 2: return "NotPaired";
+			case 3: return "AlreadyPaired";
+			case 4: return "ConnectionRejected";
+			case 5: return "TooManyConnections";
+			case 6: return "HardwareFailure";
+			case 7: return "AuthenticationTimeout";
+			case 8: return "AuthenticationNotAllowed";
+			case 9: return "AuthenticationFailure";
+			case 10: return "NoSupportedProfiles";
+			case 11: return "ProtectionLevelCouldNotBeMet";
+			case 12: return "AccessDenied";
+			case 13: return "InvalidCeremonyData";
+			case 14: return "PairingCanceled";
+			case 15: return "OperationAlreadyInProgress";
+			case 16: return "RequiredHandlerNotRegistered";
+			case 17: return "RejectedByHandler";
+			case 18: return "RemoteDeviceHasAssociation";
+			case 19: return "Failed";
+			default: return "Unknown";
+			}
+		}
+
+		bool IsRetriablePairingStatus(
+			winrt::Windows::Devices::Enumeration::DevicePairingResultStatus status)
+		{
+			const auto value = static_cast<int>(status);
+			return value == 1 || value == 2 || value == 15;
+		}
+	}
+
 	CentralManagerImpl::CentralManagerImpl(flutter::BinaryMessenger *messenger, PlatformTaskPoster post_to_platform)
 	{
 		const auto api = CentralManagerFlutterApi(messenger);
@@ -305,83 +344,62 @@ namespace bluetooth_low_energy_windows
 				static_cast<unsigned>(address & 0xff));
 			const std::string mac(mac_buf);
 
-			// Pairing a dual-mode wearable through BluetoothLEDevice may create only
-			// a BTHLE record. That record does not prove that the BR/EDR identity or
-			// its Serial Port Profile is ready, so resolve and pair both identities.
-			stage = "resolve BLE identity";
-			const auto ble_device = co_await winrt::Windows::Devices::Bluetooth::BluetoothLEDevice::FromBluetoothAddressAsync(address);
-			if (ble_device == nullptr)
+			// Pair the classic BR/EDR device identity, not the RFCOMM service child.
+			// Pairing the service child can make the Windows pairing broker fail with
+			// RPC_E_SERVERFAULT before it displays the computer-name ceremony.
+			stage = "resolve classic Bluetooth identity";
+			const auto classic_selector = winrt::Windows::Devices::Bluetooth::BluetoothDevice::GetDeviceSelectorFromBluetoothAddress(address);
+			const auto classic_infos = co_await winrt::Windows::Devices::Enumeration::DeviceInformation::FindAllAsync(classic_selector);
+			if (classic_infos.Size() == 0)
 			{
-				throw BluetoothLowEnergyException("Bluetooth device not found for address: " + mac);
-			}
-			stage = "read BLE pairing state";
-			const auto ble_device_info = co_await winrt::Windows::Devices::Enumeration::DeviceInformation::CreateFromIdAsync(
-				ble_device.BluetoothDeviceId().Id());
-			auto ble_pairing = ble_device_info.Pairing();
-			bool paired_now = false;
-			if (!ble_pairing.IsPaired())
-			{
-				stage = "pair BLE identity";
-				const auto pairing_result = co_await ble_pairing.PairAsync();
-				const auto status = pairing_result.Status();
-				if (status != winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::Paired &&
-					status != winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::AlreadyPaired)
-				{
-					throw BluetoothLowEnergyException("RFCOMM pairing failed (status: " + std::to_string(static_cast<int>(status)) + ") - confirm the pairing on the band screen");
-				}
-				paired_now = status == winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::Paired;
-			}
-			// PairAsync can finish before Windows has published the BR/EDR identity.
-			if (paired_now)
-			{
-				co_await winrt::resume_after(std::chrono::milliseconds(800));
+				throw BluetoothLowEnergyException(
+					"Classic Bluetooth identity not found for MAC: " + mac +
+					". Wake the band and keep its pairing screen open");
 			}
 
-			winrt::Windows::Devices::Bluetooth::BluetoothDevice classic_device = nullptr;
-			for (int attempt = 0; attempt < 5 && classic_device == nullptr; ++attempt)
-			{
-				stage = "resolve classic Bluetooth identity";
-				classic_device = co_await winrt::Windows::Devices::Bluetooth::BluetoothDevice::FromBluetoothAddressAsync(address);
-				if (classic_device == nullptr)
-				{
-					const auto classic_selector = winrt::Windows::Devices::Bluetooth::BluetoothDevice::GetDeviceSelectorFromBluetoothAddress(address);
-					const auto classic_infos = co_await winrt::Windows::Devices::Enumeration::DeviceInformation::FindAllAsync(classic_selector);
-					if (classic_infos.Size() > 0)
-					{
-						auto classic_pairing = classic_infos.GetAt(0).Pairing();
-						if (!classic_pairing.IsPaired())
-						{
-							stage = "pair classic Bluetooth identity";
-							const auto pairing_result = co_await classic_pairing.PairAsync();
-							const auto status = pairing_result.Status();
-							if (status != winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::Paired &&
-								status != winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::AlreadyPaired)
-							{
-								throw BluetoothLowEnergyException("Classic Bluetooth pairing failed (status: " + std::to_string(static_cast<int>(status)) + ") - confirm pairing on the band");
-							}
-						}
-					}
-					co_await winrt::resume_after(std::chrono::milliseconds(600));
-				}
-			}
-
-			if (classic_device == nullptr)
-			{
-				throw BluetoothLowEnergyException("Classic Bluetooth identity was not published for MAC: " + mac +
-					" (Windows currently has only the BLE identity; wake the band and confirm its Bluetooth pairing prompt)");
-			}
-			auto classic_pairing = classic_device.DeviceInformation().Pairing();
+			const auto classic_info = classic_infos.GetAt(0);
+			auto classic_pairing = classic_info.Pairing();
 			if (!classic_pairing.IsPaired())
 			{
+				if (!classic_pairing.CanPair())
+				{
+					throw BluetoothLowEnergyException(
+						"Classic Bluetooth identity is not ready to pair for MAC: " + mac +
+						". Wake the band and retry");
+				}
+
+				// This is the only PairAsync in the RFCOMM connection path. Windows
+				// presents the computer-name pairing request for the classic identity.
 				stage = "pair classic Bluetooth identity";
 				const auto pairing_result = co_await classic_pairing.PairAsync();
 				const auto status = pairing_result.Status();
 				if (status != winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::Paired &&
 					status != winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::AlreadyPaired)
 				{
-					throw BluetoothLowEnergyException("Classic Bluetooth pairing failed (status: " + std::to_string(static_cast<int>(status)) + ") - confirm pairing on the band");
+					throw BluetoothLowEnergyException(
+						"Classic Bluetooth pairing failed: status=" + PairingStatusName(status) +
+						"(" + std::to_string(static_cast<int>(status)) +
+						") - confirm the computer pairing prompt on the band");
 				}
 				co_await winrt::resume_after(std::chrono::milliseconds(800));
+			}
+
+			// Pairing completion and RFCOMM service publication are separate Windows
+			// operations. Re-resolve the classic device and query SPP uncached.
+			winrt::Windows::Devices::Bluetooth::BluetoothDevice classic_device = nullptr;
+			for (int attempt = 0; attempt < 6 && classic_device == nullptr; ++attempt)
+			{
+				stage = "refresh classic Bluetooth identity";
+				classic_device = co_await winrt::Windows::Devices::Bluetooth::BluetoothDevice::FromBluetoothAddressAsync(address);
+				if (classic_device == nullptr && attempt < 5)
+				{
+					co_await winrt::resume_after(std::chrono::milliseconds(500));
+				}
+			}
+			if (classic_device == nullptr)
+			{
+				throw BluetoothLowEnergyException(
+					"Classic Bluetooth identity was not published after pairing for MAC: " + mac);
 			}
 
 			const auto serial_port = winrt::Windows::Devices::Bluetooth::Rfcomm::RfcommServiceId::SerialPort();
@@ -389,27 +407,29 @@ namespace bluetooth_low_energy_windows
 			int last_rfcomm_error = 0;
 			for (int attempt = 0; attempt < 6 && service == nullptr; ++attempt)
 			{
-				stage = "query target RFCOMM serial service";
+				stage = "query RFCOMM serial service";
 				const auto services_result = co_await classic_device.GetRfcommServicesForIdAsync(
 					serial_port, winrt::Windows::Devices::Bluetooth::BluetoothCacheMode::Uncached);
 				last_rfcomm_error = static_cast<int>(services_result.Error());
-				const auto target_services = services_result.Services();
+				const auto services = services_result.Services();
 				if (last_rfcomm_error == static_cast<int>(winrt::Windows::Devices::Bluetooth::BluetoothError::Success) &&
-					target_services.Size() > 0)
+					services.Size() > 0)
 				{
-					service = target_services.GetAt(0);
+					service = services.GetAt(0);
 					break;
 				}
 				if (attempt < 5)
 				{
-					co_await winrt::resume_after(std::chrono::milliseconds(600));
+					co_await winrt::resume_after(std::chrono::milliseconds(500));
 				}
 			}
 			if (service == nullptr)
 			{
-				throw BluetoothLowEnergyException("RFCOMM Serial Port service was not published for MAC: " + mac +
+				throw BluetoothLowEnergyException(
+					"RFCOMM Serial Port service was not published for MAC: " + mac +
 					" (BluetoothError: " + std::to_string(last_rfcomm_error) + ")");
 			}
+
 			auto socket = winrt::Windows::Networking::Sockets::StreamSocket();
 			// RFCOMM advertises the protection level accepted by the service. Using
 			// the two-argument overload creates a PlainSocket, which Windows may abort
@@ -533,20 +553,44 @@ namespace bluetooth_low_energy_windows
 			// BluetoothLEDevice has no Id()/Pairing() projection; use BluetoothDeviceId -> DeviceInformation.
 			// Async: Windows shows the system pairing UI; co_await does not block the platform thread.
 			const auto id_string = device.BluetoothDeviceId().Id();
-			const auto device_info = co_await winrt::Windows::Devices::Enumeration::DeviceInformation::CreateFromIdAsync(id_string);
+			auto device_info = co_await winrt::Windows::Devices::Enumeration::DeviceInformation::CreateFromIdAsync(id_string);
 			if (device_info.Pairing().IsPaired())
 			{
 				result(std::nullopt);
 				co_return;
 			}
-			const auto pairing_result = co_await device_info.Pairing().PairAsync();
-			const auto status = pairing_result.Status();
-			if (status != winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::Paired &&
-				status != winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::AlreadyPaired)
+			winrt::Windows::Devices::Enumeration::DevicePairingResultStatus last_status{};
+			for (int attempt = 0; attempt < 3; ++attempt)
 			{
-				throw BluetoothLowEnergyException("Pair failed: status != Paired");
+				const auto pairing_result = co_await device_info.Pairing().PairAsync();
+				last_status = pairing_result.Status();
+				if (last_status == winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::Paired ||
+					last_status == winrt::Windows::Devices::Enumeration::DevicePairingResultStatus::AlreadyPaired)
+				{
+					result(std::nullopt);
+					co_return;
+				}
+				if (!IsRetriablePairingStatus(last_status) || attempt == 2)
+				{
+					break;
+				}
+
+				// Windows can report a transient result while it is still publishing
+				// the dual-mode device association. Re-read the pairing object before
+				// retrying instead of repeatedly using a stale DeviceInformation.
+				co_await winrt::resume_after(std::chrono::milliseconds(750));
+				device_info = co_await winrt::Windows::Devices::Enumeration::DeviceInformation::CreateFromIdAsync(id_string);
+				if (device_info.Pairing().IsPaired())
+				{
+					result(std::nullopt);
+					co_return;
+				}
 			}
-			result(std::nullopt);
+			const auto status_value = static_cast<int>(last_status);
+			throw BluetoothLowEnergyException(
+				"Pair failed: status=" + PairingStatusName(last_status) +
+				"(" + std::to_string(status_value) +
+				"). Wake the band and confirm the Windows pairing prompt; remove a stale Windows pairing record if this repeats");
 		}
 		catch (const winrt::hresult_error &ex)
 		{
