@@ -361,13 +361,6 @@ namespace bluetooth_low_energy_windows
 			auto classic_pairing = classic_info.Pairing();
 			if (!classic_pairing.IsPaired())
 			{
-				if (!classic_pairing.CanPair())
-				{
-					throw BluetoothLowEnergyException(
-						"Classic Bluetooth identity is not ready to pair for MAC: " + mac +
-						". Wake the band and retry");
-				}
-
 				// This is the only PairAsync in the RFCOMM connection path. Windows
 				// presents the computer-name pairing request for the classic identity.
 				stage = "pair classic Bluetooth identity";

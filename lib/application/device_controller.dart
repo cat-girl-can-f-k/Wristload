@@ -2054,6 +2054,24 @@ class DeviceController extends ChangeNotifier {
   /// RFCOMM 连接 → SessionConfig(START_SESSION) → 设备回 SessionConfig →
   /// 发 f=26（DATA 明文帧）→ 设备回 watchNonce → 完成 step1。
   Future<void> connectSpp({bool resumeSession = false}) async {
+    final inFlight = _sppConnectInFlight;
+    if (inFlight != null) {
+      _log('SPP 连接请求已在进行，忽略重复 RFCOMM 建链。');
+      await inFlight;
+      return;
+    }
+    final operation = _connectSppInternal(resumeSession: resumeSession);
+    _sppConnectInFlight = operation;
+    try {
+      await operation;
+    } finally {
+      if (identical(_sppConnectInFlight, operation)) {
+        _sppConnectInFlight = null;
+      }
+    }
+  }
+
+  Future<void> _connectSppInternal({bool resumeSession = false}) async {
     if (sppConnecting) {
       _log('SPP 连接已在进行，忽略重复请求。');
       return;
@@ -2070,6 +2088,9 @@ class DeviceController extends ChangeNotifier {
       return;
     }
     final connectionEpoch = ++_sppConnectionEpoch;
+    final rfcommTimeout = defaultTargetPlatform == TargetPlatform.windows
+        ? const Duration(seconds: 20)
+        : const Duration(seconds: 8);
     _closingFailedSppEpoch = null;
     sessionReady = false;
     _connectionAttemptInProgress = true;
@@ -2114,13 +2135,14 @@ class DeviceController extends ChangeNotifier {
         _ => '当前平台',
       };
       _log('  $platformName 的 BLE 连接不等于经典蓝牙 SPP 配对；若手环弹出请求，请在手环上确认。');
+      _log('RFCOMM 建链等待上限：${rfcommTimeout.inSeconds} 秒。');
       final classicAddress = await _transport
           .connectRfcomm(device.uuid, advertisedName: connectedDeviceName)
           .timeout(
-            const Duration(seconds: 8),
+            rfcommTimeout,
             onTimeout: () => throw TimeoutException(
-              'RFCOMM 8 秒内设备未响应',
-              const Duration(seconds: 8),
+              'RFCOMM ${rfcommTimeout.inSeconds} 秒内设备未响应',
+              rfcommTimeout,
             ),
           );
       if (!_isCurrentSppConnection(connectionEpoch)) return;
@@ -2139,9 +2161,9 @@ class DeviceController extends ChangeNotifier {
         await _cleanupFailedSppConnect(device, exception, connectionEpoch);
       }
       if (exception is TimeoutException &&
-          exception.duration == const Duration(seconds: 8)) {
+          exception.duration == rfcommTimeout) {
         _connectionIssues.recordRfcommTimeout();
-        _log('SPP 超时：8 秒内设备未响应，已停止等待 RFCOMM 建链。$exception');
+        _log('SPP 超时：${rfcommTimeout.inSeconds} 秒内设备未响应，已停止等待 RFCOMM 建链。$exception');
       } else {
         _connectionIssues.recordConnectionFailure(exception);
       }
@@ -2151,6 +2173,7 @@ class DeviceController extends ChangeNotifier {
   }
 
   StreamSubscription<Uint8List>? _sppSub;
+  Future<void>? _sppConnectInFlight;
   Accumulator _sppAcc = Accumulator();
   int _sppSeq = 0;
   bool _sppAwaitingVersion = false;
