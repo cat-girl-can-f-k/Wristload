@@ -3,12 +3,26 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-import '../application/device_controller.dart';
-import '../application/diagnostic_log_service.dart';
-import '../domain/device_tools.dart';
-import '../platform/scoped_file_picker.dart';
-import '../platform/security_scoped_file_access.dart';
+import '../../application/device_controller.dart';
+import '../../application/diagnostic_log_service.dart';
+import '../../domain/device_tools.dart';
+import '../../platform/scoped_file_picker.dart';
+import '../../platform/security_scoped_file_access.dart';
 
+import '../page_module.dart';
+
+const wristloadPage = WristloadPageModule(
+  id: 'tools',
+  route: '/tools',
+  label: '工具',
+  icon: Icons.build_outlined,
+  selectedIcon: Icons.build,
+  order: 30,
+  build: _buildToolsPage,
+);
+
+Widget _buildToolsPage(WristloadPageContext context) =>
+    ToolsPage(controller: context.controller);
 class ToolsPage extends StatefulWidget {
   const ToolsPage({required this.controller, super.key});
 
@@ -26,6 +40,7 @@ class _ToolsPageState extends State<ToolsPage> {
   ScopedFileRef? _zipFile;
   int? _zipFileSize;
   String? _authKey;
+  List<AuthKeyCandidate> _authKeyCandidates = const [];
   bool _authKeyRevealed = false;
   String? _authError;
   String? _unlockCode;
@@ -52,6 +67,7 @@ class _ToolsPageState extends State<ToolsPage> {
       _zipFile = result.single;
       _zipFileSize = null;
       _authKey = null;
+      _authKeyCandidates = const [];
       _authKeyRevealed = false;
       _authError = null;
     });
@@ -97,6 +113,7 @@ class _ToolsPageState extends State<ToolsPage> {
       _extracting = true;
       _authError = null;
       _authKey = null;
+      _authKeyCandidates = const [];
     });
     try {
       final bytes = await _readZip(file);
@@ -111,7 +128,8 @@ class _ToolsPageState extends State<ToolsPage> {
       }
       if (mounted) {
         setState(() {
-          _authKey = candidates.first.key;
+          _authKeyCandidates = candidates;
+          _authKey = null;
           _authKeyRevealed = false;
         });
       }
@@ -243,6 +261,27 @@ class _ToolsPageState extends State<ToolsPage> {
                       child: Text(error,
                           style: TextStyle(color: theme.colorScheme.error)),
                     ),
+                  if (_authKeyCandidates.isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    const Text('Found authkeys. Select the matching device key:'),
+                    for (final candidate in _authKeyCandidates)
+                      RadioListTile<String>(
+                        value: candidate.key,
+                        groupValue: _authKey,
+                        onChanged: (value) => setState(() {
+                          _authKey = value;
+                          _authKeyRevealed = false;
+                        }),
+                        title: Text(candidate.productName ?? 'Unknown device'),
+                        subtitle: Text([
+                          if (candidate.mac != null) candidate.mac!,
+                          if (candidate.sourcePath != null) candidate.sourcePath!,
+                          '${candidate.key.substring(0, 4)}******${candidate.key.substring(candidate.key.length - 4)}',
+                        ].join(' | ')),
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                      ),
+                  ],
                   if (key != null) ...[
                     const SizedBox(height: 12),
                     Container(

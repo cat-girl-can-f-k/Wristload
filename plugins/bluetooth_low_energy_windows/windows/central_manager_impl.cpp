@@ -9,6 +9,11 @@ namespace bluetooth_low_energy_windows
 		const auto api = CentralManagerFlutterApi(messenger);
 		const auto watcher = winrt::Windows::Devices::Bluetooth::Advertisement::BluetoothLEAdvertisementWatcher();
 		watcher.ScanningMode(winrt::Windows::Devices::Bluetooth::Advertisement::BluetoothLEScanningMode::Active);
+		// Recent Xiaomi wearables can advertise only through Bluetooth 5 extended
+		// advertisements before pairing. Windows leaves those disabled by default,
+		// which made the live watcher look empty while cached paired devices were
+		// still injected by PublishKnownDevicesAsync.
+		watcher.AllowExtendedAdvertisements(true);
 		m_api = api;
 		m_watcher = watcher;
 		m_post_to_platform = std::move(post_to_platform);
@@ -514,7 +519,17 @@ namespace bluetooth_low_energy_windows
 	{
 		try
 		{
-			const auto &device = RetrieveDevice(address_args);
+			// Desktop V2 connects through RFCOMM without first opening GATT. In
+			// that path m_devices has no entry, so RetrieveDevice() would call
+			// value() on an empty optional ("Bad optional access"). Resolve the
+			// current BLE identity directly from the address reported by discovery.
+			const auto device = co_await winrt::Windows::Devices::Bluetooth::BluetoothLEDevice::FromBluetoothAddressAsync(
+				static_cast<uint64_t>(address_args));
+			if (device == nullptr)
+			{
+				throw BluetoothLowEnergyException(
+					"Bluetooth device not found while requesting pairing");
+			}
 			// BluetoothLEDevice has no Id()/Pairing() projection; use BluetoothDeviceId -> DeviceInformation.
 			// Async: Windows shows the system pairing UI; co_await does not block the platform thread.
 			const auto id_string = device.BluetoothDeviceId().Id();
@@ -739,10 +754,19 @@ namespace bluetooth_low_energy_windows
 					const auto type_args = AdvertisementTypeToArgs(type);
 					const auto advertisement = event_args.Advertisement();
 					const auto advertisement_args = AdvertisementToArgs(advertisement);
-					PostToPlatform([peripheral_args, rssi_args, timestamp_args, type_args, advertisement_args](CentralManagerFlutterApi &api)
-					{
-						api.OnDiscovered(peripheral_args, rssi_args, timestamp_args, type_args, advertisement_args, [] {}, [](auto error) {});
-					});
+					// Keep live advertisements on the WinRT callback path. The custom
+					// window-message bridge can lose these high-frequency callbacks,
+					// leaving only the separately enumerated, already-paired devices.
+					// This is the dispatch path used by beta0.1.3, which reliably found
+					// unpaired devices.
+					m_api.value().OnDiscovered(
+						peripheral_args,
+						rssi_args,
+						timestamp_args,
+						type_args,
+						advertisement_args,
+						[] {},
+						[](auto error) {});
 				});
 			result(std::nullopt);
 		}

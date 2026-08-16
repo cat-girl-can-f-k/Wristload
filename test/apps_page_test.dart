@@ -3,7 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:wristload/application/device_controller.dart';
 import 'package:wristload/domain/watch_app.dart';
-import 'package:wristload/presentation/apps_page.dart';
+import 'package:wristload/presentation/pages/apps_page.dart';
 
 void main() {
   testWidgets('快应用页在会话就绪后只自动读取一次，并在断开后为下一会话重置', (tester) async {

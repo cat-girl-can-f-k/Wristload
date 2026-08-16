@@ -123,6 +123,18 @@ bool isInstallableDiscovery(DiscoveredEventArgs result) {
       ProtocolGeneration.v2Vela;
 }
 
+bool isLikelyMiWearDiscovery(DiscoveredEventArgs result) {
+  const miWear = '0000fe95-0000-1000-8000-00805f9b34fb';
+  final uuids = result.advertisement.serviceUUIDs
+      .map((uuid) => uuid.toString().toLowerCase())
+      .toSet();
+  if (uuids.contains(miWear) || uuids.contains('fe95')) return true;
+  final serviceData = result.advertisement.serviceData.keys
+      .map((key) => key.toString().toLowerCase())
+      .toSet();
+  return serviceData.contains(miWear) || serviceData.contains('fe95');
+}
+
 class ScanResultsList extends StatefulWidget {
   const ScanResultsList({
     required this.results,
@@ -234,6 +246,7 @@ class ScanTile extends StatelessWidget {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
     final name = (result.advertisement.name ?? '').trim();
+    final likelyMiWear = isLikelyMiWearDiscovery(result);
     final profile = DeviceProfile.matchAdvertisementName(name);
     final card = Card(
       margin: const EdgeInsets.symmetric(vertical: 4),
@@ -284,7 +297,9 @@ class ScanTile extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      name.isEmpty ? '未命名设备' : name,
+                      name.isEmpty
+                          ? (likelyMiWear ? '小米设备（未命名）' : '未命名设备')
+                          : name,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: theme.textTheme.titleSmall,

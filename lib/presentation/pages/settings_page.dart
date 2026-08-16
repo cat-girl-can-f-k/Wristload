@@ -1,9 +1,48 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
-import '../domain/device_profile.dart';
-import '../domain/install_preference_store.dart';
-import 'install_preference_selector.dart';
+import '../../domain/device_profile.dart';
+import '../../domain/install_preference_store.dart';
+import '../floating_window_warning_dialog.dart';
+import '../install_preference_selector.dart';
 
+import '../page_module.dart';
+
+const wristloadPage = WristloadPageModule(
+  id: 'settings',
+  route: '/settings',
+  label: '设置',
+  icon: Icons.settings_outlined,
+  selectedIcon: Icons.settings,
+  order: 50,
+  build: _buildSettingsPage,
+);
+
+Widget _buildSettingsPage(WristloadPageContext context) =>
+    TransferSettingsPage(
+      preferredInstallTarget: context.preferredInstallTarget,
+      connectionMode: context.controller.connectionMode,
+      connectionModeEnabled: !context.controller.isConnected && !context.controller.isConnectionBusy,
+      segmentIntervalMs: context.controller.segmentIntervalMs,
+      massWindowSize: context.controller.massWindowSize,
+      autoTimeSync: context.controller.autoTimeSync,
+      autoConnectLastDevice: context.controller.autoConnectLastDeviceEnabled,
+      floatingInstallWindowEnabled: context.floatingInstallWindowEnabled,
+      autoOpenDiagnosticLog: context.autoOpenDiagnosticLog,
+      themeSeedColor: context.themeSeedColor,
+      onThemeSeedChanged: context.onThemeSeedChanged,
+      onConnectionModeChanged: context.controller.setConnectionMode,
+      onSegmentIntervalChanged: context.controller.setSegmentIntervalMs,
+      onMassWindowSizeChanged: context.controller.setMassWindowSize,
+      onAutoTimeSyncChanged: context.controller.setAutoTimeSync,
+      onAutoConnectLastDeviceChanged: context.controller.setAutoConnectLastDeviceEnabled,
+      onFloatingInstallWindowEnabledChanged: context.onFloatingInstallWindowEnabledChanged,
+      onAutoOpenDiagnosticLogChanged: context.onAutoOpenDiagnosticLogChanged,
+      onPreferredInstallTargetChanged: context.onPreferredInstallTargetChanged,
+      onReplayOobe: context.onReplayOobe,
+      onEditAuthKey: context.onEditAuthKey,
+    );
 class TransferSettingsPage extends StatelessWidget {
   const TransferSettingsPage({
     required this.connectionMode,
@@ -104,7 +143,25 @@ class TransferSettingsPage extends StatelessWidget {
                     : '可将文件直接拖入右下角悬浮窗安装。',
               ),
               value: floatingInstallWindowEnabled,
-              onChanged: onFloatingInstallWindowEnabledChanged,
+              onChanged: onFloatingInstallWindowEnabledChanged == null
+                  ? null
+                  : (value) {
+                      if (!value) {
+                        onFloatingInstallWindowEnabledChanged!(false);
+                        return;
+                      }
+                      // 开启前确认：悬浮窗（独立窗口）会抢占键盘焦点，
+                      // 导致主窗口内输入框无法输入。
+                      unawaited(
+                        showFloatingWindowEnableWarning(context).then(
+                          (confirmed) {
+                            if (confirmed == true) {
+                              onFloatingInstallWindowEnabledChanged!(true);
+                            }
+                          },
+                        ),
+                      );
+                    },
             ),
             const Divider(height: 40),
             SwitchListTile(

@@ -8,7 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:wristload/application/device_controller.dart';
-import 'package:wristload/presentation/tools_page.dart';
+import 'package:wristload/presentation/pages/tools_page.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();

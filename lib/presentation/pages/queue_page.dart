@@ -1,13 +1,27 @@
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/material.dart';
 
-import '../application/device_controller.dart';
-import '../domain/install_models.dart';
-import '../domain/install_task.dart';
-import '../domain/queue_file_importer.dart';
-import '../platform/scoped_file_picker.dart';
-import '../platform/security_scoped_file_access.dart';
+import '../../application/device_controller.dart';
+import '../../domain/install_models.dart';
+import '../../domain/install_task.dart';
+import '../../domain/queue_file_importer.dart';
+import '../../platform/scoped_file_picker.dart';
+import '../../platform/security_scoped_file_access.dart';
 
+import '../page_module.dart';
+
+const wristloadPage = WristloadPageModule(
+  id: 'queue',
+  route: '/queue',
+  label: '队列',
+  icon: Icons.queue_outlined,
+  selectedIcon: Icons.queue,
+  order: 10,
+  build: _buildQueuePage,
+);
+
+Widget _buildQueuePage(WristloadPageContext context) =>
+    QueuePage(controller: context.controller);
 class QueuePage extends StatefulWidget {
   const QueuePage({required this.controller, super.key});
 

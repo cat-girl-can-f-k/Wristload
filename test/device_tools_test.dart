@@ -79,6 +79,112 @@ void main() {
       expect(candidates.first.productName, 'Mi Band');
     });
 
+    test('does not cross-pair interleaved multi-device product and token fields', () {
+      final bytes = _zip({
+        'XiaomiFit.main.log':
+            "productName='Band 9'\n"
+                "productName='Watch S4'; token='AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'\n"
+                "token='BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB'\n",
+      });
+
+      final candidates = extractAuthKeysFromZip(bytes);
+
+      expect(candidates.map((candidate) => candidate.key), [
+        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      ]);
+      expect(candidates[0].productName, 'Watch S4');
+      expect(candidates[1].productName, isNull);
+    });
+
+    test('associates nested device-list keys with their enclosing device names', () {
+      final bytes = _zip({
+        'XiaomiFit.device.log':
+            '2026|Http|provideHttpLog: {"code":0,"result":{"list":['
+                '{"name":"小米手环9 Pro","detail":{"mac":"D0:AE:05:0C:CC:F2","encrypt_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}},'
+                '{"name":"小米手环9 NFC版","detail":{"mac":"04:34:C3:22:08:40","encrypt_key":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"}}]}}',
+      });
+
+      final candidates = extractAuthKeysFromZip(bytes);
+
+      expect(candidates.map((candidate) => candidate.productName), [
+        '小米手环9 Pro',
+        '小米手环9 NFC版',
+      ]);
+      expect(candidates.map((candidate) => candidate.mac), [
+        'D0:AE:05:0C:CC:F2',
+        '04:34:C3:22:08:40',
+      ]);
+    });
+
+    test('upgrades an earlier anonymous key with later device-list metadata', () {
+      final bytes = _zip({
+        'XiaomiFit.main.log': 'token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+        'XiaomiFit.device.log':
+            '2026|Http|provideHttpLog: {"result":{"list":[{'
+                '"name":"小米手环9 Pro","detail":{'
+                '"mac":"D0:AE:05:0C:CC:F2",'
+                '"encrypt_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}]}}',
+      });
+
+      final candidates = extractAuthKeysFromZip(bytes);
+
+      expect(candidates, hasLength(1));
+      expect(candidates.single.productName, '小米手环9 Pro');
+      expect(candidates.single.mac, 'D0:AE:05:0C:CC:F2');
+      expect(candidates.single.sourcePath, 'XiaomiFit.device.log');
+    });
+
+    test('keeps only the latest authkey snapshot for the same device MAC', () {
+      final bytes = _zip({
+        'XiaomiFit.device.log':
+            '2026|Http|provideHttpLog: {"result":{"list":[{'
+                '"name":"Band 9 Pro","detail":{'
+                '"mac":"D0:AE:05:0C:CC:F2",'
+                '"encrypt_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}},'
+                '{"name":"Band 9 Pro","detail":{'
+                '"mac":"D0:AE:05:0C:CC:F2",'
+                '"encrypt_key":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"}},'
+                '{"name":"Band 9 NFC","detail":{'
+                '"mac":"04:34:C3:22:08:40",'
+                '"encrypt_key":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"}}]}}',
+      });
+
+      final candidates = extractAuthKeysFromZip(bytes);
+
+      expect(candidates.map((candidate) => candidate.key), [
+        'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        'cccccccccccccccccccccccccccccccc',
+      ]);
+      expect(candidates.map((candidate) => candidate.mac), [
+        'D0:AE:05:0C:CC:F2',
+        '04:34:C3:22:08:40',
+      ]);
+    });
+
+    test('uses the newest device snapshot after main-log keys were seen first', () {
+      final bytes = _zip({
+        'XiaomiFit.main.log':
+            'token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n'
+                'token=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
+        'XiaomiFit.device.log':
+            '2026-08-14 14:38:32.213|Http|provideHttpLog: {\"result\":{\"list\":[{'
+                '\"name\":\"Band 9 Pro\",\"detail\":{'
+                '\"mac\":\"D0:AE:05:0C:CC:F2\",'
+                '\"encrypt_key\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}}]}}\n'
+                '2026-08-14 14:39:52.489|Http|provideHttpLog: {\"result\":{\"list\":[{'
+                '\"name\":\"Band 9 Pro\",\"detail\":{'
+                '\"mac\":\"D0:AE:05:0C:CC:F2\",'
+                '\"encrypt_key\":\"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\"}}]}}',
+      });
+
+      final candidates = extractAuthKeysFromZip(bytes);
+
+      expect(candidates, hasLength(1));
+      expect(candidates.single.key, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+      expect(candidates.single.productName, 'Band 9 Pro');
+    });
+
     test('deduplicates authkeys across all supported forms', () {
       const key = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
       final bytes = _zip({

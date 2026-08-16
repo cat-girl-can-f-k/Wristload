@@ -38,6 +38,111 @@ void main() {
   test('OTA channel is reserved separately from Mass transfers', () {
     expect(SppProtocol.channelOta, 6);
     expect(SppProtocol.channelOta, isNot(SppProtocol.channelMass));
+    expect(
+      SppProtocol.rawDataTypeForChannel(SppProtocol.channelMass, v2: true),
+      SppProtocol.dataTypeOneTrackLog,
+    );
+    expect(
+      SppProtocol.rawDataTypeForChannel(
+        SppProtocol.channelFileSensor,
+        v2: false,
+      ),
+      SppProtocol.dataTypeDeviceLog,
+    );
+    expect(
+      SppProtocol.rawDataTypeForChannel(
+        SppProtocol.channelFileFitness,
+        v2: false,
+      ),
+      SppProtocol.dataTypeOneTrackLog,
+    );
+  });
+
+  group('Device-log protocol', () {
+    test('encodes the official factory-test 13/2 dump request', () {
+      final payload = DeviceLogPayload.dumpRequest();
+      expect(payload, isNull);
+      expect(
+        Zau(
+          command: ZauCommand.debugTransfer,
+          sub: ZauCommand.debugTransferDeviceLogSub,
+          payload: payload,
+        ).encode(),
+        [0x08, 0x0d, 0x10, 0x02],
+      );
+    });
+
+    test('encodes the official 2/80 start payload', () {
+      final payload = DeviceLogPayload.startRequest();
+      expect(payload.$1, 4);
+      expect(payload.$2, [0x92, 0x03, 0x02, 0x08, 0x01]);
+      expect(
+        Zau(
+          command: ZauCommand.deviceLog,
+          sub: ZauCommand.deviceLogStartSub,
+          payload: payload,
+        ).encode(),
+        [0x08, 0x02, 0x10, 0x50, 0x22, 0x05, 0x92, 0x03, 0x02, 0x08, 0x01],
+      );
+    });
+
+    test('parses the official 2/81 completion result', () {
+      final parsed = DeviceLogPayload.parseResult(
+        (4, [0x9a, 0x03, 0x04, 0x08, 0x03, 0x10, 0x02]),
+      );
+      expect(parsed, isNotNull);
+      expect(parsed!.type, 3);
+      expect(parsed.code, 2);
+    });
+  });
+
+  group('Self-check protocol', () {
+    test('encodes mode query without a payload', () {
+      expect(SelfCheckPayload.modeQueryRequest(), (15, <int>[]));
+    });
+
+    test('encodes mode change and parses nested mode', () {
+      expect(SelfCheckPayload.enterModeRequest(), (15, [0x3a, 0x02, 0x08, 0x00]));
+      final payload = SelfCheckPayload.modeChangeRequest(1);
+      expect(payload, (15, [0x3a, 0x02, 0x08, 0x01]));
+      expect(SelfCheckPayload.parseMode((15, [0x3a, 0x02, 0x08, 0x03])), 3);
+    });
+
+    test('parses the official 13/8 b9a/y8a self-check report', () {
+      final parsed = SelfCheckPayload.parseReport(
+        (15, [
+          0x4a, 0x0e,
+          0x0a, 0x04, 0x08, 0x01, 0x10, 0x01,
+          0x0a, 0x04, 0x08, 0x02, 0x10, 0x00,
+          0x10, 0x01,
+        ]),
+      );
+      expect(parsed, isNotNull);
+      expect(parsed!.completed, isTrue);
+      expect(parsed.items.map((item) => item.id), [1, 2]);
+      expect(parsed.items.map((item) => item.passed), [true, false]);
+    });
+  });
+
+  group('Boot-mode protocol', () {
+    test('encodes the official 13/0 r8a.field1 mode values', () {
+      expect(BootModePayload.switchRequest(DeviceBootMode.user),
+          (15, [0x08, 0x00]));
+      expect(BootModePayload.switchRequest(DeviceBootMode.userdebug),
+          (15, [0x08, 0x01]));
+      expect(BootModePayload.switchRequest(DeviceBootMode.eng),
+          (15, [0x08, 0x02]));
+      expect(BootModePayload.switchRequest(DeviceBootMode.medicalMeter),
+          (15, [0x08, 0x04]));
+      expect(
+        Zau(
+          command: ZauCommand.debugTransfer,
+          sub: ZauCommand.debugTransferBootModeSub,
+          payload: BootModePayload.switchRequest(DeviceBootMode.userdebug),
+        ).encode(),
+        [0x08, 0x0d, 0x10, 0x00, 0x7a, 0x02, 0x08, 0x01],
+      );
+    });
   });
 
   group('Mass ACK 空闲超时', () {

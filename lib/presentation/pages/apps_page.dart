@@ -3,14 +3,28 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-import '../application/device_controller.dart';
-import '../domain/watch_app.dart';
+import '../../application/device_controller.dart';
+import '../../domain/watch_app.dart';
 
 /// Shows the quick apps reported by the connected device.
 ///
 /// The list is deliberately refreshed from the device rather than persisted
 /// locally, because package fingerprints are required for a valid uninstall
 /// request and may change after an installation.
+import '../page_module.dart';
+
+const wristloadPage = WristloadPageModule(
+  id: 'apps',
+  route: '/apps',
+  label: '快应用',
+  icon: Icons.apps_outlined,
+  selectedIcon: Icons.apps,
+  order: 20,
+  build: _buildAppsPage,
+);
+
+Widget _buildAppsPage(WristloadPageContext context) =>
+    AppsPage(controller: context.controller);
 class AppsPage extends StatefulWidget {
   const AppsPage({required this.controller, super.key});
 

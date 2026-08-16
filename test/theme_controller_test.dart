@@ -4,7 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wristload/application/theme_controller.dart';
 import 'package:wristload/domain/device_profile.dart';
 import 'package:wristload/domain/install_preference_store.dart';
-import 'package:wristload/presentation/settings_page.dart';
+import 'package:wristload/presentation/pages/settings_page.dart';
 
 void main() {
   test('theme seed defaults to MD3 purple and persists a selection', () async {

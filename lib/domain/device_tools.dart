@@ -68,7 +68,7 @@ List<AuthKeyCandidate> extractAuthKeysFromZip(List<int> zipBytes) {
   });
 
   final results = <AuthKeyCandidate>[];
-  final seen = <String>{};
+  final indexesByKey = <String, int>{};
   var totalBytes = 0;
   for (final entry in entries.take(10000)) {
     if (entry.size > 16 * 1024 * 1024) continue;
@@ -80,10 +80,61 @@ List<AuthKeyCandidate> extractAuthKeysFromZip(List<int> zipBytes) {
     if (content is! List<int>) continue;
     final text = utf8.decode(content, allowMalformed: true);
     for (final candidate in _parseText(text, entry.name)) {
-      if (seen.add(candidate.key)) results.add(candidate);
+      final existingIndex = indexesByKey[candidate.key];
+      if (existingIndex == null) {
+        indexesByKey[candidate.key] = results.length;
+        results.add(candidate);
+        continue;
+      }
+
+      final existing = results[existingIndex];
+      final hasRicherMetadata =
+          (existing.productName == null && candidate.productName != null) ||
+              (existing.mac == null && candidate.mac != null);
+      if (hasRicherMetadata) {
+        // The same key may be first seen in XiaomiFit.main.log without
+        // metadata and later appear in a chronological device-list snapshot.
+        // Move that enriched record to the end: final per-MAC selection must
+        // use its most recent snapshot, not its first anonymous occurrence.
+        final enriched = AuthKeyCandidate(
+          key: existing.key,
+          productName: candidate.productName ?? existing.productName,
+          mac: candidate.mac ?? existing.mac,
+          sourcePath: candidate.sourcePath ?? existing.sourcePath,
+        );
+        results.removeAt(existingIndex);
+        for (var index = existingIndex; index < results.length; index++) {
+          indexesByKey[results[index].key] = index;
+        }
+        indexesByKey[enriched.key] = results.length;
+        results.add(enriched);
+      }
     }
   }
-  return results;
+  return _keepLatestCandidatePerDevice(results);
+}
+
+/// Device-list snapshots can contain historical credentials for one watch.
+/// The log is read from oldest to newest, so scan backwards and retain only
+/// the final record for each reliable MAC address. Candidates without a MAC
+/// stay separate rather than risking a false merge of identically named devices.
+List<AuthKeyCandidate> _keepLatestCandidatePerDevice(
+  List<AuthKeyCandidate> candidates,
+) {
+  final macs = <String>{};
+  final latestFirst = <AuthKeyCandidate>[];
+  for (final candidate in candidates.reversed) {
+    final mac = candidate.mac;
+    if (mac == null || mac.isEmpty) {
+      latestFirst.add(candidate);
+      continue;
+    }
+    final normalizedMac = mac.toUpperCase();
+    if (macs.add(normalizedMac)) {
+      latestFirst.add(candidate);
+    }
+  }
+  return latestFirst.reversed.toList(growable: false);
 }
 
 bool _isMainLog(String path) =>
@@ -109,6 +160,56 @@ List<AuthKeyCandidate> _parseText(String text, String sourcePath) {
     ));
   }
 
+  // Xiaomi Fitness device-list responses keep the display name on the outer
+  // object and the 32-hex credential inside `detail`. Parse the complete JSON
+  // line so an authkey is never separated from its own device metadata.
+  void parseDeviceListJsonLine(String line) {
+    if (!line.contains('encrypt_key') && !line.contains('\"token\"')) {
+      return;
+    }
+    final jsonStart = line.indexOf('{');
+    if (jsonStart == -1) return;
+    try {
+      final decoded = jsonDecode(line.substring(jsonStart));
+      void visit(Object? value, {String? name, String? mac}) {
+        if (value is List) {
+          for (final item in value) {
+            visit(item, name: name, mac: mac);
+          }
+          return;
+        }
+        if (value is! Map) return;
+
+        final localName = value['name'];
+        final localMac = value['mac'];
+        final resolvedName = localName is String && localName.trim().isNotEmpty
+            ? localName.trim()
+            : name;
+        final resolvedMac = localMac is String && _findMac(localMac) != null
+            ? _findMac(localMac)
+            : mac;
+        for (final field in const ['encrypt_key', 'auth_key', 'authkey', 'token']) {
+          final key = value[field];
+          if (key is String) {
+            add(key, productName: resolvedName, mac: resolvedMac);
+          }
+        }
+        for (final child in value.values) {
+          visit(child, name: resolvedName, mac: resolvedMac);
+        }
+      }
+
+      visit(decoded);
+    } on Object {
+      // Ordinary log lines can contain partial JSON; the anchor scanner below
+      // remains available for those formats.
+    }
+  }
+
+  for (final line in const LineSplitter().convert(text)) {
+    parseDeviceListJsonLine(line);
+  }
+
   final jsonBlock = RegExp(
     r'\{[^{}]*"productName"[^{}]*"token"[^{}]*\}|\{[^{}]*"token"[^{}]*"productName"[^{}]*\}',
   );
@@ -118,7 +219,7 @@ List<AuthKeyCandidate> _parseText(String text, String sourcePath) {
       if (decoded is Map) {
         final product = decoded['productName'];
         final token = decoded['token'];
-        final context = _contextAround(text, match.start, match.end);
+        final context = _lineAround(text, match.start, match.end);
         add(
           token is String ? token : null,
           productName: product is String ? product : null,
@@ -130,27 +231,24 @@ List<AuthKeyCandidate> _parseText(String text, String sourcePath) {
     }
   }
 
-  final productMatches = RegExp(
+  // Do not pair the Nth productName with the Nth token in the whole log.
+  // Multi-device logs can interleave records, so that would attach another
+  // watch's name/MAC to a valid key. Associate fields only on one log line;
+  // standalone token entries are still returned by the anchored scan below.
+  final productField = RegExp(
     r'''["']?productName["']?\s*[=:]\s*["']([^"']+)["']''',
     caseSensitive: false,
-  ).allMatches(text).toList();
-  final tokenMatches = RegExp(
+  );
+  final tokenField = RegExp(
     r'''["']?token["']?\s*[=:]\s*["']([^"']+)["']''',
     caseSensitive: false,
-  ).allMatches(text).toList();
-  final count = productMatches.length > tokenMatches.length
-      ? productMatches.length
-      : tokenMatches.length;
-  for (var index = 0; index < count; index++) {
-    final product =
-        index < productMatches.length ? productMatches[index].group(1) : null;
-    final token =
-        index < tokenMatches.length ? tokenMatches[index].group(1) : null;
-    final center = index < tokenMatches.length
-        ? tokenMatches[index].start
-        : (index < productMatches.length ? productMatches[index].start : 0);
-    final context = _contextAround(text, center, center);
-    add(token, productName: product, mac: _findMac(context));
+  );
+  for (final line in const LineSplitter().convert(text)) {
+    final product = productField.firstMatch(line)?.group(1);
+    final token = tokenField.firstMatch(line)?.group(1);
+    if (token != null) {
+      add(token, productName: product, mac: _findMac(line));
+    }
   }
 
   final anchored = RegExp(
@@ -160,16 +258,17 @@ List<AuthKeyCandidate> _parseText(String text, String sourcePath) {
   for (final match in anchored.allMatches(text)) {
     add(
       match.group(1),
-      mac: _findMac(_contextAround(text, match.start, match.end)),
+      mac: _findMac(_lineAround(text, match.start, match.end)),
     );
   }
   return results;
 }
 
-String _contextAround(String text, int start, int end) => text.substring(
-      start > 1000 ? start - 1000 : 0,
-      end + 1000 < text.length ? end + 1000 : text.length,
-    );
+String _lineAround(String text, int start, int end) {
+  final lineStart = text.lastIndexOf('\n', start - 1) + 1;
+  final lineEnd = text.indexOf('\n', end);
+  return text.substring(lineStart, lineEnd == -1 ? text.length : lineEnd);
+}
 
 String? _findMac(String text) => RegExp(
       r'([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}',

@@ -5,7 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:wristload/application/device_controller.dart';
 import 'package:wristload/domain/auth_key_binding.dart';
 import 'package:wristload/domain/install_preference_store.dart';
-import 'package:wristload/main.dart' as app;
+import 'package:wristload/presentation/pages/home_page.dart' as app;
 
 void main() {
   testWidgets('已连接卡片只在统计块显示电量并放大设备名称', (tester) async {

@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
 
 import '../domain/device_profile.dart';
 import '../domain/auth_key_binding.dart';
@@ -26,6 +29,9 @@ import '../domain/protocol/zau.dart';
 import '../domain/protocol/transport_constants.dart';
 import '../domain/verification_gate.dart';
 import '../platform/ble_transport.dart';
+import '../platform/desktop_v2_connection.dart';
+import '../platform/macos_v2_connection.dart';
+import '../platform/windows_v2_connection.dart';
 import '../platform/auth_key_store.dart';
 import '../platform/system_time_info.dart';
 import '../platform/security_scoped_file_access.dart';
@@ -1750,9 +1756,16 @@ class DeviceController extends ChangeNotifier {
     // Allow one transport-only reconnect while retaining the confirmed keys.
     _postAuthReconnectAttempts = 0;
     _authenticatedAt = null;
-    final platformName = defaultTargetPlatform == TargetPlatform.macOS
-        ? 'macOS'
-        : 'Windows';
+    final DesktopV2Connection desktopConnection = switch (
+      defaultTargetPlatform
+    ) {
+      TargetPlatform.windows => const WindowsV2Connection(),
+      TargetPlatform.macOS => const MacosV2Connection(),
+      _ => throw UnsupportedError(
+        'Desktop V2 connection is unsupported on $defaultTargetPlatform.',
+      ),
+    };
+    final platformName = desktopConnection.platformName;
     _log('已识别 ${profile.displayName}（V2），$platformName 使用无 GATT 的经典蓝牙 SPP 连接。');
     try {
       if (!directIdentity) {
@@ -1763,24 +1776,14 @@ class DeviceController extends ChangeNotifier {
       _scanResultsFlushTimer?.cancel();
       _scanResultsFlushTimer = null;
       services = const [];
-      if (defaultTargetPlatform == TargetPlatform.macOS) {
-        // Pairing is native and can fail before connectSpp() has a chance to
-        // attach the EventChannel. Start the idempotent listener here so the
-        // selector, pairing delegate, and eventual SDP events all reach the
-        // diagnostic journal for this exact connection attempt.
-        _transport.listenRfcommData();
-        _log('已启用 macOS 经典蓝牙原生日志；等待系统配对与 SPP 建链事件。');
-      }
-      if (directIdentity) {
-        _log('已复用已确认的 macOS 经典蓝牙身份映射；直接建立 RFCOMM。');
-      } else {
-        _log('先检查系统经典蓝牙配对，再建立 RFCOMM；不创建临时 GATT 链路。');
-        connectedClassicAddress = await _transport.pairDevice(
-          peripheral.uuid,
-          advertisedName: connectedDeviceName,
-        );
-        if (connectionSession != _sessionEpoch) return;
-      }
+      connectedClassicAddress = await desktopConnection.prepare(
+        transport: _transport,
+        peripheral: peripheral,
+        advertisedName: connectedDeviceName ?? profile.displayName,
+        directIdentity: directIdentity,
+        log: _log,
+      );
+      if (connectionSession != _sessionEpoch) return;
       // System pairing is not a successful application connection. Do not
       // publish a connected device until the pairing request has completed,
       // otherwise a cancelled macOS dialog leaves the home page showing a
@@ -2115,10 +2118,10 @@ class DeviceController extends ChangeNotifier {
       final classicAddress = await _transport
           .connectRfcomm(device.uuid, advertisedName: connectedDeviceName)
           .timeout(
-            const Duration(seconds: 2),
+            const Duration(seconds: 8),
             onTimeout: () => throw TimeoutException(
-              'RFCOMM 2 秒内设备未响应',
-              const Duration(seconds: 2),
+              'RFCOMM 8 秒内设备未响应',
+              const Duration(seconds: 8),
             ),
           );
       if (!_isCurrentSppConnection(connectionEpoch)) return;
@@ -2137,9 +2140,9 @@ class DeviceController extends ChangeNotifier {
         await _cleanupFailedSppConnect(device, exception, connectionEpoch);
       }
       if (exception is TimeoutException &&
-          exception.duration == const Duration(seconds: 2)) {
+          exception.duration == const Duration(seconds: 8)) {
         _connectionIssues.recordRfcommTimeout();
-        _log('SPP 超时：2 秒内设备未响应，已停止等待 RFCOMM 建链。$exception');
+        _log('SPP 超时：8 秒内设备未响应，已停止等待 RFCOMM 建链。$exception');
       } else {
         _connectionIssues.recordConnectionFailure(exception);
       }
@@ -2174,6 +2177,29 @@ class DeviceController extends ChangeNotifier {
   final Map<int, _MassProgressMarker> _pendingMassProgress = {};
   final StreamController<Zau> _businessResponses =
       StreamController<Zau>.broadcast();
+  bool selfCheckStarting = false;
+  bool selfCheckModeSwitching = false;
+  bool selfCheckEntered = false;
+  bool selfCheckActive = false;
+  bool selfCheckModeLoading = false;
+  int? currentSelfCheckMode;
+  String? selfCheckError;
+  SelfCheckReport? latestSelfCheckReport;
+  String? latestSelfCheckExportPath;
+  bool deviceLogPullStarting = false;
+  bool deviceLogPullActive = false;
+  String? deviceLogError;
+  String? latestDeviceLogPath;
+  String? latestDeviceLogId;
+  int deviceLogSegmentTotal = 0;
+  int deviceLogReceivedSegments = 0;
+  int deviceLogReceivedBytes = 0;
+  final BytesBuilder _deviceLogBuffer = BytesBuilder(copy: false);
+  Timer? _deviceLogTimeout;
+  bool _deviceLogFinishing = false;
+  bool bootModeSwitching = false;
+  String? bootModeError;
+  String? pendingBootModeLabel;
   final Set<_BusinessWaiter> _completionWaiters = {};
   bool _installCancelled = false;
   bool _installInProgress = false;
@@ -2640,6 +2666,15 @@ class DeviceController extends ChangeNotifier {
     final channel = packet.payload[0] & 0x0f;
     final opCode = packet.payload[1];
     final data = packet.payload.sublist(2);
+    if ((deviceLogPullStarting || deviceLogPullActive) && _isDeviceLogTransportData(data)) {
+      _handleDeviceLogSegment(channel, opCode, data);
+      return;
+    }
+    if (channel == SppProtocol.channelMass && opCode == SppProtocol.opCodeWrite &&
+        (deviceLogPullStarting || deviceLogPullActive)) {
+      _handleDeviceLogMassSegment(data);
+      return;
+    }
     _log('  DATA channel=$channel opCode=$opCode data=${_hex(data)}');
     final isPlainPbWrite =
         channel == SppProtocol.channelPb && opCode == SppProtocol.opCodeWrite;
@@ -2785,6 +2820,8 @@ class DeviceController extends ChangeNotifier {
     final business = Zau.tryParse(plaintext);
     if (business != null && business.command != XiaomiAuth.commandType) {
       _log('  WRITE_ENC 业务响应：command=${business.command}/${business.sub}');
+      _handleSelfCheckReport(business);
+      _handleDeviceLogControlResult(business);
       _businessResponses.add(business);
       return;
     }
@@ -2798,6 +2835,60 @@ class DeviceController extends ChangeNotifier {
     }
     _log('  WRITE_ENC 未解析为已知 Command；不改变会话或发送状态。');
   }
+
+  void _handleSelfCheckReport(Zau message) {
+    if (message.command != ZauCommand.debugTransfer || message.sub != ZauCommand.debugTransferSelfCheckResultSub) return;
+    final parsed = SelfCheckPayload.parseReport(message.payload);
+    if (parsed == null) { selfCheckError = '设备自检结果无法解析'; notifyListeners(); return; }
+    latestSelfCheckReport = SelfCheckReport(receivedAt: DateTime.now(), completed: parsed.completed, items: [for (final i in parsed.items) SelfCheckItem(id: i.id, passed: i.passed)]);
+    selfCheckActive = false; selfCheckError = null;
+    _log('收到设备自检结果：${parsed.items.length} 项'); notifyListeners();
+  }
+
+  void _handleDeviceLogControlResult(Zau message) {
+    if (message.command != ZauCommand.deviceLog || message.sub != ZauCommand.deviceLogResultSub) return;
+    final result = DeviceLogPayload.parseResult(message.payload);
+    if (result == null) return;
+    if (result.code != 0) _failDeviceLogPull('设备日志导出失败，结果码=${result.code}');
+  }
+
+  bool _isDeviceLogTransportData(List<int> data) => data.length >= 6 && data[0] == 0 && (data[1] == 129 || data[1] == 130);
+
+  void _handleDeviceLogMassSegment(List<int> data) {
+    if (data.length < 4) return _failDeviceLogPull('设备日志分片长度不足');
+    final total = data[0] | data[1] << 8, seq = data[2] | data[3] << 8;
+    _appendDeviceLogChunk(total, seq, data.sublist(4));
+  }
+
+  void _handleDeviceLogSegment(int channel, int opCode, List<int> data) {
+    final total = data[2] | data[3] << 8, seq = data[4] | data[5] << 8;
+    _appendDeviceLogChunk(total, seq, data.sublist(6));
+  }
+
+  void _appendDeviceLogChunk(int total, int seq, List<int> chunk) {
+    if (total <= 0 || seq != deviceLogReceivedSegments + 1 || seq > total) { _failDeviceLogPull('设备日志分片顺序无效：$seq/$total'); return; }
+    if (deviceLogSegmentTotal == 0) deviceLogSegmentTotal = total;
+    if (deviceLogSegmentTotal != total || deviceLogReceivedBytes + chunk.length > 64 * 1024 * 1024) { _failDeviceLogPull('设备日志分片无效'); return; }
+    _deviceLogBuffer.add(chunk); deviceLogReceivedSegments = seq; deviceLogReceivedBytes += chunk.length; deviceLogPullStarting = false; deviceLogPullActive = true;
+    _armDeviceLogTimeout(); notifyListeners();
+    if (seq == total) { _deviceLogFinishing = true; unawaited(_finishDeviceLogPull()); }
+  }
+
+  void _armDeviceLogTimeout() { _deviceLogTimeout?.cancel(); _deviceLogTimeout = Timer(const Duration(seconds: 60), () => _failDeviceLogPull('等待设备日志分片超时')); }
+
+  Future<void> _finishDeviceLogPull() async {
+    _deviceLogTimeout?.cancel(); _deviceLogTimeout = null;
+    try {
+      final bytes = _deviceLogBuffer.toBytes();
+      if (bytes.isEmpty) throw const FormatException('设备日志为空');
+      final dir = Directory('${(await getApplicationDocumentsDirectory()).path}${Platform.pathSeparator}DeviceLog'); await dir.create(recursive: true);
+      final file = File('${dir.path}${Platform.pathSeparator}device_log_${DateTime.now().millisecondsSinceEpoch}.bin'); await file.writeAsBytes(bytes, flush: true);
+      latestDeviceLogPath = file.path; deviceLogError = null;
+    } catch (e) { deviceLogError = '设备日志导出失败：$e'; }
+    deviceLogPullStarting = false; deviceLogPullActive = false; _deviceLogFinishing = false; _log(latestDeviceLogPath == null ? deviceLogError! : '设备日志已导出：$latestDeviceLogPath'); notifyListeners();
+  }
+
+  void _failDeviceLogPull(String reason) { if (_deviceLogFinishing) return; _deviceLogTimeout?.cancel(); deviceLogPullStarting = false; deviceLogPullActive = false; deviceLogError = reason; _log(reason); notifyListeners(); }
 
   Future<void> _sppSendAuthConfirm({
     required int connectionEpoch,
@@ -3225,7 +3316,9 @@ class DeviceController extends ChangeNotifier {
   bool debugCleanupPolling = false;
   DebugCleanupReport? debugCleanupReport;
   String? debugError;
+  List<String> debugCleanupLogs = const [];
   Future<void>? _debugCleanupFuture;
+  bool _debugCleanupStopRequested = false;
 
   bool get debugInstallInProgress => _debugInstallInProgress;
 
@@ -3235,6 +3328,8 @@ class DeviceController extends ChangeNotifier {
     debugError = null;
     debugCleanupReport = null;
     debugCleanupPolling = false;
+    debugCleanupLogs = const [];
+    _debugCleanupStopRequested = false;
     notifyListeners();
     try {
       await startInstall(request);
@@ -3256,6 +3351,7 @@ class DeviceController extends ChangeNotifier {
       await Future<void>.delayed(const Duration(milliseconds: 20));
     }
     if (_debugCleanupFuture != null) return;
+    _debugCleanupStopRequested = false;
     _debugCleanupFuture = _pollDebugCleanup();
     try {
       await _debugCleanupFuture;
@@ -3271,16 +3367,20 @@ class DeviceController extends ChangeNotifier {
     debugCleanupPolling = true;
     debugCleanupReport = null;
     debugError = null;
+    debugCleanupLogs = const [];
     notifyListeners();
     try {
-      while (true) {
+      while (!_debugCleanupStopRequested) {
         if (pollCount > 0) {
-          await Future<void>.delayed(const Duration(seconds: 8));
+          _appendDebugCleanupLog('等待 3 秒后发起第 ${pollCount + 1} 次查询…');
+          await Future<void>.delayed(const Duration(seconds: 3));
         }
         if (_disposed) return;
         if (!sessionReady || _sessionCipher == null) {
           throw StateError('设备鉴权会话已失效，无法查询清理状态');
         }
+        final attempt = pollCount + 1;
+        _appendDebugCleanupLog('正在发送第 $attempt 次请求。');
         final response = await _requestBusiness(
           Zau(
             command: ZauCommand.debugTransfer,
@@ -3295,7 +3395,11 @@ class DeviceController extends ChangeNotifier {
           throw const FormatException('设备清理状态响应缺少状态码');
         }
         _log('调试清理状态查询：status=$finalStatus（第 $pollCount 次）');
+        _appendDebugCleanupLog('第 $attempt 次收到设备响应，status=$finalStatus。');
         if (finalStatus != 1) break;
+      }
+      if (_debugCleanupStopRequested) {
+        _appendDebugCleanupLog('轮询已停止。');
       }
       debugCleanupReport = DebugCleanupReport(
         startedAt: startedAt,
@@ -3317,6 +3421,18 @@ class DeviceController extends ChangeNotifier {
       debugCleanupPolling = false;
       notifyListeners();
     }
+  }
+
+  void _appendDebugCleanupLog(String message) {
+    final now = DateTime.now();
+    String two(int value) => value.toString().padLeft(2, '0');
+    final stamp = '[${two(now.hour)}:${two(now.minute)}:${two(now.second)}.'
+        '${now.millisecond.toString().padLeft(3, '0')}]';
+    final next = [...debugCleanupLogs, '$stamp $message'];
+    debugCleanupLogs = List<String>.unmodifiable(
+      next.length <= 200 ? next : next.sublist(next.length - 200),
+    );
+    notifyListeners();
   }
 
   /// Reads the installed quick-app list from the authenticated device.
@@ -4153,6 +4269,87 @@ class DeviceController extends ChangeNotifier {
       await waiter.cancel();
     }
   }
+
+  void stopDebugCleanupPolling() {
+    if (!debugCleanupPolling) return;
+    _debugCleanupStopRequested = true;
+    _appendDebugCleanupLog('已请求停止轮询；当前请求结束后将停止。');
+  }
+
+  Future<bool> switchBootMode(DeviceBootMode mode) async {
+    if (bootModeSwitching || !sessionReady || _sessionCipher == null) return false;
+    bootModeSwitching = true; pendingBootModeLabel = mode.label; bootModeError = null; notifyListeners();
+    try {
+      await _sendBusinessNoResponse(Zau(command: ZauCommand.debugTransfer, sub: ZauCommand.debugTransferBootModeSub, payload: BootModePayload.switchRequest(mode)));
+      _log('已发送启动模式切换请求：${mode.label}');
+      // The device may reboot and drop the link, but that must not leave the
+      // UI locked waiting for reconnection. Allow another request immediately
+      // after this request has been written successfully.
+      pendingBootModeLabel = null;
+      return true;
+    } catch (e) { pendingBootModeLabel = null; bootModeError = '启动模式切换失败：$e'; _log(bootModeError!); return false; }
+    finally { bootModeSwitching = false; notifyListeners(); }
+  }
+
+  Future<bool> enterSelfCheckMode() async {
+    if (selfCheckModeSwitching || selfCheckEntered || !sessionReady || _sessionCipher == null) return false;
+    selfCheckModeSwitching = true; selfCheckError = null; notifyListeners();
+    try {
+      final r = await _requestBusiness(Zau(command: ZauCommand.debugTransfer, sub: ZauCommand.debugTransferControlSub, payload: SelfCheckPayload.enterModeRequest()), ZauCommand.debugTransfer, ZauCommand.debugTransferControlSub);
+      if (SelfCheckPayload.parseControlResult(r.payload) != 0) throw StateError('设备拒绝进入自检模式');
+      selfCheckEntered = true; _log('已进入设备自检模式'); return true;
+    } catch (e) { selfCheckError = '进入自检模式失败：$e'; _log(selfCheckError!); return false; }
+    finally { selfCheckModeSwitching = false; notifyListeners(); }
+  }
+
+  Future<bool> startSelfCheck() async {
+    if (selfCheckStarting || !selfCheckEntered || !sessionReady || _sessionCipher == null) return false;
+    selfCheckStarting = true; selfCheckError = null; notifyListeners();
+    try {
+      final r = await _requestBusiness(Zau(command: ZauCommand.debugTransfer, sub: ZauCommand.debugTransferControlSub, payload: SelfCheckPayload.startRequest()), ZauCommand.debugTransfer, ZauCommand.debugTransferControlSub);
+      if (SelfCheckPayload.parseControlResult(r.payload) != 0) throw StateError('设备拒绝开始自检');
+      selfCheckActive = true; _log('已开始设备自检'); return true;
+    } catch (e) { selfCheckError = '开始自检失败：$e'; _log(selfCheckError!); return false; }
+    finally { selfCheckStarting = false; notifyListeners(); }
+  }
+
+  Future<bool> refreshSelfCheckMode() async {
+    if (selfCheckModeLoading || !sessionReady || _sessionCipher == null) return false;
+    selfCheckModeLoading = true; notifyListeners();
+    try {
+      final r = await _requestBusiness(Zau(command: ZauCommand.debugTransfer, sub: ZauCommand.debugTransferStatusSub), ZauCommand.debugTransfer, ZauCommand.debugTransferStatusSub);
+      currentSelfCheckMode = SelfCheckPayload.parseMode(r.payload); selfCheckEntered = currentSelfCheckMode != null && currentSelfCheckMode != 0; return currentSelfCheckMode != null;
+    } catch (e) { selfCheckError = '读取自检模式失败：$e'; return false; }
+    finally { selfCheckModeLoading = false; notifyListeners(); }
+  }
+
+  Future<bool> exitSelfCheck() async {
+    if (!sessionReady || _sessionCipher == null) return false;
+    try {
+      final r = await _requestBusiness(Zau(command: ZauCommand.debugTransfer, sub: ZauCommand.debugTransferControlSub, payload: SelfCheckPayload.modeChangeRequest(2)), ZauCommand.debugTransfer, ZauCommand.debugTransferControlSub);
+      if (SelfCheckPayload.parseControlResult(r.payload) != 0) throw StateError('设备拒绝退出自检');
+      selfCheckEntered = false; selfCheckActive = false; currentSelfCheckMode = null; notifyListeners(); return true;
+    } catch (e) { selfCheckError = '退出自检失败：$e'; _log(selfCheckError!); notifyListeners(); return false; }
+  }
+
+  Future<String?> exportSelfCheckResult() async {
+    final report = latestSelfCheckReport; if (report == null) return null;
+    try {
+      final dir = Directory('${(await getApplicationDocumentsDirectory()).path}${Platform.pathSeparator}SelfCheckReport'); await dir.create(recursive: true);
+      final file = File('${dir.path}${Platform.pathSeparator}self_check_${DateTime.now().millisecondsSinceEpoch}.txt');
+      await file.writeAsString('Device: ${connectedDeviceName ?? 'Unknown'}\nCompleted: ${report.completed}\n${report.items.map((i) => 'Item ${i.id}: ${i.passed ? 'PASS' : 'FAIL'}').join('\n')}', flush: true);
+      latestSelfCheckExportPath = file.path; notifyListeners(); return file.path;
+    } catch (e) { selfCheckError = '导出自检结果失败：$e'; notifyListeners(); return null; }
+  }
+
+  Future<bool> pullDeviceLog() async {
+    if (deviceLogPullStarting || deviceLogPullActive || !sessionReady || _sessionCipher == null) return false;
+    _resetDeviceLogPull(); deviceLogPullStarting = true; deviceLogError = null; notifyListeners();
+    try { await _sendBusinessNoResponse(Zau(command: ZauCommand.debugTransfer, sub: ZauCommand.debugTransferDeviceLogSub, payload: DeviceLogPayload.dumpRequest())); _armDeviceLogTimeout(); return true; }
+    catch (e) { _failDeviceLogPull('请求设备日志失败：$e'); return false; }
+  }
+
+  void _resetDeviceLogPull() { _deviceLogTimeout?.cancel(); _deviceLogTimeout = null; _deviceLogBuffer.clear(); deviceLogSegmentTotal = 0; deviceLogReceivedSegments = 0; deviceLogReceivedBytes = 0; _deviceLogFinishing = false; }
 
   Future<bool> syncSystemTime({bool automatic = false}) async {
     if (_timeSyncInProgress) return false;

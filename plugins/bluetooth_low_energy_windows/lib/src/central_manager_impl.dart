@@ -320,11 +320,12 @@ final class CentralManagerImpl
         advertisementArgs,
       );
       final directAdvertisement = advertisementArgs.toAdvertisement();
-      if (typeArgs == AdvertisementTypeArgs.connectableUndirected &&
-          directAdvertisement.name?.trim().isNotEmpty == true) {
-        // Some Windows adapters do not deliver a matching scan response in the
-        // original one-second window. Publish a named connectable advertisement
-        // immediately; a later merged scan response can update its metadata.
+      if (directAdvertisement.name?.trim().isNotEmpty == true) {
+        // Windows can report the name in a scan response before, or without,
+        // its matching ADV_IND packet. Publish any named live advertisement
+        // immediately; the later merged event only enriches its metadata.
+        // Restricting this to ConnectableUndirected hid nearby unpaired
+        // wearables reported as ScannableUndirected or ScanResponse.
         final eventArgs = DiscoveredEventArgs(
           peripheralArgs.toPeripheral(),
           rssiArgs,

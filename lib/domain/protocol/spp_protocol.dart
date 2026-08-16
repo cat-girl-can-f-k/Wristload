@@ -28,6 +28,22 @@ abstract final class SppProtocol {
 
   static const int channelPb = 1;
   static const int channelMass = 2;
+  static const int channelMassVoice = 3;
+  static const int channelFileSensor = 4;
+  static const int channelFileFitness = 5;
+
+  /// Raw data types accepted by the official DeviceLogDataHandler.
+  static const int dataTypeDeviceLog = 103;
+  static const int dataTypeOneTrackLog = 104;
+
+  /// Official queue mappings: V1 channel 4/5 -> 103/104; V2 channel 2 -> 104.
+  static int? rawDataTypeForChannel(int channel, {required bool v2}) =>
+      switch (channel) {
+        channelMass when v2 => dataTypeOneTrackLog,
+        channelFileSensor => dataTypeDeviceLog,
+        channelFileFitness => dataTypeOneTrackLog,
+        _ => null,
+      };
 
   /// Official V2 L2 channel reserved for firmware OTA traffic.
   ///

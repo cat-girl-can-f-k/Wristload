@@ -470,14 +470,17 @@ class FloatingWindowCoordinator with WindowListener {
   @override
   void onWindowClose() {
     if (_exiting) return;
-    if (!_trayReady) {
+    // The tray infrastructure is initialized eagerly, but closing the main
+    // window may keep the process alive only while the floating window feature
+    // is enabled.
+    if (!_enabled || !_trayReady) {
       _exiting = true;
       unawaited(_destroyMainWindow());
       return;
     }
     appLogger.info('主窗口关闭请求转为托盘隐藏', category: DiagnosticLogCategory.ui);
-    // Main-window close is a tray hide. The tray Exit action is the only
-    // process-terminating path.
+    // With the floating installer enabled, keep the process in the tray and
+    // leave the auxiliary window available.
     unawaited(windowManager.hide());
     if (_enabled) unawaited(showFloatingWindow());
   }

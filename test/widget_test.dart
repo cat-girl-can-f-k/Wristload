@@ -11,9 +11,9 @@ import 'package:wristload/presentation/install_task_card.dart';
 import 'package:wristload/presentation/install_split_button.dart';
 import 'package:wristload/presentation/install_request_preflight.dart';
 import 'package:wristload/presentation/install_warning_dialog.dart';
-import 'package:wristload/presentation/queue_page.dart';
-import 'package:wristload/presentation/settings_page.dart';
-import 'package:wristload/presentation/tools_page.dart';
+import 'package:wristload/presentation/pages/queue_page.dart';
+import 'package:wristload/presentation/pages/settings_page.dart';
+import 'package:wristload/presentation/pages/tools_page.dart';
 
 void main() {
   test('known profile hints stay restricted to verified observations', () {

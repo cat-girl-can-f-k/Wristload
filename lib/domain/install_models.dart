@@ -237,6 +237,7 @@ class DebugCleanupReport {
     required this.pollCount,
     required this.finalStatus,
     this.error,
+    this.stoppedByUser = false,
   });
 
   final DateTime startedAt;
@@ -244,7 +245,32 @@ class DebugCleanupReport {
   final int pollCount;
   final int? finalStatus;
   final String? error;
+  final bool stoppedByUser;
 
   Duration get elapsed => finishedAt.difference(startedAt);
-  bool get completed => error == null;
+  bool get completed => error == null && !stoppedByUser;
+}
+
+/// A self-check report pushed by the device after it has entered self-check
+/// mode. Item IDs intentionally stay numeric: their localized display names
+/// are owned by the official client and are not present in the device packet.
+class SelfCheckReport {
+  const SelfCheckReport({
+    required this.receivedAt,
+    required this.completed,
+    required this.items,
+  });
+
+  final DateTime receivedAt;
+  final bool completed;
+  final List<SelfCheckItem> items;
+
+  int get passedCount => items.where((item) => item.passed).length;
+}
+
+class SelfCheckItem {
+  const SelfCheckItem({required this.id, required this.passed});
+
+  final int id;
+  final bool passed;
 }

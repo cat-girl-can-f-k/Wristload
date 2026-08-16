@@ -28,8 +28,15 @@ abstract final class ZauCommand {
   /// Debug transfer cleanup status query. The device returns status 1 while
   /// the previous transfer is still being disposed.
   static const int debugTransfer = 13;
+  /// Factory/debug build-mode switch. The device restarts immediately after
+  /// receiving this command, so the official client does not wait for a
+  /// business response.
+  static const int debugTransferBootModeSub = 0;
+  /// FactoryTestFragment.dumpDeviceLog() is fire-and-forget.
+  static const int debugTransferDeviceLogSub = 2;
   static const int debugTransferStatusSub = 6;
   static const int debugTransferControlSub = 7;
+  static const int debugTransferSelfCheckResultSub = 8;
 
   static const int appList = 20;
   static const int appListSub = 0;
@@ -43,9 +50,241 @@ abstract final class ZauCommand {
   /// Official Vela system-time sync request (TimeSyncer): command=2, sub=3.
   static const int setSystemTime = 2;
 
+  /// Official device-log request and completion notification.
+  static const int deviceLog = 2;
+  static const int deviceLogStartSub = 80;
+  static const int deviceLogResultSub = 81;
+
   static const int setFace = 4; // 表盘：预装(f=4) / setFace(f=1)
   static const int prepareInstallApp = 20; // RPK 预装
   static const int massTransfer = 22; // Mass 文件传输（MassPrepare/MassData 控制）
+}
+
+/// Boot modes accepted by the official Xiaomi Fitness factory-test page.
+///
+/// `FactoryTestFragment.doFactoryMode` sends command/sub `13/0` and assigns
+/// the selected value through `r8a.field1`. The values intentionally have a
+/// gap because they are device firmware enum values, not a sequential UI index.
+enum DeviceBootMode {
+  user(0, 'user'),
+  userdebug(1, 'userdebug'),
+  eng(2, 'eng'),
+  medicalMeter(4, 'medical_meter');
+
+  const DeviceBootMode(this.value, this.label);
+
+  final int value;
+  final String label;
+}
+
+abstract final class BootModePayload {
+  /// Encodes `r8a.field1`, as used by the official factory-test command.
+  static (int, List<int>) switchRequest(DeviceBootMode mode) {
+    final debug = ProtoWriter()..writeInt(1, mode.value);
+    return (15, debug.bytes);
+  }
+}
+
+/// Device-log messages confirmed from the official Xiaomi Fitness debug APK.
+///
+/// The request is command/sub `2/80` with `zau.field4 -> ysr.field50 ->
+/// tsr.field1 = 1`. The device later reports command/sub `2/81` through
+/// `ysr.field51 -> tsr`, whose fields 1 and 2 identify the result kind and
+/// status code. The actual log bytes arrive separately on the raw data path.
+abstract final class DeviceLogPayload {
+  /// Official FactoryTest dump request (`command=13`, `sub=2`) has no
+  /// protobuf oneof payload. Returning null keeps field 0 out of the wire
+  /// message; field numbers are one-based in protobuf.
+  static (int, List<int>)? dumpRequest() => null;
+
+  static (int, List<int>) startRequest() {
+    final request = ProtoWriter()..writeInt(1, 1);
+    final envelope = ProtoWriter()..writeMessage(50, request.bytes);
+    return (4, envelope.bytes);
+  }
+
+  static DeviceLogControlResult? parseResult((int, List<int>)? payload) {
+    if (payload == null || payload.$1 != 4) return null;
+    try {
+      final envelope = ProtoReader(payload.$2);
+      while (!envelope.isAtEnd) {
+        final (field, wire) = envelope.readFieldHeader();
+        if (field != 51 || wire != 2) {
+          envelope.skipField(wire);
+          continue;
+        }
+        final result = ProtoReader(envelope.readBytes());
+        int? type;
+        int? code;
+        while (!result.isAtEnd) {
+          final (resultField, resultWire) = result.readFieldHeader();
+          if (resultWire != 0) {
+            result.skipField(resultWire);
+          } else if (resultField == 1) {
+            type = result.readVarint();
+          } else if (resultField == 2) {
+            code = result.readVarint();
+          } else {
+            result.skipField(resultWire);
+          }
+        }
+        return code == null ? null : DeviceLogControlResult(type: type, code: code);
+      }
+    } on FormatException {
+      return null;
+    }
+    return null;
+  }
+}
+
+class DeviceLogControlResult {
+  const DeviceLogControlResult({required this.type, required this.code});
+
+  final int? type;
+  final int code;
+}
+
+/// Debug self-check messages confirmed from Xiaomi Fitness Debug.
+///
+/// The start request is command/sub `13/7` with `zau.field15` containing
+/// `r8a.field7 -> z8a.field1 = 1`. The device later pushes command/sub
+/// `13/8` with `r8a.field9 -> b9a` carrying the individual check results.
+abstract final class SelfCheckPayload {
+  static (int, List<int>) modeQueryRequest() => (15, const <int>[]);
+
+  /// Switches the device from its normal mode into self-check mode. This is
+  /// distinct from [startRequest], which starts the check after entry.
+  static (int, List<int>) enterModeRequest() => modeChangeRequest(0);
+
+  static (int, List<int>) modeChangeRequest(int mode) {
+    if (mode < 0 || mode > 3) {
+      throw ArgumentError.value(mode, 'mode', 'must be between 0 and 3');
+    }
+    final control = ProtoWriter()..writeInt(1, mode);
+    final debug = ProtoWriter()..writeMessage(7, control.bytes);
+    return (15, debug.bytes);
+  }
+
+  static (int, List<int>) startRequest() {
+    final control = ProtoWriter()..writeInt(1, 1);
+    final debug = ProtoWriter()..writeMessage(7, control.bytes);
+    return (15, debug.bytes);
+  }
+
+  /// Parses `r8a.field8 -> a9a.field2`, the official control result code.
+  static int? parseControlResult((int, List<int>)? payload) {
+    if (payload == null || payload.$1 != 15) return null;
+    try {
+      final debug = ProtoReader(payload.$2);
+      while (!debug.isAtEnd) {
+        final (field, wire) = debug.readFieldHeader();
+        if (field != 8 || wire != 2) {
+          debug.skipField(wire);
+          continue;
+        }
+        final result = ProtoReader(debug.readBytes());
+        while (!result.isAtEnd) {
+          final (resultField, resultWire) = result.readFieldHeader();
+          if (resultField == 2 && resultWire == 0) {
+            return result.readVarint();
+          }
+          result.skipField(resultWire);
+        }
+        return null;
+      }
+    } on FormatException {
+      return null;
+    }
+    return null;
+  }
+
+  /// Parses the mode returned by the official 13/6 request. The obfuscated
+  /// protobuf wrapper has changed nesting across firmware revisions, so walk
+  /// only embedded protobuf messages and accept the first mode value 0..3.
+  static int? parseMode((int, List<int>)? payload) {
+    if (payload == null || payload.$1 != 15) return null;
+    return _findMode(payload.$2, 0);
+  }
+
+  static int? _findMode(List<int> bytes, int depth) {
+    if (depth > 5) return null;
+    try {
+      final reader = ProtoReader(bytes);
+      while (!reader.isAtEnd) {
+        final (field, wire) = reader.readFieldHeader();
+        if (wire == 0) {
+          final value = reader.readVarint();
+          if (value >= 0 && value <= 3) return value;
+        } else if (wire == 2) {
+          final nested = _findMode(reader.readBytes(), depth + 1);
+          if (nested != null) return nested;
+        } else {
+          reader.skipField(wire);
+        }
+      }
+    } on FormatException {
+      return null;
+    }
+    return null;
+  }
+
+  static ({List<SelfCheckDeviceItem> items, bool completed})? parseReport(
+    (int, List<int>)? payload,
+  ) {
+    if (payload == null || payload.$1 != 15) return null;
+    try {
+      final debug = ProtoReader(payload.$2);
+      while (!debug.isAtEnd) {
+        final (field, wire) = debug.readFieldHeader();
+        if (field != 9 || wire != 2) {
+          debug.skipField(wire);
+          continue;
+        }
+        final report = ProtoReader(debug.readBytes());
+        final items = <SelfCheckDeviceItem>[];
+        var completed = false;
+        while (!report.isAtEnd) {
+          final (reportField, reportWire) = report.readFieldHeader();
+          if (reportField == 1 && reportWire == 2) {
+            final item = _parseItem(report.readBytes());
+            if (item != null) items.add(item);
+          } else if (reportField == 2 && reportWire == 0) {
+            completed = report.readVarint() != 0;
+          } else {
+            report.skipField(reportWire);
+          }
+        }
+        return (items: items, completed: completed);
+      }
+    } on FormatException {
+      return null;
+    }
+    return null;
+  }
+
+  static SelfCheckDeviceItem? _parseItem(List<int> bytes) {
+    final reader = ProtoReader(bytes);
+    int? id;
+    var passed = false;
+    while (!reader.isAtEnd) {
+      final (field, wire) = reader.readFieldHeader();
+      if (field == 1 && wire == 0) {
+        id = reader.readVarint();
+      } else if (field == 2 && wire == 0) {
+        passed = reader.readVarint() != 0;
+      } else {
+        reader.skipField(wire);
+      }
+    }
+    return id == null ? null : SelfCheckDeviceItem(id: id, passed: passed);
+  }
+}
+
+class SelfCheckDeviceItem {
+  const SelfCheckDeviceItem({required this.id, required this.passed});
+
+  final int id;
+  final bool passed;
 }
 
 /// Parses the status response used by the debug transfer-cleanup probe.
