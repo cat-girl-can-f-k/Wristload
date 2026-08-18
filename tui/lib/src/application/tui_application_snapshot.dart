@@ -6,15 +6,36 @@ import 'persistence/saved_tui_device.dart';
 /// Whether the TUI can use the known installation protocol for a device.
 enum TuiApplicationDeviceSupport { supported, unsupported, unknown }
 
-/// Connection state intentionally expressed without native transport details.
+/// Canonical user-visible lifecycle for the standalone TUI.
+///
+/// [scanning], device selection, and [installing] also have independent
+/// snapshot fields. These values provide one concise status label without
+/// making those orthogonal concerns part of transport control flow.
 enum TuiApplicationConnectionState {
-  disconnected,
+  idle,
+  scanning,
+  selected,
+  waitingAuthkey,
   connecting,
-  awaitingAuthKey,
+
+  /// A raw Bluetooth transport exists, but protocol authentication has not
+  /// completed. This must never be rendered as [ready].
+  connected,
   authenticating,
   ready,
+  installing,
   disconnecting,
   failed,
+
+  // Compatibility aliases for older application consumers. New snapshots
+  // use [idle] and [waitingAuthkey] respectively.
+  ;
+
+  @Deprecated('Use idle instead')
+  static const disconnected = TuiApplicationConnectionState.idle;
+
+  @Deprecated('Use waitingAuthkey instead')
+  static const awaitingAuthKey = TuiApplicationConnectionState.waitingAuthkey;
 }
 
 /// Auto-connect outcome for the current TUI process lifetime.
@@ -53,6 +74,7 @@ final class TuiApplicationDevice {
     this.profileName,
     this.paired = false,
     this.rssi,
+    this.isDirectedSessionTarget = false,
   }) : macAddress = SavedTuiDevice.normalizeMacAddress(macAddress);
 
   /// Complete display name. Renderers may wrap it but must not lose access.
@@ -70,6 +92,10 @@ final class TuiApplicationDevice {
   final String? profileName;
   final bool paired;
   final int? rssi;
+
+  /// True only for the ephemeral target explicitly configured at TUI launch.
+  /// This is a UI affordance, not a persisted connection authorization.
+  final bool isDirectedSessionTarget;
 
   String get id => macAddress;
   String get authKeyLabel =>
@@ -90,6 +116,7 @@ final class TuiApplicationDevice {
     bool? paired,
     int? rssi,
     bool clearRssi = false,
+    bool? isDirectedSessionTarget,
   }) {
     return TuiApplicationDevice(
       name: name ?? this.name,
@@ -103,6 +130,8 @@ final class TuiApplicationDevice {
       profileName: clearProfileName ? null : (profileName ?? this.profileName),
       paired: paired ?? this.paired,
       rssi: clearRssi ? null : (rssi ?? this.rssi),
+      isDirectedSessionTarget:
+          isDirectedSessionTarget ?? this.isDirectedSessionTarget,
     );
   }
 }
@@ -172,6 +201,9 @@ final class TuiApplicationSnapshot {
     required this.themeId,
     required this.installation,
     this.activeDeviceId,
+    this.selectedDeviceId,
+    this.pendingAuthDeviceId,
+    this.connectionGeneration = 0,
     this.notice,
     this.error,
   }) : devices = List.unmodifiable(devices);
@@ -180,6 +212,16 @@ final class TuiApplicationSnapshot {
   final List<TuiApplicationDevice> devices;
   final TuiApplicationConnectionState connection;
   final String? activeDeviceId;
+
+  /// Stable user selection, independent of the current transport target.
+  final String? selectedDeviceId;
+
+  /// Stable device identity locked to the current authkey prompt, if any.
+  /// Authkey material itself never appears in an application snapshot.
+  final String? pendingAuthDeviceId;
+
+  /// Monotonic identity of the application-owned connection attempt.
+  final int connectionGeneration;
   final bool scanning;
   final bool autoConnectEnabled;
   final TuiApplicationAutoConnectState autoConnectState;
@@ -188,5 +230,7 @@ final class TuiApplicationSnapshot {
   final String? notice;
   final String? error;
 
-  bool get ready => connection == TuiApplicationConnectionState.ready;
+  bool get ready =>
+      connection == TuiApplicationConnectionState.ready ||
+      connection == TuiApplicationConnectionState.installing;
 }

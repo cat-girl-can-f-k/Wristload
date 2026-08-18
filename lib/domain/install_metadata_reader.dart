@@ -27,8 +27,9 @@ class InstallMetadataReader {
   static const maxManifestBytes = 1024 * 1024;
   static const maxWatchfaceResourceBytes = 128 * 1024 * 1024;
 
-  static final _packageName =
-      RegExp(r'^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$');
+  static final _packageName = RegExp(
+    r'^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$',
+  );
 
   Future<InstallMetadata> read(
     InstallKind kind,
@@ -65,7 +66,10 @@ class InstallMetadataReader {
       appLogger.error(
         '安装文件元数据读取失败',
         category: DiagnosticLogCategory.installation,
-        fields: <String, Object?>{'kind': kind.name, 'errorType': error.runtimeType.toString()},
+        fields: <String, Object?>{
+          'kind': kind.name,
+          'errorType': error.runtimeType.toString(),
+        },
       );
       rethrow;
     }
@@ -89,7 +93,10 @@ class InstallMetadataReader {
       appLogger.info(
         '安装文件元数据读取完成（复用安全作用域）',
         category: DiagnosticLogCategory.installation,
-        fields: <String, Object?>{'kind': kind.name, 'fileSize': value.fileSize},
+        fields: <String, Object?>{
+          'kind': kind.name,
+          'fileSize': value.fileSize,
+        },
       );
       return value;
     } on Object catch (error) {
@@ -105,10 +112,7 @@ class InstallMetadataReader {
     }
   }
 
-  Future<InstallMetadata> _readResolved(
-    InstallKind kind,
-    String path,
-  ) async {
+  Future<InstallMetadata> _readResolved(InstallKind kind, String path) async {
     final value = await Isolate.run<Map<String, Object?>>(
       () => _readMetadataInWorker(kind.index, path),
     );
@@ -134,7 +138,9 @@ class InstallMetadataReader {
   static String _extension(String path) {
     final name = path.split(RegExp(r'[/\\]')).last;
     final dot = name.lastIndexOf('.');
-    return dot >= 0 && dot + 1 < name.length ? name.substring(dot + 1).toLowerCase() : '';
+    return dot >= 0 && dot + 1 < name.length
+        ? name.substring(dot + 1).toLowerCase()
+        : '';
   }
 
   Future<InstallMetadata> _readDirect(InstallKind kind, String path) async {
@@ -150,33 +156,62 @@ class InstallMetadataReader {
     final digest = md5.convert(bytes).toString();
     final strongDigest = sha256.convert(bytes).toString();
     return switch (kind) {
-      InstallKind.watchface =>
-        _readWatchface(bytes, fileName, digest, strongDigest),
+      InstallKind.watchface => _readWatchface(
+        bytes,
+        fileName,
+        digest,
+        strongDigest,
+      ),
       InstallKind.quickApp => _readRpk(bytes, fileName, digest, strongDigest),
     };
   }
 
   InstallMetadata _readWatchface(
-      Uint8List bytes, String fileName, String digest, String strongDigest) {
+    Uint8List bytes,
+    String fileName,
+    String digest,
+    String strongDigest,
+  ) {
     final resource = _resourceFromArchive(bytes) ?? bytes;
     final faceId = _faceIdFromResource(resource);
     final inspection = _inspectWatchface(resource);
     return InstallMetadata(
-        fileName: fileName,
-        fileSize: bytes.length,
-        md5Hex: digest,
-        sha256Hex: strongDigest,
-        faceId: faceId,
-        watchfaceResolutions: inspection.resolutions,
-        containsLua: inspection.containsLua);
+      fileName: fileName,
+      fileSize: bytes.length,
+      md5Hex: digest,
+      sha256Hex: strongDigest,
+      faceId: faceId,
+      watchfaceResolutions: inspection.resolutions,
+      containsLua: inspection.containsLua,
+    );
   }
 
   InstallMetadata _readRpk(
-      Uint8List bytes, String fileName, String digest, String strongDigest) {
-    final archive = _decodeArchive(bytes, 'RPK');
+    Uint8List bytes,
+    String fileName,
+    String digest,
+    String strongDigest,
+  ) {
+    final archive = decodeZipArchive(bytes, 'RPK');
+    final isBinQuickApp = _extension(fileName) == 'bin';
+    var hasManifest = false;
+    var hasRuntime = false;
     final manifests = <({String packageName, int? versionCode})>[];
     for (final entry in archive.files) {
       final name = entry.name.toLowerCase();
+      if (isBinQuickApp &&
+          entry.isFile &&
+          (name == 'app.js' ||
+              name.endsWith('/app.js') ||
+              name == 'app.jsc' ||
+              name.endsWith('/app.jsc'))) {
+        readVerifiedArchiveEntry(
+          entry,
+          maxWatchfaceResourceBytes,
+          'Quick App 运行时文件',
+        );
+        hasRuntime = true;
+      }
       if (!entry.isFile ||
           !(name == 'manifest.json' ||
               name.endsWith('/manifest.json') ||
@@ -184,23 +219,31 @@ class InstallMetadataReader {
         continue;
       }
       try {
-        final value = jsonDecode(utf8.decode(
-          _verifiedEntryBytes(entry, maxManifestBytes, 'RPK 清单'),
-        ));
+        final isManifest =
+            name == 'manifest.json' || name.endsWith('/manifest.json');
+        final value = jsonDecode(
+          utf8.decode(
+            readVerifiedArchiveEntry(entry, maxManifestBytes, 'RPK 清单'),
+          ),
+        );
+        if (isManifest) hasManifest = true;
         if (value is Map) {
-          final manifest =
-              value.map((key, value) => MapEntry(key.toString(), value));
+          final manifest = value.map(
+            (key, value) => MapEntry(key.toString(), value),
+          );
           final rawPackage =
               manifest['package'] ?? manifest['packageName'] ?? manifest['id'];
           if (rawPackage is! String || !_packageName.hasMatch(rawPackage)) {
             continue;
           }
           final rawVersion = manifest['versionCode'];
-          final parsedVersion =
-              rawVersion is int ? rawVersion : int.tryParse('$rawVersion');
+          final parsedVersion = rawVersion is int
+              ? rawVersion
+              : int.tryParse('$rawVersion');
           manifests.add((
             packageName: rawPackage,
-            versionCode: parsedVersion != null &&
+            versionCode:
+                parsedVersion != null &&
                     parsedVersion > 0 &&
                     parsedVersion <= maxRpkVersionCode
                 ? parsedVersion
@@ -211,6 +254,11 @@ class InstallMetadataReader {
         // 尝试下一个候选清单。
       }
     }
+    if (isBinQuickApp && (!hasManifest || !hasRuntime)) {
+      throw const FormatException(
+        'BIN 快应用必须同时包含 manifest.json 与 app.js 或 app.jsc，已拒绝安装',
+      );
+    }
     if (manifests.isEmpty) {
       throw const FormatException('RPK 清单未包含有效包名，已拒绝安装');
     }
@@ -218,8 +266,10 @@ class InstallMetadataReader {
     if (packageNames.length != 1) {
       throw const FormatException('RPK 包含互相冲突的包名，已拒绝安装');
     }
-    final versions =
-        manifests.map((item) => item.versionCode).whereType<int>().toSet();
+    final versions = manifests
+        .map((item) => item.versionCode)
+        .whereType<int>()
+        .toSet();
     if (versions.length > 1) {
       throw const FormatException('RPK 清单包含互相冲突的版本号，已拒绝安装');
     }
@@ -235,14 +285,16 @@ class InstallMetadataReader {
 
   Uint8List? _resourceFromArchive(Uint8List bytes) {
     if (!_looksLikeZip(bytes)) return null;
-    final archive = _decodeArchive(bytes, '表盘');
+    final archive = decodeZipArchive(bytes, '表盘');
     for (final entry in archive.files) {
       if (entry.isFile && entry.name.toLowerCase().endsWith('resource.bin')) {
-        return Uint8List.fromList(_verifiedEntryBytes(
-          entry,
-          maxWatchfaceResourceBytes,
-          '表盘 resource.bin',
-        ));
+        return Uint8List.fromList(
+          readVerifiedArchiveEntry(
+            entry,
+            maxWatchfaceResourceBytes,
+            '表盘 resource.bin',
+          ),
+        );
       }
     }
     return null;
@@ -255,7 +307,10 @@ class InstallMetadataReader {
       (bytes[2] == 0x03 || bytes[2] == 0x05 || bytes[2] == 0x07) &&
       (bytes[3] == 0x04 || bytes[3] == 0x06 || bytes[3] == 0x08);
 
-  Archive _decodeArchive(Uint8List bytes, String label) {
+  /// Decodes ZIP central-directory metadata within the shared installation
+  /// package limits. Callers must CRC-check every entry they actually read via
+  /// [readVerifiedArchiveEntry].
+  static Archive decodeZipArchive(Uint8List bytes, String label) {
     try {
       // Do not use verify:true here: archive 3.x verifies by expanding every
       // entry, allowing an unrelated ZIP bomb entry to consume memory. Only
@@ -282,7 +337,12 @@ class InstallMetadataReader {
     }
   }
 
-  List<int> _verifiedEntryBytes(ArchiveFile entry, int limit, String label) {
+  /// Expands a selected archive entry with a byte limit and verifies its CRC.
+  static List<int> readVerifiedArchiveEntry(
+    ArchiveFile entry,
+    int limit,
+    String label,
+  ) {
     if (entry.size > limit) {
       throw FormatException('$label 超过安全上限');
     }
@@ -301,6 +361,23 @@ class InstallMetadataReader {
     return content;
   }
 
+  /// Canonicalizes a ZIP file entry name and rejects paths that could escape
+  /// the package root. Directory entries are intentionally handled by callers.
+  static String? normalizeArchiveEntryPath(String input) {
+    var name = input.replaceAll('\\', '/');
+    while (name.startsWith('./')) {
+      name = name.substring(2);
+    }
+    if (name.isEmpty ||
+        name.startsWith('/') ||
+        RegExp(r'^[A-Za-z]:').hasMatch(name)) {
+      return null;
+    }
+    final parts = name.split('/');
+    if (parts.any((part) => part == '..' || part.isEmpty)) return null;
+    return parts.where((part) => part != '.').join('/');
+  }
+
   String? _faceIdFromResource(Uint8List bytes) {
     // 已验证的表盘工具从资源头部读取数值 ID。读取固定候选区并只接受数字，
     // 不把文件名或随机 UUID 冒充设备侧 faceId。
@@ -308,14 +385,17 @@ class InstallMetadataReader {
     final raw = bytes.sublist(40, 56);
     final zero = raw.indexOf(0);
     final value = ascii
-        .decode(raw.sublist(0, zero < 0 ? raw.length : zero),
-            allowInvalid: true)
+        .decode(
+          raw.sublist(0, zero < 0 ? raw.length : zero),
+          allowInvalid: true,
+        )
         .trim();
     return RegExp(r'^\d+$').hasMatch(value) ? value : null;
   }
 
   ({List<WatchfaceResolution> resolutions, bool containsLua}) _inspectWatchface(
-      Uint8List bytes) {
+    Uint8List bytes,
+  ) {
     const known = <WatchfaceResolution>[
       WatchfaceResolution(336, 480),
       WatchfaceResolution(212, 520),
@@ -392,20 +472,24 @@ class InstallMetadataReader {
   }
 
   List<int> _utf16le(String value) => [
-        for (final unit in value.codeUnits) ...[unit & 0xff, unit >> 8],
-      ];
+    for (final unit in value.codeUnits) ...[unit & 0xff, unit >> 8],
+  ];
 }
 
 /// Isolate boundary uses only primitives and lists. This avoids accidentally
 /// capturing WidgetsBinding, BuildContext, file handles, or another unsendable
 /// Flutter object in the worker message.
 Future<Map<String, Object?>> _readMetadataInWorker(
-    int kindIndex, String path) async {
+  int kindIndex,
+  String path,
+) async {
   if (kindIndex < 0 || kindIndex >= InstallKind.values.length) {
     throw const FormatException('未知安装文件类型');
   }
-  final metadata = await InstallMetadataReader()
-      ._readDirect(InstallKind.values[kindIndex], path);
+  final metadata = await InstallMetadataReader()._readDirect(
+    InstallKind.values[kindIndex],
+    path,
+  );
   return <String, Object?>{
     'fileName': metadata.fileName,
     'fileSize': metadata.fileSize,

@@ -1,11 +1,16 @@
+import 'dart:io';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../../application/device_controller.dart';
+import '../../domain/install_file_classifier.dart';
 import '../../domain/install_metadata_reader.dart';
 import '../../domain/install_models.dart';
+import '../../domain/install_task.dart';
 import '../../domain/protocol/zau.dart';
 import '../../domain/queue_file_importer.dart';
+import '../../platform/scoped_file_picker.dart';
 
 import '../page_module.dart';
 
@@ -21,6 +26,7 @@ const wristloadPage = WristloadPageModule(
 
 Widget _buildDebugPage(WristloadPageContext context) =>
     DebugPage(controller: context.controller);
+
 class DebugPage extends StatefulWidget {
   const DebugPage({required this.controller, super.key});
 
@@ -32,6 +38,7 @@ class DebugPage extends StatefulWidget {
 
 class _DebugPageState extends State<DebugPage> {
   PlatformFile? _file;
+  String? _macOSFileName;
   InstallRequest? _request;
   bool _loading = false;
   String? _error;
@@ -54,6 +61,11 @@ class _DebugPageState extends State<DebugPage> {
 
   Future<void> _pickFile() async {
     if (widget.controller.debugInstallInProgress || _loading) return;
+    if (Platform.isMacOS) {
+      await _pickMacOSFile();
+      return;
+    }
+
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: const ['rpk', 'bin', 'face'],
@@ -65,13 +77,14 @@ class _DebugPageState extends State<DebugPage> {
       setState(() => _error = '无法读取所选文件路径。');
       return;
     }
-    final kind = QueueFileImporter.kindForPath(path);
+    final kind = _legacyKindForPath(path);
     if (kind == null) {
       setState(() => _error = '仅支持 .rpk、.bin、.face 文件。');
       return;
     }
     setState(() {
       _file = selected;
+      _macOSFileName = null;
       _request = null;
       _error = null;
       _loading = true;
@@ -90,6 +103,73 @@ class _DebugPageState extends State<DebugPage> {
         _error = '文件解析失败：$error';
       });
     }
+  }
+
+  Future<void> _pickMacOSFile() async {
+    try {
+      final selected = await ScopedFilePicker.pickFiles(
+        allowedExtensions: const ['rpk', 'bin', 'face'],
+      );
+      final source = selected?.single;
+      if (!mounted || source == null) return;
+
+      final fileName = source.path.split(RegExp(r'[/\\]')).last;
+      setState(() {
+        _file = null;
+        _macOSFileName = fileName;
+        _request = null;
+        _error = null;
+        _loading = true;
+      });
+
+      final classifiedSource = await const InstallFileClassifier()
+          .classifySource(source);
+      final classification = classifiedSource.type;
+      if (!mounted) return;
+      if (classification == InstallableFileType.firmware) {
+        setState(() {
+          _loading = false;
+          _error = '调试安装不支持固件包，请使用首页的固件检查入口。';
+        });
+        return;
+      }
+      final kind = switch (classification) {
+        InstallableFileType.quickApp => InstallKind.quickApp,
+        InstallableFileType.watchface => InstallKind.watchface,
+        InstallableFileType.unsupported => null,
+        InstallableFileType.firmware => null,
+      };
+      if (kind == null) {
+        setState(() {
+          _loading = false;
+          _error = '仅支持可安装的 .rpk、.bin 或 .face 文件。';
+        });
+        return;
+      }
+
+      final request = await QueueFileImporter().prepareSingle(
+        classifiedSource.source,
+        expectedKind: kind,
+      );
+      if (!mounted) return;
+      setState(() {
+        _request = request;
+        _loading = false;
+      });
+    } on Object catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _request = null;
+        _error = '文件解析失败：$error';
+      });
+    }
+  }
+
+  InstallKind? _legacyKindForPath(String path) {
+    final declaredKind = QueueFileImporter.kindForPath(path);
+    if (declaredKind != null) return declaredKind;
+    return path.toLowerCase().endsWith('.bin') ? InstallKind.watchface : null;
   }
 
   Future<void> _start() async {
@@ -158,8 +238,10 @@ class _DebugPageState extends State<DebugPage> {
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               Text('启动模式', style: theme.textTheme.titleMedium),
-                              Text('发送后手环会立即重启，蓝牙连接断开属于预期现象。',
-                                  style: theme.textTheme.bodySmall),
+                              Text(
+                                '发送后手环会立即重启，蓝牙连接断开属于预期现象。',
+                                style: theme.textTheme.bodySmall,
+                              ),
                             ],
                           ),
                         ),
@@ -172,7 +254,8 @@ class _DebugPageState extends State<DebugPage> {
                       children: [
                         for (final mode in DeviceBootMode.values)
                           FilledButton.icon(
-                            onPressed: running ||
+                            onPressed:
+                                running ||
                                     polling ||
                                     pullingDeviceLog ||
                                     switchingBootMode ||
@@ -181,11 +264,15 @@ class _DebugPageState extends State<DebugPage> {
                                     controller.selfCheckActive
                                 ? null
                                 : () => controller.switchBootMode(mode),
-                            icon: switchingBootMode &&
-                                    controller.pendingBootModeLabel == mode.label
+                            icon:
+                                switchingBootMode &&
+                                    controller.pendingBootModeLabel ==
+                                        mode.label
                                 ? const SizedBox.square(
                                     dimension: 18,
-                                    child: CircularProgressIndicator(strokeWidth: 2),
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
                                   )
                                 : const Icon(Icons.restart_alt),
                             label: Text('重启到 ${mode.label}'),
@@ -195,13 +282,18 @@ class _DebugPageState extends State<DebugPage> {
                     if (controller.pendingBootModeLabel case final mode?)
                       Padding(
                         padding: const EdgeInsets.only(top: 16),
-                        child: Text('已请求重启到 $mode，等待设备重启后重新连接。',
-                            style: theme.textTheme.bodyMedium),
+                        child: Text(
+                          '已请求重启到 $mode，等待设备重启后重新连接。',
+                          style: theme.textTheme.bodyMedium,
+                        ),
                       ),
                     if (controller.bootModeError case final error?)
                       Padding(
                         padding: const EdgeInsets.only(top: 12),
-                        child: Text(error, style: TextStyle(color: colors.error)),
+                        child: Text(
+                          error,
+                          style: TextStyle(color: colors.error),
+                        ),
                       ),
                   ],
                 ),
@@ -227,8 +319,10 @@ class _DebugPageState extends State<DebugPage> {
                             color: colors.surfaceContainerHigh,
                             borderRadius: BorderRadius.circular(12),
                           ),
-                          child: Icon(Icons.download_for_offline_outlined,
-                              color: colors.primary),
+                          child: Icon(
+                            Icons.download_for_offline_outlined,
+                            color: colors.primary,
+                          ),
                         ),
                         const SizedBox(width: 12),
                         Expanded(
@@ -236,8 +330,10 @@ class _DebugPageState extends State<DebugPage> {
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               Text('设备日志', style: theme.textTheme.titleMedium),
-                              Text('从设备拉取诊断日志并导出为原始文件。',
-                                  style: theme.textTheme.bodySmall),
+                              Text(
+                                '从设备拉取诊断日志并导出为原始文件。',
+                                style: theme.textTheme.bodySmall,
+                              ),
                             ],
                           ),
                         ),
@@ -245,8 +341,12 @@ class _DebugPageState extends State<DebugPage> {
                     ),
                     const SizedBox(height: 16),
                     FilledButton.icon(
-                      onPressed: running || polling || controller.selfCheckStarting ||
-                              controller.selfCheckActive || pullingDeviceLog
+                      onPressed:
+                          running ||
+                              polling ||
+                              controller.selfCheckStarting ||
+                              controller.selfCheckActive ||
+                              pullingDeviceLog
                           ? null
                           : controller.pullDeviceLog,
                       icon: pullingDeviceLog
@@ -263,15 +363,18 @@ class _DebugPageState extends State<DebugPage> {
                         controller.deviceLogSegmentTotal == 0
                             ? '正在等待设备开始发送日志。'
                             : '已接收 ${controller.deviceLogReceivedSegments}/'
-                                '${controller.deviceLogSegmentTotal} 个分片，'
-                                '${controller.deviceLogReceivedBytes} B。',
+                                  '${controller.deviceLogSegmentTotal} 个分片，'
+                                  '${controller.deviceLogReceivedBytes} B。',
                         style: theme.textTheme.bodyMedium,
                       ),
                     ],
                     if (controller.deviceLogError case final error?)
                       Padding(
                         padding: const EdgeInsets.only(top: 12),
-                        child: Text(error, style: TextStyle(color: colors.error)),
+                        child: Text(
+                          error,
+                          style: TextStyle(color: colors.error),
+                        ),
                       ),
                     if (controller.latestDeviceLogPath case final path?)
                       Padding(
@@ -289,7 +392,8 @@ class _DebugPageState extends State<DebugPage> {
             Card(
               color: colors.surfaceContainer,
               shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(16)),
+                borderRadius: BorderRadius.circular(16),
+              ),
               child: Padding(
                 padding: const EdgeInsets.all(20),
                 child: Column(
@@ -304,18 +408,24 @@ class _DebugPageState extends State<DebugPage> {
                             color: colors.surfaceContainerHigh,
                             borderRadius: BorderRadius.circular(12),
                           ),
-                          child: Icon(Icons.bug_report_outlined,
-                              color: colors.primary),
+                          child: Icon(
+                            Icons.bug_report_outlined,
+                            color: colors.primary,
+                          ),
                         ),
                         const SizedBox(width: 12),
                         Expanded(
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              Text('安装清理速度测试',
-                                  style: theme.textTheme.titleMedium),
-                              Text('取消安装后每 3 秒轮询设备清理状态，直到状态不再为 1。',
-                                  style: theme.textTheme.bodySmall),
+                              Text(
+                                '安装清理速度测试',
+                                style: theme.textTheme.titleMedium,
+                              ),
+                              Text(
+                                '取消安装后每 3 秒轮询设备清理状态，直到状态不再为 1。',
+                                style: theme.textTheme.bodySmall,
+                              ),
                             ],
                           ),
                         ),
@@ -343,16 +453,19 @@ class _DebugPageState extends State<DebugPage> {
                                     const Icon(Icons.insert_drive_file),
                                     const SizedBox(width: 10),
                                     Expanded(
-                                      child: Text(_file!.name,
-                                          overflow: TextOverflow.ellipsis),
+                                      child: Text(
+                                        _file?.name ?? _macOSFileName!,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
                                     ),
                                     if (request != null)
                                       Text(_size(request.metadata.fileSize)),
                                     TextButton(
-                                        onPressed: running || _loading
-                                            ? null
-                                            : _pickFile,
-                                        child: const Text('重新选择')),
+                                      onPressed: running || _loading
+                                          ? null
+                                          : _pickFile,
+                                      child: const Text('重新选择'),
+                                    ),
                                   ],
                                 ),
                         ),
@@ -368,8 +481,8 @@ class _DebugPageState extends State<DebugPage> {
                         FilledButton.icon(
                           onPressed:
                               request == null || running || polling || _loading
-                                  ? null
-                                  : _start,
+                              ? null
+                              : _start,
                           icon: const Icon(Icons.play_arrow),
                           label: const Text('开始测试安装'),
                         ),
@@ -393,25 +506,32 @@ class _DebugPageState extends State<DebugPage> {
                       Row(
                         children: [
                           const SizedBox.square(
-                              dimension: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2)),
+                            dimension: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          ),
                           const SizedBox(width: 10),
-                          Text('正在每 3 秒轮询设备清理状态…',
-                              style: theme.textTheme.bodyMedium),
+                          Text(
+                            '正在每 3 秒轮询设备清理状态…',
+                            style: theme.textTheme.bodyMedium,
+                          ),
                         ],
                       ),
                     ],
                     if (_error case final error?)
                       Padding(
                         padding: const EdgeInsets.only(top: 12),
-                        child:
-                            Text(error, style: TextStyle(color: colors.error)),
+                        child: Text(
+                          error,
+                          style: TextStyle(color: colors.error),
+                        ),
                       ),
                     if (controller.debugError case final error?)
                       Padding(
                         padding: const EdgeInsets.only(top: 12),
-                        child:
-                            Text(error, style: TextStyle(color: colors.error)),
+                        child: Text(
+                          error,
+                          style: TextStyle(color: colors.error),
+                        ),
                       ),
                     if (cleanupLogs.isNotEmpty) ...[
                       const SizedBox(height: 16),
@@ -451,15 +571,18 @@ class _DebugPageState extends State<DebugPage> {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Text(result.stoppedByUser
-                                ? '轮询已停止'
-                                : result.completed
-                                    ? '设备清理轮询结束'
-                                    : '设备清理查询结束',
-                                style: theme.textTheme.titleSmall),
+                            Text(
+                              result.stoppedByUser
+                                  ? '轮询已停止'
+                                  : result.completed
+                                  ? '设备清理轮询结束'
+                                  : '设备清理查询结束',
+                              style: theme.textTheme.titleSmall,
+                            ),
                             const SizedBox(height: 4),
                             Text(
-                                '用时 ${(result.elapsed.inMilliseconds / 1000).toStringAsFixed(1)} 秒 · 轮询 ${result.pollCount} 次 · 最终状态 ${result.finalStatus ?? '未知'}'),
+                              '用时 ${(result.elapsed.inMilliseconds / 1000).toStringAsFixed(1)} 秒 · 轮询 ${result.pollCount} 次 · 最终状态 ${result.finalStatus ?? '未知'}',
+                            ),
                           ],
                         ),
                       ),
@@ -488,18 +611,21 @@ class _DebugPageState extends State<DebugPage> {
                             color: colors.surfaceContainerHigh,
                             borderRadius: BorderRadius.circular(12),
                           ),
-                          child: Icon(Icons.fact_check_outlined,
-                              color: colors.primary),
+                          child: Icon(
+                            Icons.fact_check_outlined,
+                            color: colors.primary,
+                          ),
                         ),
                         const SizedBox(width: 12),
                         Expanded(
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              Text('设备自检',
-                                  style: theme.textTheme.titleMedium),
-                              Text('进入自检后等待手环主动上报结果。',
-                                  style: theme.textTheme.bodySmall),
+                              Text('设备自检', style: theme.textTheme.titleMedium),
+                              Text(
+                                '进入自检后等待手环主动上报结果。',
+                                style: theme.textTheme.bodySmall,
+                              ),
                             ],
                           ),
                         ),
@@ -511,7 +637,10 @@ class _DebugPageState extends State<DebugPage> {
                       runSpacing: 10,
                       children: [
                         FilledButton.icon(
-                          onPressed: running || polling || pullingDeviceLog ||
+                          onPressed:
+                              running ||
+                                  polling ||
+                                  pullingDeviceLog ||
                                   controller.selfCheckStarting ||
                                   controller.selfCheckModeSwitching ||
                                   controller.selfCheckEntered
@@ -520,15 +649,20 @@ class _DebugPageState extends State<DebugPage> {
                           icon: controller.selfCheckModeSwitching
                               ? const SizedBox.square(
                                   dimension: 18,
-                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
                                 )
-                          : const Icon(Icons.play_arrow),
-                          label: Text(controller.selfCheckModeSwitching
-                              ? '正在进入自检'
-                              : '进入自检模式'),
+                              : const Icon(Icons.play_arrow),
+                          label: Text(
+                            controller.selfCheckModeSwitching
+                                ? '正在进入自检'
+                                : '进入自检模式',
+                          ),
                         ),
                         FilledButton.icon(
-                          onPressed: controller.selfCheckEntered &&
+                          onPressed:
+                              controller.selfCheckEntered &&
                                   !controller.selfCheckStarting &&
                                   !controller.selfCheckModeSwitching &&
                                   !controller.selfCheckActive
@@ -537,15 +671,18 @@ class _DebugPageState extends State<DebugPage> {
                           icon: controller.selfCheckStarting
                               ? const SizedBox.square(
                                   dimension: 18,
-                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
                                 )
                               : const Icon(Icons.fact_check_outlined),
-                          label: Text(controller.selfCheckStarting
-                              ? '正在启动自检'
-                              : '开始自检'),
+                          label: Text(
+                            controller.selfCheckStarting ? '正在启动自检' : '开始自检',
+                          ),
                         ),
                         OutlinedButton.icon(
-                          onPressed: controller.selfCheckStarting ||
+                          onPressed:
+                              controller.selfCheckStarting ||
                                   controller.selfCheckModeLoading ||
                                   controller.selfCheckModeSwitching
                               ? null
@@ -553,13 +690,16 @@ class _DebugPageState extends State<DebugPage> {
                           icon: controller.selfCheckModeLoading
                               ? const SizedBox.square(
                                   dimension: 18,
-                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
                                 )
                               : const Icon(Icons.refresh),
                           label: const Text('读取当前模式'),
                         ),
                         OutlinedButton.icon(
-                          onPressed: controller.selfCheckEntered &&
+                          onPressed:
+                              controller.selfCheckEntered &&
                                   !controller.selfCheckStarting &&
                                   !controller.selfCheckModeSwitching
                               ? controller.exitSelfCheck
@@ -585,8 +725,10 @@ class _DebugPageState extends State<DebugPage> {
                             child: CircularProgressIndicator(strokeWidth: 2),
                           ),
                           const SizedBox(width: 10),
-                          Text('设备正在自检，等待结果上报。',
-                              style: theme.textTheme.bodyMedium),
+                          Text(
+                            '设备正在自检，等待结果上报。',
+                            style: theme.textTheme.bodyMedium,
+                          ),
                         ],
                       ),
                     ],
@@ -595,22 +737,29 @@ class _DebugPageState extends State<DebugPage> {
                         !controller.selfCheckStarting)
                       Padding(
                         padding: const EdgeInsets.only(top: 16),
-                        child: Text('已进入自检模式，可以开始自检或退出。',
-                            style: theme.textTheme.bodyMedium),
+                        child: Text(
+                          '已进入自检模式，可以开始自检或退出。',
+                          style: theme.textTheme.bodyMedium,
+                        ),
                       ),
                     if (controller.currentSelfCheckMode case final mode?)
                       Padding(
                         padding: const EdgeInsets.only(top: 12),
-                        child: Text('设备模式值：$mode（3 表示设备正在执行自检）',
-                            style: theme.textTheme.bodySmall),
+                        child: Text(
+                          '设备模式值：$mode（3 表示设备正在执行自检）',
+                          style: theme.textTheme.bodySmall,
+                        ),
                       ),
                     if (controller.selfCheckError case final error?)
                       Padding(
                         padding: const EdgeInsets.only(top: 12),
-                        child: Text(error,
-                            style: TextStyle(color: colors.error)),
+                        child: Text(
+                          error,
+                          style: TextStyle(color: colors.error),
+                        ),
                       ),
-                    if (controller.latestSelfCheckReport case final result?) ...[
+                    if (controller.latestSelfCheckReport
+                        case final result?) ...[
                       const SizedBox(height: 16),
                       Container(
                         width: double.infinity,
@@ -629,11 +778,16 @@ class _DebugPageState extends State<DebugPage> {
                               style: theme.textTheme.titleSmall,
                             ),
                             const SizedBox(height: 4),
-                            Text('通过 ${result.passedCount}/${result.items.length} 项'),
+                            Text(
+                              '通过 ${result.passedCount}/${result.items.length} 项',
+                            ),
                             const SizedBox(height: 8),
                             SelectableText(
                               result.items
-                                  .map((item) => '项目 ${item.id}: ${item.passed ? 'PASS' : 'FAIL'}')
+                                  .map(
+                                    (item) =>
+                                        '项目 ${item.id}: ${item.passed ? 'PASS' : 'FAIL'}',
+                                  )
                                   .join('\n'),
                               style: theme.textTheme.bodySmall?.copyWith(
                                 fontFamily: 'monospace',
@@ -674,13 +828,15 @@ class _DebugDashedPainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1;
     final path = Path()
-      ..addRRect(RRect.fromRectAndRadius(
-          Offset.zero & size, const Radius.circular(12)));
+      ..addRRect(
+        RRect.fromRectAndRadius(Offset.zero & size, const Radius.circular(12)),
+      );
     for (final metric in path.computeMetrics()) {
       for (var offset = 0.0; offset < metric.length; offset += 10) {
         canvas.drawPath(
-            metric.extractPath(offset, (offset + 6).clamp(0, metric.length)),
-            paint);
+          metric.extractPath(offset, (offset + 6).clamp(0, metric.length)),
+          paint,
+        );
       }
     }
   }

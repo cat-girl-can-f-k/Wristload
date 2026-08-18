@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -8,6 +10,7 @@ import '../../application/device_controller.dart';
 import '../../application/diagnostic_log_service.dart';
 import '../../domain/auth_key_binding.dart';
 import '../../domain/firmware_package_inspector.dart';
+import '../../domain/install_file_classifier.dart';
 import '../../domain/install_models.dart';
 import '../../domain/install_task.dart';
 import '../../domain/install_preference_store.dart';
@@ -75,12 +78,19 @@ class HomePage extends StatelessWidget {
       allowedExtensions: const ['zip', 'bin'],
     );
     final file = selected?.single;
-    final path = file?.path;
-    if (path == null || !context.mounted) return;
+    if (file == null || !context.mounted) return;
+    await _inspectFirmware(context, file);
+  }
+
+  Future<void> _inspectFirmware(
+    BuildContext context,
+    ScopedFileRef file,
+  ) async {
+    final path = file.path;
 
     try {
       final inspection = await SecurityScopedFileAccess.instance.withAccess(
-        file!,
+        file,
         (resolved) => const FirmwarePackageInspector().inspect(resolved.path),
       );
       if (!context.mounted) return;
@@ -112,12 +122,105 @@ class HomePage extends StatelessWidget {
   Future<void> _pickAndTry(BuildContext context, InstallKind kind) async {
     final extensions = kind == InstallKind.watchface
         ? const ['bin', 'face']
+        : Platform.isMacOS
+        ? const ['rpk', 'bin']
         : const ['rpk'];
     final selected = await ScopedFilePicker.pickFiles(
       allowedExtensions: extensions,
     );
     final source = selected?.single;
     if (source == null) return;
+    // The content inspection below is macOS-specific because it must retain
+    // the security-scoped bookmark returned by the native file picker. Other
+    // platforms keep their established extension-based import path.
+    if (!Platform.isMacOS) {
+      await _prepareAndTry(context, source, kind);
+      return;
+    }
+    await _tryImportSource(context, source, expectedKind: kind);
+  }
+
+  Future<void> _handleDrop(
+    BuildContext context,
+    DropDoneDetails details,
+  ) async {
+    for (final error in details.errors) {
+      controller.reportError('无法拖入文件：${error.message}');
+    }
+    for (final file in details.files) {
+      if (!context.mounted) return;
+      await _tryImportSource(
+        context,
+        ScopedFileRef(path: file.path, bookmark: file.extraAppleBookmark),
+      );
+    }
+  }
+
+  Future<void> _tryImportSource(
+    BuildContext context,
+    ScopedFileRef source, {
+    InstallKind? expectedKind,
+  }) async {
+    final fileName = source.path.split(RegExp(r'[/\\]')).last;
+    if (!_isMacOSInstallCandidate(source.path)) {
+      controller.reportError('不支持的安装文件：$fileName');
+      return;
+    }
+    try {
+      final classifiedSource = await const InstallFileClassifier()
+          .classifySource(source);
+      final classification = classifiedSource.type;
+      final resolvedSource = classifiedSource.source;
+      if (!context.mounted) return;
+      switch (classification) {
+        case InstallableFileType.firmware:
+          if (expectedKind != null) {
+            controller.reportError('所选文件是固件包，请使用固件检查入口。');
+            return;
+          }
+          await _inspectFirmware(context, resolvedSource);
+          return;
+        case InstallableFileType.quickApp:
+          if (expectedKind == InstallKind.watchface) {
+            controller.reportError('所选文件是快应用，请从快应用入口安装。');
+            return;
+          }
+          await _prepareAndTry(context, resolvedSource, InstallKind.quickApp);
+          return;
+        case InstallableFileType.watchface:
+          if (expectedKind == InstallKind.quickApp) {
+            final suffix = fileName.toLowerCase().endsWith('.bin')
+                ? '；合法快应用 .bin 必须同时包含 manifest.json 与 app.js 或 app.jsc'
+                : '';
+            controller.reportError('所选文件不是合法的快应用$suffix。');
+            return;
+          }
+          await _prepareAndTry(context, resolvedSource, InstallKind.watchface);
+          return;
+        case InstallableFileType.unsupported:
+          controller.reportError('不支持的安装文件：$fileName');
+          return;
+      }
+    } on Object catch (error) {
+      controller.reportError('无法识别安装文件 $fileName：$error');
+    }
+  }
+
+  bool _isMacOSInstallCandidate(String path) {
+    final name = path.split(RegExp(r'[/\\]')).last;
+    final dot = name.lastIndexOf('.');
+    final extension = dot < 0 ? '' : name.substring(dot + 1).toLowerCase();
+    // `.zip` is retained for drag-dropped firmware. The classifier accepts
+    // it only when it contains ota.sh, so ordinary ZIP files never enter the
+    // installation queue.
+    return extension == 'zip' || InstallFileClassifier.supportsPath(path);
+  }
+
+  Future<void> _prepareAndTry(
+    BuildContext context,
+    ScopedFileRef source,
+    InstallKind kind,
+  ) async {
     try {
       final importedRequest = await QueueFileImporter().prepareSingle(
         source,
@@ -439,7 +542,7 @@ class HomePage extends StatelessWidget {
         storageTotal != null &&
         storageTotal > 0 &&
         storageUsed <= storageTotal;
-    return SafeArea(
+    final content = SafeArea(
       child: Align(
         alignment: Alignment.topCenter,
         child: ConstrainedBox(
@@ -548,6 +651,15 @@ class HomePage extends StatelessWidget {
                       if (!connected && controller.bluetoothUnavailable) ...[
                         _BluetoothUnavailableBanner(
                           message: controller.bluetoothStateMessage,
+                          onOpenBluetoothPrivacySettings:
+                              Platform.isMacOS &&
+                                  controller
+                                      .macOSBluetoothPrivacySettingsRequired
+                              ? () => unawaited(
+                                  controller
+                                      .openMacOSBluetoothPrivacySettings(),
+                                )
+                              : null,
                         ),
                         const SizedBox(height: 12),
                       ],
@@ -706,6 +818,11 @@ class HomePage extends StatelessWidget {
         ),
       ),
     );
+    if (!Platform.isMacOS) return content;
+    return DropTarget(
+      onDragDone: (details) => unawaited(_handleDrop(context, details)),
+      child: content,
+    );
   }
 }
 
@@ -799,9 +916,13 @@ class _SavedDeviceTile extends StatelessWidget {
 }
 
 class _BluetoothUnavailableBanner extends StatelessWidget {
-  const _BluetoothUnavailableBanner({required this.message});
+  const _BluetoothUnavailableBanner({
+    required this.message,
+    this.onOpenBluetoothPrivacySettings,
+  });
 
   final String message;
+  final VoidCallback? onOpenBluetoothPrivacySettings;
 
   @override
   Widget build(BuildContext context) {
@@ -815,17 +936,34 @@ class _BluetoothUnavailableBanner extends StatelessWidget {
         borderRadius: BorderRadius.circular(8),
         border: Border.all(color: colors.error.withValues(alpha: 0.35)),
       ),
-      child: Row(
+      child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(Icons.bluetooth_disabled, color: colors.onErrorContainer),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              message,
-              style: TextStyle(color: colors.onErrorContainer),
-            ),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(Icons.bluetooth_disabled, color: colors.onErrorContainer),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  message,
+                  style: TextStyle(color: colors.onErrorContainer),
+                ),
+              ),
+            ],
           ),
+          if (onOpenBluetoothPrivacySettings != null) ...[
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: OutlinedButton.icon(
+                key: const ValueKey('open-bluetooth-privacy-settings'),
+                onPressed: onOpenBluetoothPrivacySettings,
+                icon: const Icon(Icons.settings_outlined),
+                label: const Text('打开蓝牙隐私设置'),
+              ),
+            ),
+          ],
         ],
       ),
     );

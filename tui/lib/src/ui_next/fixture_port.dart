@@ -232,6 +232,10 @@ final class FakeUiNextPort implements UiNextPort {
   }
 
   @override
+  Future<UiActionResult> connectDirectedExactAddress() async =>
+      const UiActionResult.rejected('预览没有配置定向 Classic 设备。');
+
+  @override
   Future<UiActionResult> disconnect() {
     _emit(_snapshot.copyWith(
       revision: _snapshot.revision + 1,

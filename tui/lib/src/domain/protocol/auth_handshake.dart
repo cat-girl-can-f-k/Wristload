@@ -26,12 +26,22 @@ abstract final class XiaomiAuth {
 
   /// 构建官方 `abu{e=1,f=26,bc0.field30=hc0}` 验证请求。
   ///
-  /// 与 App `WearAuthV2.i()`（sendAppVerify）一致：本地绑定模式（手环 9）
-  /// 必须携带 appDeviceId，否则手环固件（已存绑定 appDeviceId）忽略报文。
-  /// `hasOob = !oob.isEmpty()`（App 为 `true ^ TextUtils.isEmpty(oob)`）。
-  /// 仅使用 authkey；不要求小米账号或 appDeviceId。
-  static List<int> buildNonceCommand(List<int> nonce) {
+  /// 与 App WearAuthV2.i()（sendAppVerify）一致：始终发送 16 字节 phone
+  /// nonce；只有显式 appDeviceId 存在时才发送 field 2 和 hasOob field 3。
+  /// 官方 Classic SppConnection 会传入可空 appDeviceId，且 OOB 为空，
+  /// 因此 nonce-only f=26 是有效分支。appDeviceId/OOB 绝不能从 MAC 或
+  /// authkey 推导或替代。
+  static List<int> buildNonceCommand(
+    List<int> nonce, {
+    String? appDeviceId,
+    bool hasOob = false,
+  }) {
     final verify = ProtoWriter()..writeBytes(1, nonce);
+    final id = appDeviceId?.trim();
+    if (id != null && id.isNotEmpty) {
+      verify.writeString(2, id);
+      if (hasOob) verify.writeBool(3, true);
+    }
     final command = ProtoWriter()..writeMessage(30, verify.bytes);
     final envelope = ProtoWriter()
       ..writeInt(1, commandType)
@@ -61,6 +71,8 @@ abstract final class XiaomiAuth {
       List<int>? appNonce;
       List<int>? watchNonce;
       List<int>? watchHmac;
+      String? appDeviceId;
+      var hasOob = false;
       while (!r.isAtEnd) {
         final (field, wire) = r.readFieldHeader();
         if (field == 1 && wire == 0) {
@@ -79,6 +91,11 @@ abstract final class XiaomiAuth {
                 final (verifyField, verifyWire) = verify.readFieldHeader();
                 if (verifyField == 1 && verifyWire == 2) {
                   appNonce = verify.readBytes();
+                } else if (verifyField == 2 && verifyWire == 2) {
+                  appDeviceId =
+                      utf8.decode(verify.readBytes(), allowMalformed: true);
+                } else if (verifyField == 3 && verifyWire == 0) {
+                  hasOob = verify.readVarint() != 0;
                 } else {
                   verify.skipField(verifyWire);
                 }
@@ -121,6 +138,8 @@ abstract final class XiaomiAuth {
         status: status,
         authStatus: authStatus,
         appNonce: appNonce,
+        appDeviceId: appDeviceId,
+        hasOob: hasOob,
         watchNonce: watchNonce,
         watchHmac: watchHmac,
       );
@@ -129,8 +148,9 @@ abstract final class XiaomiAuth {
     }
   }
 
-  /// HKDF-SHA256（与 `nud`/Gadgetbridge `computeAuthStep3Hmac` 一致）：
-  /// PRK = HMAC(key=phoneNonce‖watchNonce, secretKey)，
+  /// HKDF-SHA256（与 APK `WearAuthV2.m53570j` → `o6o.m83454i` →
+  /// `nud.m82787f` 一致）：
+  /// PRK = HMAC(key=phoneNonce‖watchNonce, data=authkey)，
   /// OKM = Expand(PRK, info="miwear-auth", 64B)，取 64B。
   static List<int> computeStep3Hmac(
     List<int> secretKey,
@@ -172,6 +192,7 @@ abstract final class XiaomiAuth {
     int sdkInt = 34,
     String phoneModel = 'XiaoMi',
     String region = 'CN',
+    String? oob,
     // 表盘自定义工具在 SPP 模式只声明 0xE0。此前沿用官方完整 App 的
     // 25237220 会向设备宣称本工具并未实现的大量常驻能力；设备确认鉴权后
     // 会立即终止该不完整客户端。跨平台安装器应只声明实际支持的最小集合。
@@ -182,9 +203,14 @@ abstract final class XiaomiAuth {
     final appKey = okm.sublist(16, 32);
     final appIv = okm.sublist(36, 40);
 
-    // 校验设备签名：HMAC(DeviceKey, watchNonce‖phoneNonce)
-    final expectedDeviceSign =
-        hmacSha256(deviceKey, [...watchNonce, ...phoneNonce]);
+    // APK appends the independent OOB value to the device-sign input when
+    // present. appDeviceId belongs only to f=26 hc0 and must not be reused.
+    final deviceSignInput = <int>[...watchNonce, ...phoneNonce];
+    final oobValue = oob?.trim();
+    if (oobValue != null && oobValue.isNotEmpty) {
+      deviceSignInput.addAll(utf8.encode(oobValue));
+    }
+    final expectedDeviceSign = hmacSha256(deviceKey, deviceSignInput);
     if (!_constTimeEquals(expectedDeviceSign, watchHmac)) {
       return null;
     }
@@ -273,6 +299,8 @@ class ParsedAuthCommand {
     this.status,
     this.authStatus,
     this.appNonce,
+    this.appDeviceId,
+    this.hasOob = false,
     this.watchNonce,
     this.watchHmac,
   });
@@ -282,6 +310,8 @@ class ParsedAuthCommand {
   final int? status;
   final int? authStatus;
   final List<int>? appNonce;
+  final String? appDeviceId;
+  final bool hasOob;
   final List<int>? watchNonce;
   final List<int>? watchHmac;
 }

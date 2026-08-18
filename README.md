@@ -14,21 +14,62 @@
   CoreBluetooth 扫描、IOBluetooth SPP、Keychain 和沙盒文件授权，仍需目标设备真机安装验收；
   Linux 仅保留明确的不支持提示。
 
-## 环境
+## 自行编译和运行
 
-需要内置 Dart 3.9.2+ 的 Flutter stable 和各平台开发工具（当前已验证
-Flutter 3.44.8 / Dart 3.12.2）。安装 SDK 后，在本目录运行：
+本仓库有两个独立入口：根目录是 Flutter GUI，`tui/` 是只支持 macOS 的终端程序。两者不能互相替代；TUI 不会启动 Flutter，也不依赖 GUI 运行时。
 
-```shell
+### Flutter GUI
+
+准备 Flutter stable（内置 Dart 3.9.2+；当前已验证 Flutter 3.44.8 / Dart 3.12.2）以及目标平台的开发环境。在仓库根目录执行：
+
+```sh
 flutter pub get
-flutter run -d windows
 flutter run -d macos
+
+# 或在 Windows 上运行
+flutter run -d windows
 ```
+
+仅构建而不启动时，分别使用：
+
+```sh
+flutter build macos --debug
+flutter build windows --debug
+```
+
+Windows 也提供会先更新页面注册表的构建脚本。PowerShell 中执行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tool\build_windows_only.ps1
+```
+
+脚本默认从 `C:\src\flutter` 寻找 Flutter；使用其他位置时传入 `-FlutterRoot`。发布 GUI 可使用 `flutter build macos --release`。
+
+### macOS TUI
+
+TUI 需要 macOS、Xcode Command Line Tools、CMake 和 Dart SDK；原生 Bluetooth helper 不需要 Flutter。下面的命令从仓库根目录开始，先构建并 ad-hoc 签名 helper，再启动交互式 TUI：
+
+```sh
+cd tui
+dart pub get
+cd macos_bridge
+./scripts/package_bundle.sh --ad-hoc
+cd ..
+dart run bin/wristload_tui.dart
+```
+
+需要较完整的本地编译检查时，在 `tui/` 执行：
+
+```sh
+dart analyze lib test bin tool
+dart test
+```
+
+`package_bundle.sh --ad-hoc` 会运行 CMake 构建与不依赖硬件的 CTest，并把已签名 helper 放到 TUI 默认读取的位置。可用 `dart run bin/wristload_tui.dart --probe` 只检查 TUI 到 helper 的启动与 JSONL 握手；`--fixture ready` 可预览纯内存界面，两者都不连接设备。更多 TUI 操作说明见 [`tui/README.md`](tui/README.md)。
 
 Android 原生工程已生成，最低 SDK 需保持为 21+，并已声明附近设备/蓝牙扫描/连接权限。不要让 Flutter 模板重新生成时覆盖 `lib/` 或 `pubspec.yaml`。
 macOS 最低版本为 10.15。首次连接前需在系统蓝牙设置中完成配对；应用会通过设备广播名将
 CoreBluetooth 标识映射到已配对的经典蓝牙设备。广播名不唯一时会拒绝猜测，避免连接到错误设备。
-发布构建可使用 `flutter build macos --release`。
 
 当前工作站验证状态（2026-08-10）：
 

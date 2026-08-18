@@ -32,6 +32,8 @@ enum TuiBackendInstallState {
 
 enum TuiBackendDeviceSource { inquiry, paired, manual }
 
+enum TuiBackendIdentityState { unresolved, provisional, confirmed }
+
 final class TuiBackendDevice {
   const TuiBackendDevice({
     required this.address,
@@ -52,6 +54,24 @@ final class TuiBackendDevice {
   final Set<TuiBackendDeviceSource> sources;
 
   bool get supported => profile?.generation == ProtocolGeneration.v2Vela;
+}
+
+/// Explicit Xiaomi WearAuthV2 binding material for one connection attempt.
+/// This DTO never derives values from a Bluetooth address or authkey.
+final class TuiBackendBindingMaterial {
+  TuiBackendBindingMaterial({required this.appDeviceId, this.oob}) {
+    if (appDeviceId.trim().isEmpty) {
+      throw ArgumentError.value(appDeviceId, 'appDeviceId');
+    }
+    if (oob != null && oob!.trim().isEmpty) {
+      throw ArgumentError.value(oob, 'oob');
+    }
+  }
+
+  final String appDeviceId;
+  final String? oob;
+
+  bool get hasOob => oob != null;
 }
 
 final class TuiBackendInstallation {
@@ -88,6 +108,13 @@ final class TuiBackendSnapshot {
     required this.devices,
     required this.authKeyLoaded,
     this.activeDeviceAddress,
+    this.identityCandidateId,
+    this.identityState,
+    this.identityGeneration,
+    this.connectionId,
+    this.connectionGeneration,
+    this.applicationAttemptGeneration,
+    this.protocolAuthenticated = false,
     this.message,
     this.failureCode,
     this.installation,
@@ -100,6 +127,17 @@ final class TuiBackendSnapshot {
   final TuiBackendConnectionState connection;
   final List<TuiBackendDevice> devices;
   final String? activeDeviceAddress;
+  final String? identityCandidateId;
+  final TuiBackendIdentityState? identityState;
+  final int? identityGeneration;
+  final String? connectionId;
+
+  /// Logical application connection-attempt generation. This fences stale
+  /// UI/application work and is intentionally separate from the native
+  /// RFCOMM [connectionGeneration].
+  final int? connectionGeneration;
+  final int? applicationAttemptGeneration;
+  final bool protocolAuthenticated;
   final String? message;
   final String? failureCode;
   final TuiBackendInstallation? installation;
@@ -124,7 +162,22 @@ abstract interface class TuiBackendPort {
     required String address,
     required String name,
     DeviceProfile? profile,
+    bool requireConfirmedIdentity = false,
+
+    /// True only when the user explicitly selected this exact Classic address
+    /// from a current Classic discovery row, or supplied it as a temporary
+    /// launch target. Saved-device reconnect and auto-connect leave this
+    /// false.
+    bool directedExactAddress = false,
+    int? attemptGeneration,
+
+    /// Optional explicit Xiaomi material for this device. A null value uses
+    /// the official Classic nonce-only f=26 branch; callers must never derive
+    /// a replacement from the address or authkey.
+    required TuiBackendBindingMaterial? bindingMaterial,
   });
+
+  Future<void> confirmActiveIdentity({required int attemptGeneration});
 
   /// Loads a key into protocol memory. Implementations must not log or publish
   /// the value. This may be called before connectByAddress for auto-connect.

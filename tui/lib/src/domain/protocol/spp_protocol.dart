@@ -26,6 +26,11 @@ abstract final class SppProtocol {
   static const int cmdL1StartReq = 1;
   static const int cmdL1StartRsp = 2;
 
+  static const int l1ConfigTypeVersion = 1;
+  static const int l1ConfigTypeMps = 2;
+  static const int l1ConfigTypeTxWindow = 3;
+  static const int l1ConfigTypeSendTimeout = 4;
+
   static const int channelPb = 1;
   static const int channelMass = 2;
 
@@ -73,28 +78,106 @@ abstract final class SppProtocol {
   /// L1START_REQ（cmd=1 + 21B config）——App createCmdData 逐字节一致。
   static Uint8List buildL1StartRequest() {
     final config = BytesBuilder()
-      ..addByte(1) // CONFIG_TYPE_VERSION
+      ..addByte(l1ConfigTypeVersion) // CONFIG_TYPE_VERSION
       ..addByte(0x03)
       ..addByte(0x00)
       ..addByte(0x01) // 版本 1.0.0
       ..addByte(0x00)
       ..addByte(0x00)
-      ..addByte(2) // CONFIG_TYPE_MPS = 0xFC00
+      ..addByte(l1ConfigTypeMps) // CONFIG_TYPE_MPS = 0xFC00
       ..addByte(0x02)
       ..addByte(0x00)
       ..addByte(0x00)
       ..addByte(0xfc)
-      ..addByte(3) // CONFIG_TYPE_TX_WIN = 32
+      ..addByte(l1ConfigTypeTxWindow) // CONFIG_TYPE_TX_WIN = 32
       ..addByte(0x02)
       ..addByte(0x00)
       ..addByte(0x20)
       ..addByte(0x00)
-      ..addByte(4) // CONFIG_TYPE_SEND_TIMEOUT = 10000
+      ..addByte(l1ConfigTypeSendTimeout) // CONFIG_TYPE_SEND_TIMEOUT = 10000
       ..addByte(0x02)
       ..addByte(0x00)
       ..addByte(0x10)
       ..addByte(0x27);
     return encodeCmd(cmdL1StartReq, config.toBytes());
+  }
+
+  /// Parses the config tail of a `CMD_L1START_RSP`.
+  ///
+  /// The Xiaomi L1 reference implementation treats the payload as
+  /// `[cmd][type][length LE16][value]...`, not as a one-byte command. Empty
+  /// config tails remain valid for compatibility with devices that omit
+  /// negotiation fields. Unknown, well-formed fields are intentionally
+  /// ignored, while malformed field boundaries and malformed known fields fail
+  /// closed before authentication can begin.
+  static L1StartConfiguration parseL1StartResponse(List<int> payload) {
+    if (payload.isEmpty || payload.first != cmdL1StartRsp) {
+      throw const FormatException('Expected a CMD_L1START_RSP payload.');
+    }
+
+    var offset = 1;
+    var tlvCount = 0;
+    var unknownTlvCount = 0;
+    int? versionMajor;
+    int? versionMinor;
+    int? versionPatch;
+    int? remoteMps;
+    int? remoteTxWindow;
+    int? remoteSendTimeoutMs;
+
+    while (offset < payload.length) {
+      if (payload.length - offset < 3) {
+        throw const FormatException('Truncated L1START configuration header.');
+      }
+      final type = payload[offset];
+      final length = payload[offset + 1] | (payload[offset + 2] << 8);
+      offset += 3;
+      final valueEnd = offset + length;
+      if (valueEnd > payload.length) {
+        throw const FormatException('Truncated L1START configuration value.');
+      }
+
+      switch (type) {
+        case l1ConfigTypeVersion:
+          if (length != 3) {
+            throw const FormatException('Invalid L1START version length.');
+          }
+          versionMajor = payload[offset];
+          versionMinor = payload[offset + 1];
+          versionPatch = payload[offset + 2];
+        case l1ConfigTypeMps:
+          if (length != 2) {
+            throw const FormatException('Invalid L1START MPS length.');
+          }
+          remoteMps = payload[offset] | (payload[offset + 1] << 8);
+        case l1ConfigTypeTxWindow:
+          if (length != 2) {
+            throw const FormatException('Invalid L1START TX window length.');
+          }
+          remoteTxWindow = payload[offset] | (payload[offset + 1] << 8);
+        case l1ConfigTypeSendTimeout:
+          if (length != 2) {
+            throw const FormatException('Invalid L1START send timeout length.');
+          }
+          remoteSendTimeoutMs = payload[offset] | (payload[offset + 1] << 8);
+        default:
+          unknownTlvCount++;
+      }
+
+      tlvCount++;
+      offset = valueEnd;
+    }
+
+    return L1StartConfiguration(
+      tlvCount: tlvCount,
+      unknownTlvCount: unknownTlvCount,
+      versionMajor: versionMajor,
+      versionMinor: versionMinor,
+      versionPatch: versionPatch,
+      remoteMps: remoteMps,
+      remoteTxWindow: remoteTxWindow,
+      remoteSendTimeoutMs: remoteSendTimeoutMs,
+    );
   }
 
   /// DATA 帧（type=3）：L2Packet = `[channel][opCode][payload]`。
@@ -193,6 +276,34 @@ class SppPacket {
   final int type;
   final int seq;
   final List<int> payload;
+}
+
+/// Non-secret L1START transport parameters negotiated by the remote device.
+final class L1StartConfiguration {
+  const L1StartConfiguration({
+    required this.tlvCount,
+    required this.unknownTlvCount,
+    this.versionMajor,
+    this.versionMinor,
+    this.versionPatch,
+    this.remoteMps,
+    this.remoteTxWindow,
+    this.remoteSendTimeoutMs,
+  });
+
+  final int tlvCount;
+  final int unknownTlvCount;
+  final int? versionMajor;
+  final int? versionMinor;
+  final int? versionPatch;
+  final int? remoteMps;
+  final int? remoteTxWindow;
+  final int? remoteSendTimeoutMs;
+
+  String? get version =>
+      versionMajor == null || versionMinor == null || versionPatch == null
+          ? null
+          : '$versionMajor.$versionMinor.$versionPatch';
 }
 
 /// 增量接收缓冲。

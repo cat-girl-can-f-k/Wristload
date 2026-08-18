@@ -82,6 +82,10 @@ class DeviceController extends ChangeNotifier {
 
   /// Completes after persisted authkey/device bindings have been restored.
   Future<void> get authKeyBindingsReady => _authKeyBindingsReady;
+
+  /// Completes after the platform Bluetooth state and macOS authorization
+  /// startup checks have finished.
+  Future<void> get bluetoothInitializationReady => _bluetoothInitialization;
   StreamSubscription<DiscoveredEventArgs>? _scanSubscription;
   StreamSubscription<BluetoothLowEnergyStateChangedEventArgs>?
   _bluetoothStateSubscription;
@@ -90,6 +94,10 @@ class DeviceController extends ChangeNotifier {
   BluetoothLowEnergyState _bluetoothState = BluetoothLowEnergyState.unknown;
   bool _bluetoothStateKnown = false;
   bool _authorizationRequestInFlight = false;
+  BluetoothAuthorizationStatus _macOSBluetoothAuthorization =
+      BluetoothAuthorizationStatus.unknown;
+  bool _macOSAuthorizationRequestAttempted = false;
+  bool _macOSAuthorizationRetryAttempted = false;
   late final Future<void> _bluetoothInitialization;
   Timer? _scanResultsFlushTimer;
   Timer? _savedDeviceRequestTimer;
@@ -545,28 +553,66 @@ class DeviceController extends ChangeNotifier {
   bool get bluetoothAvailable =>
       _bluetoothState == BluetoothLowEnergyState.poweredOn;
 
+  /// macOS TCC authorization is separate from the CoreBluetooth adapter state.
+  BluetoothAuthorizationStatus get macOSBluetoothAuthorization =>
+      _macOSBluetoothAuthorization;
+
+  bool get macOSBluetoothPrivacySettingsRequired =>
+      defaultTargetPlatform == TargetPlatform.macOS &&
+      _macOSBluetoothAuthorization.needsSettings;
+
+  bool get _isMacOS => defaultTargetPlatform == TargetPlatform.macOS;
+
+  /// `CBManager.authorization` is macOS's source of truth for Bluetooth TCC.
+  /// `CBCentralManager.state` is still useful for adapter power/support, but
+  /// must not turn into a second, contradictory permission decision.
+  bool get _macOSPluginStateConflictsWithTcc =>
+      _isMacOS &&
+      _macOSBluetoothAuthorization.isAuthorized &&
+      bluetoothState == BluetoothLowEnergyState.unauthorized;
+
   /// Whether BLE is conclusively unavailable for a disconnected device.
   ///
   /// A macOS saved-device RFCOMM session can authenticate before
   /// CoreBluetooth publishes its first state transition.  In that window the
   /// manager remains [unknown], which is an initialization state rather than
   /// an adapter failure and must not be rendered as a red warning.
-  bool get bluetoothUnavailable =>
-      bluetoothStateKnown &&
-      (bluetoothState == BluetoothLowEnergyState.poweredOff ||
-          bluetoothState == BluetoothLowEnergyState.unauthorized ||
-          bluetoothState == BluetoothLowEnergyState.unsupported);
+  bool get bluetoothUnavailable {
+    if (_isMacOS) {
+      // A denied or restricted native TCC result always wins over a stale
+      // plugin state. Conversely, an authorized TCC result must not be
+      // contradicted by a cached `CBCentralManager.state.unauthorized`.
+      if (_macOSBluetoothAuthorization.needsSettings) return true;
+      return bluetoothStateKnown &&
+          (bluetoothState == BluetoothLowEnergyState.poweredOff ||
+              bluetoothState == BluetoothLowEnergyState.unsupported);
+    }
+    return bluetoothStateKnown &&
+        (bluetoothState == BluetoothLowEnergyState.poweredOff ||
+            bluetoothState == BluetoothLowEnergyState.unauthorized ||
+            bluetoothState == BluetoothLowEnergyState.unsupported);
+  }
 
   /// Unknown keeps the original scan behavior during adapter initialization.
-  bool get canScan => !_bluetoothStateKnown || bluetoothAvailable;
+  bool get canScan {
+    if (_isMacOS) return !bluetoothUnavailable;
+    return !_bluetoothStateKnown || bluetoothAvailable;
+  }
 
-  String get bluetoothStateMessage => switch (_bluetoothState) {
-    BluetoothLowEnergyState.poweredOff => '蓝牙已关闭，请在系统设置中开启蓝牙。',
-    BluetoothLowEnergyState.unauthorized => '蓝牙权限未授权，请允许 Wristload 使用蓝牙。',
-    BluetoothLowEnergyState.unsupported => '当前系统不支持蓝牙低功耗扫描。',
-    BluetoothLowEnergyState.unknown => '正在检测蓝牙状态…',
-    BluetoothLowEnergyState.poweredOn => '蓝牙可用。',
-  };
+  String get bluetoothStateMessage {
+    if (_isMacOS && _macOSBluetoothAuthorization.needsSettings) {
+      return '蓝牙权限未授权，请允许 Wristload 使用蓝牙。';
+    }
+    return switch (_bluetoothState) {
+      BluetoothLowEnergyState.poweredOff => '蓝牙已关闭，请在系统设置中开启蓝牙。',
+      BluetoothLowEnergyState.unauthorized when _isMacOS =>
+        'CoreBluetooth 状态尚未同步，请重试扫描。',
+      BluetoothLowEnergyState.unauthorized => '蓝牙权限未授权，请允许 Wristload 使用蓝牙。',
+      BluetoothLowEnergyState.unsupported => '当前系统不支持蓝牙低功耗扫描。',
+      BluetoothLowEnergyState.unknown => '正在检测蓝牙状态…',
+      BluetoothLowEnergyState.poweredOn => '蓝牙可用。',
+    };
+  }
 
   bool get hasAuthKey => authKey != null;
 
@@ -614,6 +660,12 @@ class DeviceController extends ChangeNotifier {
   }
 
   Future<void> _initializeBluetoothState() async {
+    // On macOS, establish the TCC decision before the BLE plugin constructs
+    // its own CBCentralManager. That prevents the plugin from caching a state
+    // observed while the system consent prompt was still unresolved.
+    if (_isMacOS) {
+      await _requestMacOSBluetoothAuthorizationAtStartup();
+    }
     try {
       _bluetoothStateSubscription = _transport.bluetoothStateChanged.listen(
         (event) => _handleBluetoothState(event.state),
@@ -635,10 +687,132 @@ class DeviceController extends ChangeNotifier {
         level: DiagnosticLogLevel.debug,
         fields: <String, Object?>{'errorType': error.runtimeType.toString()},
       );
-      return;
     }
     if (defaultTargetPlatform == TargetPlatform.android) {
       await _requestBluetoothAuthorization();
+    }
+  }
+
+  Future<void> _requestMacOSBluetoothAuthorizationAtStartup() async {
+    if (_disposed || _macOSAuthorizationRequestAttempted) return;
+    _macOSAuthorizationRequestAttempted = true;
+    try {
+      _macOSBluetoothAuthorization = await _transport
+          .requestMacOSBluetoothAuthorization();
+      _logMacOSBluetoothAuthorization('macOS 蓝牙权限首次检查完成。');
+
+      if (_macOSBluetoothAuthorization.needsSettings &&
+          !_macOSAuthorizationRetryAttempted) {
+        _macOSAuthorizationRetryAttempted = true;
+        // This is a second logical request, not a TCC reset. macOS only
+        // displays its consent dialog while authorization is notDetermined;
+        // after a denial the public API reports the existing decision.
+        _macOSBluetoothAuthorization = await _transport
+            .requestMacOSBluetoothAuthorization();
+        _logMacOSBluetoothAuthorization('macOS 蓝牙权限第二次请求完成。');
+      }
+
+      // Use the observed final TCC state to decide whether Settings is needed.
+      _macOSBluetoothAuthorization = await _transport
+          .getMacOSBluetoothAuthorizationStatus();
+      _logMacOSBluetoothAuthorization('macOS 蓝牙权限最终状态检查完成。');
+      // `notDetermined` means the native bridge is still waiting for a TCC
+      // decision. The native TCC result remains separate from the plugin's
+      // manager state so neither source can overwrite the other.
+      notifyListeners();
+    } on Object catch (error) {
+      _macOSBluetoothAuthorization = BluetoothAuthorizationStatus.unknown;
+      _logBluetooth(
+        'macOS 蓝牙权限检查失败：$error',
+        level: DiagnosticLogLevel.warning,
+        fields: <String, Object?>{'errorType': error.runtimeType.toString()},
+      );
+      notifyListeners();
+    }
+  }
+
+  void _logMacOSBluetoothAuthorization(String message) {
+    _logBluetooth(
+      message,
+      level: _macOSBluetoothAuthorization.isAuthorized
+          ? DiagnosticLogLevel.info
+          : DiagnosticLogLevel.warning,
+      fields: <String, Object?>{
+        'platform': 'macos',
+        'tccAuthorization': _macOSBluetoothAuthorization.name,
+        'pluginCentralState': _bluetoothState.name,
+        'pluginStateKnown': _bluetoothStateKnown,
+        'pluginStateConflictsWithTcc': _macOSPluginStateConflictsWithTcc,
+        'settingsRequired': _macOSBluetoothAuthorization.needsSettings,
+      },
+    );
+  }
+
+  /// Opens the system Bluetooth privacy page after a final denied/restricted
+  /// result. It never attempts to reset or bypass macOS TCC.
+  Future<bool> openMacOSBluetoothPrivacySettings() async {
+    if (defaultTargetPlatform != TargetPlatform.macOS || _disposed) {
+      return false;
+    }
+    try {
+      final opened = await _transport.openMacOSBluetoothPrivacySettings();
+      _logBluetooth(
+        opened ? '已打开 macOS 蓝牙隐私设置。' : '无法打开 macOS 蓝牙隐私设置。',
+        level: opened ? DiagnosticLogLevel.info : DiagnosticLogLevel.warning,
+        fields: <String, Object?>{'opened': opened, 'platform': 'macos'},
+      );
+      return opened;
+    } on Object catch (error) {
+      _logBluetooth(
+        '打开 macOS 蓝牙隐私设置失败：$error',
+        level: DiagnosticLogLevel.warning,
+        fields: <String, Object?>{'errorType': error.runtimeType.toString()},
+      );
+      return false;
+    }
+  }
+
+  /// Re-reads macOS Bluetooth TCC after the app returns to the foreground.
+  ///
+  /// This intentionally performs a status read only: opening System Settings
+  /// must not implicitly request permission again, start a scan, or reconnect
+  /// to a saved device.
+  Future<void> refreshMacOSBluetoothAuthorization() async {
+    if (!_isMacOS || _disposed) return;
+
+    // A foreground event can arrive while the initial consent prompt is still
+    // pending. Let the startup flow settle before replacing its result.
+    await _bluetoothInitialization;
+    if (_disposed) return;
+
+    try {
+      final previous = _macOSBluetoothAuthorization;
+      final previousMessage = bluetoothStateMessage;
+      final next = await _transport.getMacOSBluetoothAuthorizationStatus();
+      if (_disposed) return;
+
+      _macOSBluetoothAuthorization = next;
+      final changed = previous != next;
+      _logMacOSBluetoothAuthorization(
+        changed ? 'macOS 蓝牙权限前台状态已刷新。' : 'macOS 蓝牙权限前台状态未变化。',
+      );
+
+      if (!changed) return;
+
+      // A denied scan may have left only the old permission message behind.
+      // Clear that narrow, now-stale error while preserving unrelated failures.
+      if (previous.needsSettings &&
+          next.isAuthorized &&
+          error == previousMessage) {
+        error = null;
+      }
+      notifyListeners();
+    } on Object catch (error) {
+      _logBluetooth(
+        'macOS 蓝牙权限前台刷新失败：$error',
+        level: DiagnosticLogLevel.warning,
+        fields: <String, Object?>{'errorType': error.runtimeType.toString()},
+      );
     }
   }
 
@@ -680,13 +854,21 @@ class DeviceController extends ChangeNotifier {
         'state': state.name,
         'available': state == BluetoothLowEnergyState.poweredOn,
         'platform': defaultTargetPlatform.name,
+        if (_isMacOS) 'tccAuthorization': _macOSBluetoothAuthorization.name,
+        if (_isMacOS)
+          'pluginStateConflictsWithTcc': _macOSPluginStateConflictsWithTcc,
       },
     );
     if (state == BluetoothLowEnergyState.unauthorized &&
         defaultTargetPlatform == TargetPlatform.android) {
       unawaited(_requestBluetoothAuthorization());
     }
-    if (state != BluetoothLowEnergyState.poweredOn && _isScanning) {
+    final shouldStopScan = _isMacOS
+        ? _macOSBluetoothAuthorization.needsSettings ||
+              state == BluetoothLowEnergyState.poweredOff ||
+              state == BluetoothLowEnergyState.unsupported
+        : state != BluetoothLowEnergyState.poweredOn;
+    if (shouldStopScan && _isScanning) {
       unawaited(stopScan());
     }
     notifyListeners();
@@ -770,6 +952,16 @@ class DeviceController extends ChangeNotifier {
   /// Requests a one-shot startup reconnect. Only an identity is persisted;
   /// the authkey is read from secure storage after a matching scan result.
   Future<bool> autoConnectLastDevice() async {
+    if (defaultTargetPlatform == TargetPlatform.macOS) {
+      // Startup auto-connect must not race the macOS TCC prompt. The native
+      // permission bridge keeps this future pending until the user decides.
+      await _bluetoothInitialization;
+      if (_disposed) return false;
+      if (!_macOSBluetoothAuthorization.isAuthorized) {
+        _log('启动自动连接已跳过：macOS 蓝牙权限尚未授权（${_macOSBluetoothAuthorization.name}）。');
+        return false;
+      }
+    }
     await _autoConnectPreferenceReady;
     if (!autoConnectLastDeviceEnabled) {
       _log('启动自动连接已关闭，跳过上次设备连接。');
@@ -823,6 +1015,18 @@ class DeviceController extends ChangeNotifier {
   /// A CoreBluetooth peripheral cannot be reconstructed from a stored UUID.
   Future<bool> connectSavedDevice(AuthKeyBinding binding) async {
     if (_disposed || isConnectionBusy || isConnected) return false;
+    if (defaultTargetPlatform == TargetPlatform.macOS) {
+      // Saved V2 devices can bypass BLE discovery, so they must explicitly
+      // wait for the startup TCC decision before starting Classic Bluetooth.
+      await _bluetoothInitialization;
+      if (_disposed || isConnectionBusy || isConnected) return false;
+      if (!_macOSBluetoothAuthorization.isAuthorized) {
+        _log(
+          '已保存设备连接已跳过：macOS 蓝牙权限尚未授权（${_macOSBluetoothAuthorization.name}）。',
+        );
+        return false;
+      }
+    }
     await _authKeyBindingsReady;
     if (!await useSavedAuthKeyForDevice(binding.id)) {
       error = '已保存设备缺少可用 authkey，请手动输入后再连接。';
@@ -1492,16 +1696,26 @@ class DeviceController extends ChangeNotifier {
       _log('BLE 扫描请求已取消：设备连接或断开尚未完成。');
       return;
     }
-    final unavailable =
-        _bluetoothStateKnown &&
-        _bluetoothState != BluetoothLowEnergyState.poweredOn &&
-        _bluetoothState != BluetoothLowEnergyState.unknown;
+    // On macOS, TCC comes from the native bridge. A plugin manager reporting
+    // `unauthorized` after TCC has allowed the app is an inconsistent runtime
+    // state, not a second permission denial. Let the native scan report the
+    // actual operation error instead of blocking it before it starts.
+    final unavailable = _isMacOS
+        ? !canScan
+        : _bluetoothStateKnown &&
+              _bluetoothState != BluetoothLowEnergyState.poweredOn &&
+              _bluetoothState != BluetoothLowEnergyState.unknown;
     if (unavailable) {
       error = bluetoothStateMessage;
       _logBluetooth(
         '扫描请求被拒绝：蓝牙不可用。',
         level: DiagnosticLogLevel.warning,
-        fields: <String, Object?>{'state': _bluetoothState.name},
+        fields: <String, Object?>{
+          'state': _bluetoothState.name,
+          if (_isMacOS) 'tccAuthorization': _macOSBluetoothAuthorization.name,
+          if (_isMacOS)
+            'pluginStateConflictsWithTcc': _macOSPluginStateConflictsWithTcc,
+        },
       );
       notifyListeners();
       return;
@@ -1756,15 +1970,14 @@ class DeviceController extends ChangeNotifier {
     // Allow one transport-only reconnect while retaining the confirmed keys.
     _postAuthReconnectAttempts = 0;
     _authenticatedAt = null;
-    final DesktopV2Connection desktopConnection = switch (
-      defaultTargetPlatform
-    ) {
-      TargetPlatform.windows => const WindowsV2Connection(),
-      TargetPlatform.macOS => const MacosV2Connection(),
-      _ => throw UnsupportedError(
-        'Desktop V2 connection is unsupported on $defaultTargetPlatform.',
-      ),
-    };
+    final DesktopV2Connection desktopConnection =
+        switch (defaultTargetPlatform) {
+          TargetPlatform.windows => const WindowsV2Connection(),
+          TargetPlatform.macOS => const MacosV2Connection(),
+          _ => throw UnsupportedError(
+            'Desktop V2 connection is unsupported on $defaultTargetPlatform.',
+          ),
+        };
     final platformName = desktopConnection.platformName;
     _log('已识别 ${profile.displayName}（V2），$platformName 使用无 GATT 的经典蓝牙 SPP 连接。');
     try {
@@ -2163,7 +2376,9 @@ class DeviceController extends ChangeNotifier {
       if (exception is TimeoutException &&
           exception.duration == rfcommTimeout) {
         _connectionIssues.recordRfcommTimeout();
-        _log('SPP 超时：${rfcommTimeout.inSeconds} 秒内设备未响应，已停止等待 RFCOMM 建链。$exception');
+        _log(
+          'SPP 超时：${rfcommTimeout.inSeconds} 秒内设备未响应，已停止等待 RFCOMM 建链。$exception',
+        );
       } else {
         _connectionIssues.recordConnectionFailure(exception);
       }
@@ -2688,11 +2903,13 @@ class DeviceController extends ChangeNotifier {
     final channel = packet.payload[0] & 0x0f;
     final opCode = packet.payload[1];
     final data = packet.payload.sublist(2);
-    if ((deviceLogPullStarting || deviceLogPullActive) && _isDeviceLogTransportData(data)) {
+    if ((deviceLogPullStarting || deviceLogPullActive) &&
+        _isDeviceLogTransportData(data)) {
       _handleDeviceLogSegment(channel, opCode, data);
       return;
     }
-    if (channel == SppProtocol.channelMass && opCode == SppProtocol.opCodeWrite &&
+    if (channel == SppProtocol.channelMass &&
+        opCode == SppProtocol.opCodeWrite &&
         (deviceLogPullStarting || deviceLogPullActive)) {
       _handleDeviceLogMassSegment(data);
       return;
@@ -2859,22 +3076,39 @@ class DeviceController extends ChangeNotifier {
   }
 
   void _handleSelfCheckReport(Zau message) {
-    if (message.command != ZauCommand.debugTransfer || message.sub != ZauCommand.debugTransferSelfCheckResultSub) return;
+    if (message.command != ZauCommand.debugTransfer ||
+        message.sub != ZauCommand.debugTransferSelfCheckResultSub)
+      return;
     final parsed = SelfCheckPayload.parseReport(message.payload);
-    if (parsed == null) { selfCheckError = '设备自检结果无法解析'; notifyListeners(); return; }
-    latestSelfCheckReport = SelfCheckReport(receivedAt: DateTime.now(), completed: parsed.completed, items: [for (final i in parsed.items) SelfCheckItem(id: i.id, passed: i.passed)]);
-    selfCheckActive = false; selfCheckError = null;
-    _log('收到设备自检结果：${parsed.items.length} 项'); notifyListeners();
+    if (parsed == null) {
+      selfCheckError = '设备自检结果无法解析';
+      notifyListeners();
+      return;
+    }
+    latestSelfCheckReport = SelfCheckReport(
+      receivedAt: DateTime.now(),
+      completed: parsed.completed,
+      items: [
+        for (final i in parsed.items) SelfCheckItem(id: i.id, passed: i.passed),
+      ],
+    );
+    selfCheckActive = false;
+    selfCheckError = null;
+    _log('收到设备自检结果：${parsed.items.length} 项');
+    notifyListeners();
   }
 
   void _handleDeviceLogControlResult(Zau message) {
-    if (message.command != ZauCommand.deviceLog || message.sub != ZauCommand.deviceLogResultSub) return;
+    if (message.command != ZauCommand.deviceLog ||
+        message.sub != ZauCommand.deviceLogResultSub)
+      return;
     final result = DeviceLogPayload.parseResult(message.payload);
     if (result == null) return;
     if (result.code != 0) _failDeviceLogPull('设备日志导出失败，结果码=${result.code}');
   }
 
-  bool _isDeviceLogTransportData(List<int> data) => data.length >= 6 && data[0] == 0 && (data[1] == 129 || data[1] == 130);
+  bool _isDeviceLogTransportData(List<int> data) =>
+      data.length >= 6 && data[0] == 0 && (data[1] == 129 || data[1] == 130);
 
   void _handleDeviceLogMassSegment(List<int> data) {
     if (data.length < 4) return _failDeviceLogPull('设备日志分片长度不足');
@@ -2888,29 +3122,76 @@ class DeviceController extends ChangeNotifier {
   }
 
   void _appendDeviceLogChunk(int total, int seq, List<int> chunk) {
-    if (total <= 0 || seq != deviceLogReceivedSegments + 1 || seq > total) { _failDeviceLogPull('设备日志分片顺序无效：$seq/$total'); return; }
+    if (total <= 0 || seq != deviceLogReceivedSegments + 1 || seq > total) {
+      _failDeviceLogPull('设备日志分片顺序无效：$seq/$total');
+      return;
+    }
     if (deviceLogSegmentTotal == 0) deviceLogSegmentTotal = total;
-    if (deviceLogSegmentTotal != total || deviceLogReceivedBytes + chunk.length > 64 * 1024 * 1024) { _failDeviceLogPull('设备日志分片无效'); return; }
-    _deviceLogBuffer.add(chunk); deviceLogReceivedSegments = seq; deviceLogReceivedBytes += chunk.length; deviceLogPullStarting = false; deviceLogPullActive = true;
-    _armDeviceLogTimeout(); notifyListeners();
-    if (seq == total) { _deviceLogFinishing = true; unawaited(_finishDeviceLogPull()); }
+    if (deviceLogSegmentTotal != total ||
+        deviceLogReceivedBytes + chunk.length > 64 * 1024 * 1024) {
+      _failDeviceLogPull('设备日志分片无效');
+      return;
+    }
+    _deviceLogBuffer.add(chunk);
+    deviceLogReceivedSegments = seq;
+    deviceLogReceivedBytes += chunk.length;
+    deviceLogPullStarting = false;
+    deviceLogPullActive = true;
+    _armDeviceLogTimeout();
+    notifyListeners();
+    if (seq == total) {
+      _deviceLogFinishing = true;
+      unawaited(_finishDeviceLogPull());
+    }
   }
 
-  void _armDeviceLogTimeout() { _deviceLogTimeout?.cancel(); _deviceLogTimeout = Timer(const Duration(seconds: 60), () => _failDeviceLogPull('等待设备日志分片超时')); }
+  void _armDeviceLogTimeout() {
+    _deviceLogTimeout?.cancel();
+    _deviceLogTimeout = Timer(
+      const Duration(seconds: 60),
+      () => _failDeviceLogPull('等待设备日志分片超时'),
+    );
+  }
 
   Future<void> _finishDeviceLogPull() async {
-    _deviceLogTimeout?.cancel(); _deviceLogTimeout = null;
+    _deviceLogTimeout?.cancel();
+    _deviceLogTimeout = null;
     try {
       final bytes = _deviceLogBuffer.toBytes();
       if (bytes.isEmpty) throw const FormatException('设备日志为空');
-      final dir = Directory('${(await getApplicationDocumentsDirectory()).path}${Platform.pathSeparator}DeviceLog'); await dir.create(recursive: true);
-      final file = File('${dir.path}${Platform.pathSeparator}device_log_${DateTime.now().millisecondsSinceEpoch}.bin'); await file.writeAsBytes(bytes, flush: true);
-      latestDeviceLogPath = file.path; deviceLogError = null;
-    } catch (e) { deviceLogError = '设备日志导出失败：$e'; }
-    deviceLogPullStarting = false; deviceLogPullActive = false; _deviceLogFinishing = false; _log(latestDeviceLogPath == null ? deviceLogError! : '设备日志已导出：$latestDeviceLogPath'); notifyListeners();
+      final dir = Directory(
+        '${(await getApplicationDocumentsDirectory()).path}${Platform.pathSeparator}DeviceLog',
+      );
+      await dir.create(recursive: true);
+      final file = File(
+        '${dir.path}${Platform.pathSeparator}device_log_${DateTime.now().millisecondsSinceEpoch}.bin',
+      );
+      await file.writeAsBytes(bytes, flush: true);
+      latestDeviceLogPath = file.path;
+      deviceLogError = null;
+    } catch (e) {
+      deviceLogError = '设备日志导出失败：$e';
+    }
+    deviceLogPullStarting = false;
+    deviceLogPullActive = false;
+    _deviceLogFinishing = false;
+    _log(
+      latestDeviceLogPath == null
+          ? deviceLogError!
+          : '设备日志已导出：$latestDeviceLogPath',
+    );
+    notifyListeners();
   }
 
-  void _failDeviceLogPull(String reason) { if (_deviceLogFinishing) return; _deviceLogTimeout?.cancel(); deviceLogPullStarting = false; deviceLogPullActive = false; deviceLogError = reason; _log(reason); notifyListeners(); }
+  void _failDeviceLogPull(String reason) {
+    if (_deviceLogFinishing) return;
+    _deviceLogTimeout?.cancel();
+    deviceLogPullStarting = false;
+    deviceLogPullActive = false;
+    deviceLogError = reason;
+    _log(reason);
+    notifyListeners();
+  }
 
   Future<void> _sppSendAuthConfirm({
     required int connectionEpoch,
@@ -3448,7 +3729,8 @@ class DeviceController extends ChangeNotifier {
   void _appendDebugCleanupLog(String message) {
     final now = DateTime.now();
     String two(int value) => value.toString().padLeft(2, '0');
-    final stamp = '[${two(now.hour)}:${two(now.minute)}:${two(now.second)}.'
+    final stamp =
+        '[${two(now.hour)}:${two(now.minute)}:${two(now.second)}.'
         '${now.millisecond.toString().padLeft(3, '0')}]';
     final next = [...debugCleanupLogs, '$stamp $message'];
     debugCleanupLogs = List<String>.unmodifiable(
@@ -4299,79 +4581,219 @@ class DeviceController extends ChangeNotifier {
   }
 
   Future<bool> switchBootMode(DeviceBootMode mode) async {
-    if (bootModeSwitching || !sessionReady || _sessionCipher == null) return false;
-    bootModeSwitching = true; pendingBootModeLabel = mode.label; bootModeError = null; notifyListeners();
+    if (bootModeSwitching || !sessionReady || _sessionCipher == null)
+      return false;
+    bootModeSwitching = true;
+    pendingBootModeLabel = mode.label;
+    bootModeError = null;
+    notifyListeners();
     try {
-      await _sendBusinessNoResponse(Zau(command: ZauCommand.debugTransfer, sub: ZauCommand.debugTransferBootModeSub, payload: BootModePayload.switchRequest(mode)));
+      await _sendBusinessNoResponse(
+        Zau(
+          command: ZauCommand.debugTransfer,
+          sub: ZauCommand.debugTransferBootModeSub,
+          payload: BootModePayload.switchRequest(mode),
+        ),
+      );
       _log('已发送启动模式切换请求：${mode.label}');
       // The device may reboot and drop the link, but that must not leave the
       // UI locked waiting for reconnection. Allow another request immediately
       // after this request has been written successfully.
       pendingBootModeLabel = null;
       return true;
-    } catch (e) { pendingBootModeLabel = null; bootModeError = '启动模式切换失败：$e'; _log(bootModeError!); return false; }
-    finally { bootModeSwitching = false; notifyListeners(); }
+    } catch (e) {
+      pendingBootModeLabel = null;
+      bootModeError = '启动模式切换失败：$e';
+      _log(bootModeError!);
+      return false;
+    } finally {
+      bootModeSwitching = false;
+      notifyListeners();
+    }
   }
 
   Future<bool> enterSelfCheckMode() async {
-    if (selfCheckModeSwitching || selfCheckEntered || !sessionReady || _sessionCipher == null) return false;
-    selfCheckModeSwitching = true; selfCheckError = null; notifyListeners();
+    if (selfCheckModeSwitching ||
+        selfCheckEntered ||
+        !sessionReady ||
+        _sessionCipher == null)
+      return false;
+    selfCheckModeSwitching = true;
+    selfCheckError = null;
+    notifyListeners();
     try {
-      final r = await _requestBusiness(Zau(command: ZauCommand.debugTransfer, sub: ZauCommand.debugTransferControlSub, payload: SelfCheckPayload.enterModeRequest()), ZauCommand.debugTransfer, ZauCommand.debugTransferControlSub);
-      if (SelfCheckPayload.parseControlResult(r.payload) != 0) throw StateError('设备拒绝进入自检模式');
-      selfCheckEntered = true; _log('已进入设备自检模式'); return true;
-    } catch (e) { selfCheckError = '进入自检模式失败：$e'; _log(selfCheckError!); return false; }
-    finally { selfCheckModeSwitching = false; notifyListeners(); }
+      final r = await _requestBusiness(
+        Zau(
+          command: ZauCommand.debugTransfer,
+          sub: ZauCommand.debugTransferControlSub,
+          payload: SelfCheckPayload.enterModeRequest(),
+        ),
+        ZauCommand.debugTransfer,
+        ZauCommand.debugTransferControlSub,
+      );
+      if (SelfCheckPayload.parseControlResult(r.payload) != 0)
+        throw StateError('设备拒绝进入自检模式');
+      selfCheckEntered = true;
+      _log('已进入设备自检模式');
+      return true;
+    } catch (e) {
+      selfCheckError = '进入自检模式失败：$e';
+      _log(selfCheckError!);
+      return false;
+    } finally {
+      selfCheckModeSwitching = false;
+      notifyListeners();
+    }
   }
 
   Future<bool> startSelfCheck() async {
-    if (selfCheckStarting || !selfCheckEntered || !sessionReady || _sessionCipher == null) return false;
-    selfCheckStarting = true; selfCheckError = null; notifyListeners();
+    if (selfCheckStarting ||
+        !selfCheckEntered ||
+        !sessionReady ||
+        _sessionCipher == null)
+      return false;
+    selfCheckStarting = true;
+    selfCheckError = null;
+    notifyListeners();
     try {
-      final r = await _requestBusiness(Zau(command: ZauCommand.debugTransfer, sub: ZauCommand.debugTransferControlSub, payload: SelfCheckPayload.startRequest()), ZauCommand.debugTransfer, ZauCommand.debugTransferControlSub);
-      if (SelfCheckPayload.parseControlResult(r.payload) != 0) throw StateError('设备拒绝开始自检');
-      selfCheckActive = true; _log('已开始设备自检'); return true;
-    } catch (e) { selfCheckError = '开始自检失败：$e'; _log(selfCheckError!); return false; }
-    finally { selfCheckStarting = false; notifyListeners(); }
+      final r = await _requestBusiness(
+        Zau(
+          command: ZauCommand.debugTransfer,
+          sub: ZauCommand.debugTransferControlSub,
+          payload: SelfCheckPayload.startRequest(),
+        ),
+        ZauCommand.debugTransfer,
+        ZauCommand.debugTransferControlSub,
+      );
+      if (SelfCheckPayload.parseControlResult(r.payload) != 0)
+        throw StateError('设备拒绝开始自检');
+      selfCheckActive = true;
+      _log('已开始设备自检');
+      return true;
+    } catch (e) {
+      selfCheckError = '开始自检失败：$e';
+      _log(selfCheckError!);
+      return false;
+    } finally {
+      selfCheckStarting = false;
+      notifyListeners();
+    }
   }
 
   Future<bool> refreshSelfCheckMode() async {
-    if (selfCheckModeLoading || !sessionReady || _sessionCipher == null) return false;
-    selfCheckModeLoading = true; notifyListeners();
+    if (selfCheckModeLoading || !sessionReady || _sessionCipher == null)
+      return false;
+    selfCheckModeLoading = true;
+    notifyListeners();
     try {
-      final r = await _requestBusiness(Zau(command: ZauCommand.debugTransfer, sub: ZauCommand.debugTransferStatusSub), ZauCommand.debugTransfer, ZauCommand.debugTransferStatusSub);
-      currentSelfCheckMode = SelfCheckPayload.parseMode(r.payload); selfCheckEntered = currentSelfCheckMode != null && currentSelfCheckMode != 0; return currentSelfCheckMode != null;
-    } catch (e) { selfCheckError = '读取自检模式失败：$e'; return false; }
-    finally { selfCheckModeLoading = false; notifyListeners(); }
+      final r = await _requestBusiness(
+        Zau(
+          command: ZauCommand.debugTransfer,
+          sub: ZauCommand.debugTransferStatusSub,
+        ),
+        ZauCommand.debugTransfer,
+        ZauCommand.debugTransferStatusSub,
+      );
+      currentSelfCheckMode = SelfCheckPayload.parseMode(r.payload);
+      selfCheckEntered =
+          currentSelfCheckMode != null && currentSelfCheckMode != 0;
+      return currentSelfCheckMode != null;
+    } catch (e) {
+      selfCheckError = '读取自检模式失败：$e';
+      return false;
+    } finally {
+      selfCheckModeLoading = false;
+      notifyListeners();
+    }
   }
 
   Future<bool> exitSelfCheck() async {
     if (!sessionReady || _sessionCipher == null) return false;
     try {
-      final r = await _requestBusiness(Zau(command: ZauCommand.debugTransfer, sub: ZauCommand.debugTransferControlSub, payload: SelfCheckPayload.modeChangeRequest(2)), ZauCommand.debugTransfer, ZauCommand.debugTransferControlSub);
-      if (SelfCheckPayload.parseControlResult(r.payload) != 0) throw StateError('设备拒绝退出自检');
-      selfCheckEntered = false; selfCheckActive = false; currentSelfCheckMode = null; notifyListeners(); return true;
-    } catch (e) { selfCheckError = '退出自检失败：$e'; _log(selfCheckError!); notifyListeners(); return false; }
+      final r = await _requestBusiness(
+        Zau(
+          command: ZauCommand.debugTransfer,
+          sub: ZauCommand.debugTransferControlSub,
+          payload: SelfCheckPayload.modeChangeRequest(2),
+        ),
+        ZauCommand.debugTransfer,
+        ZauCommand.debugTransferControlSub,
+      );
+      if (SelfCheckPayload.parseControlResult(r.payload) != 0)
+        throw StateError('设备拒绝退出自检');
+      selfCheckEntered = false;
+      selfCheckActive = false;
+      currentSelfCheckMode = null;
+      notifyListeners();
+      return true;
+    } catch (e) {
+      selfCheckError = '退出自检失败：$e';
+      _log(selfCheckError!);
+      notifyListeners();
+      return false;
+    }
   }
 
   Future<String?> exportSelfCheckResult() async {
-    final report = latestSelfCheckReport; if (report == null) return null;
+    final report = latestSelfCheckReport;
+    if (report == null) return null;
     try {
-      final dir = Directory('${(await getApplicationDocumentsDirectory()).path}${Platform.pathSeparator}SelfCheckReport'); await dir.create(recursive: true);
-      final file = File('${dir.path}${Platform.pathSeparator}self_check_${DateTime.now().millisecondsSinceEpoch}.txt');
-      await file.writeAsString('Device: ${connectedDeviceName ?? 'Unknown'}\nCompleted: ${report.completed}\n${report.items.map((i) => 'Item ${i.id}: ${i.passed ? 'PASS' : 'FAIL'}').join('\n')}', flush: true);
-      latestSelfCheckExportPath = file.path; notifyListeners(); return file.path;
-    } catch (e) { selfCheckError = '导出自检结果失败：$e'; notifyListeners(); return null; }
+      final dir = Directory(
+        '${(await getApplicationDocumentsDirectory()).path}${Platform.pathSeparator}SelfCheckReport',
+      );
+      await dir.create(recursive: true);
+      final file = File(
+        '${dir.path}${Platform.pathSeparator}self_check_${DateTime.now().millisecondsSinceEpoch}.txt',
+      );
+      await file.writeAsString(
+        'Device: ${connectedDeviceName ?? 'Unknown'}\nCompleted: ${report.completed}\n${report.items.map((i) => 'Item ${i.id}: ${i.passed ? 'PASS' : 'FAIL'}').join('\n')}',
+        flush: true,
+      );
+      latestSelfCheckExportPath = file.path;
+      notifyListeners();
+      return file.path;
+    } catch (e) {
+      selfCheckError = '导出自检结果失败：$e';
+      notifyListeners();
+      return null;
+    }
   }
 
   Future<bool> pullDeviceLog() async {
-    if (deviceLogPullStarting || deviceLogPullActive || !sessionReady || _sessionCipher == null) return false;
-    _resetDeviceLogPull(); deviceLogPullStarting = true; deviceLogError = null; notifyListeners();
-    try { await _sendBusinessNoResponse(Zau(command: ZauCommand.debugTransfer, sub: ZauCommand.debugTransferDeviceLogSub, payload: DeviceLogPayload.dumpRequest())); _armDeviceLogTimeout(); return true; }
-    catch (e) { _failDeviceLogPull('请求设备日志失败：$e'); return false; }
+    if (deviceLogPullStarting ||
+        deviceLogPullActive ||
+        !sessionReady ||
+        _sessionCipher == null)
+      return false;
+    _resetDeviceLogPull();
+    deviceLogPullStarting = true;
+    deviceLogError = null;
+    notifyListeners();
+    try {
+      await _sendBusinessNoResponse(
+        Zau(
+          command: ZauCommand.debugTransfer,
+          sub: ZauCommand.debugTransferDeviceLogSub,
+          payload: DeviceLogPayload.dumpRequest(),
+        ),
+      );
+      _armDeviceLogTimeout();
+      return true;
+    } catch (e) {
+      _failDeviceLogPull('请求设备日志失败：$e');
+      return false;
+    }
   }
 
-  void _resetDeviceLogPull() { _deviceLogTimeout?.cancel(); _deviceLogTimeout = null; _deviceLogBuffer.clear(); deviceLogSegmentTotal = 0; deviceLogReceivedSegments = 0; deviceLogReceivedBytes = 0; _deviceLogFinishing = false; }
+  void _resetDeviceLogPull() {
+    _deviceLogTimeout?.cancel();
+    _deviceLogTimeout = null;
+    _deviceLogBuffer.clear();
+    deviceLogSegmentTotal = 0;
+    deviceLogReceivedSegments = 0;
+    deviceLogReceivedBytes = 0;
+    _deviceLogFinishing = false;
+  }
 
   Future<bool> syncSystemTime({bool automatic = false}) async {
     if (_timeSyncInProgress) return false;

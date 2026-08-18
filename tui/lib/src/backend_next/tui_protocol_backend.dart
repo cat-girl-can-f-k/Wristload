@@ -21,8 +21,22 @@ import '../domain/protocol/zau.dart';
 import '../domain/queue_file_importer.dart';
 import '../domain/transfer_settings_store.dart';
 import '../domain/verification_gate.dart';
+import '../diagnostics/diagnostic_journal.dart';
 import 'tui_mac_bluetooth_transport.dart';
 import 'tui_protocol_snapshot.dart';
+import 'tui_backend_port.dart';
+
+/// Reconnects the physical RFCOMM link after a successful f=27 transition.
+///
+/// Production adapters inject this callback so native connection-attempt
+/// ownership remains outside the protocol core. The protocol backend remains
+/// usable standalone; when omitted it falls back to its own transport.
+typedef TuiPostAuthReconnect = Future<void> Function(TuiTransportDevice device);
+
+/// The device's f=26 response reached this process, but its signature did not
+/// verify with the selected authkey/optional binding material.  No f=27 bytes
+/// may be emitted for this condition.
+const String deviceSignatureMismatchFailureCode = 'device_signature_mismatch';
 
 /// Pure-Dart V2 installer backend for macOS classic Bluetooth/RFCOMM.
 /// No Flutter, BLE UUID conversion, or platform channels are used here.
@@ -33,13 +47,19 @@ class TuiProtocolBackend {
     TransferSettingsStore? settingsStore,
     Random? random,
     Duration ackTimeout = const Duration(seconds: 12),
+    Duration handshakeTimeout = const Duration(seconds: 15),
     Duration? ackQuarantineDuration,
     DateTime Function()? clock,
+    TuiPostAuthReconnect? postAuthReconnect,
+    DiagnosticJournal? diagnosticJournal,
   })  : _transport = transport,
         _checkpointStore = checkpointStore ?? InstallCheckpointStore(),
         _settingsStore = settingsStore ?? TransferSettingsStore(),
         _random = random ?? Random.secure(),
         _ackTimeout = ackTimeout,
+        _handshakeTimeout = handshakeTimeout,
+        _postAuthReconnect = postAuthReconnect,
+        _diagnosticJournal = diagnosticJournal,
         _sequenceAllocator = SppSequenceAllocator(
           quarantineDuration: ackQuarantineDuration ??
               (ackTimeout.inMicroseconds * 2 >=
@@ -51,6 +71,9 @@ class TuiProtocolBackend {
     if (ackTimeout <= Duration.zero) {
       throw ArgumentError.value(ackTimeout, 'ackTimeout', '必须大于零');
     }
+    if (handshakeTimeout <= Duration.zero) {
+      throw ArgumentError.value(handshakeTimeout, 'handshakeTimeout', '必须大于零');
+    }
     _inputSubscription = _transport.input.listen(_onInput,
         onError: _onTransportError, onDone: _onTransportClosed);
     _errorSubscription = _transport.errors.listen(_onTransportError);
@@ -58,10 +81,17 @@ class TuiProtocolBackend {
   }
 
   final TuiMacBluetoothTransport _transport;
+
+  /// WearAuthV2 material locked to the active connection attempt. It is never
+  /// derived from a Bluetooth address or authkey and is cleared on invalidation.
+  TuiBackendBindingMaterial? _sessionBinding;
   final InstallCheckpointStore _checkpointStore;
   final TransferSettingsStore _settingsStore;
   final Random _random;
   final Duration _ackTimeout;
+  final Duration _handshakeTimeout;
+  final DiagnosticJournal? _diagnosticJournal;
+  TuiPostAuthReconnect? _postAuthReconnect;
   // Sequence numbers belong to the physical RFCOMM generation, not merely
   // to a logical auth/session epoch. It is replaced only after connect.done.
   SppSequenceAllocator _sequenceAllocator;
@@ -111,6 +141,12 @@ class TuiProtocolBackend {
   bool _disposed = false;
   int _postAuthReconnectAttempts = 0;
   int _sessionEpoch = 0;
+  int _transportGeneration = 0;
+  _HandshakePhase _handshake = _HandshakePhase.none;
+  int _handshakePhaseToken = 0;
+  Future<void> _orderedWrite = Future<void>.value();
+  Future<void> _orderedPacketHandling = Future<void>.value();
+  Future<void> _journalTail = Future<void>.value();
 
   Stream<TuiProtocolSnapshot> get snapshots => _snapshots.stream;
   TuiProtocolSnapshot get snapshot => _makeSnapshot();
@@ -120,6 +156,14 @@ class TuiProtocolBackend {
   bool get authKeyLoaded => _authKey != null;
   bool get queueRunning => _queueRunning;
 
+  /// Installs the adapter-owned physical reconnect boundary. This callback
+  /// must complete only after the native helper has admitted the new RFCOMM
+  /// tuple; it must not invoke [TuiProtocolBackend.connect] recursively.
+  void setPostAuthReconnectHandler(TuiPostAuthReconnect? handler) {
+    if (_disposed) throw StateError('TUI protocol backend 已释放。');
+    _postAuthReconnect = handler;
+  }
+
   void setAuthKey(String value) {
     if (XiaomiAuth.secretKeyFromHex(value) == null) {
       throw const FormatException('authkey 必须为 32 位十六进制字符');
@@ -128,9 +172,11 @@ class TuiProtocolBackend {
     _emit('authkey 已装载，仅保留于内存。');
     if (_connection == TuiProtocolConnectionState.awaitingAuthKey) {
       _connection = TuiProtocolConnectionState.authenticating;
+      _setHandshakePhase(_HandshakePhase.f26Sent);
       _emit('开始 authkey 会话鉴权。');
       _runHandshakeStep(
-        (epoch) => _sendAuthStep1(expectedEpoch: epoch),
+        (epoch, token) =>
+            _sendAuthStep1(expectedEpoch: epoch, expectedPhaseToken: token),
         '发送 f=26',
       );
     }
@@ -140,18 +186,23 @@ class TuiProtocolBackend {
   Future<void> clearAuthKey() async {
     if (_installing) await cancelInstall();
     ++_sessionEpoch;
+    _setHandshakePhase(_HandshakePhase.none);
     _clearSensitiveSessionMaterial(clearAuthKey: true);
     _resumeAuthenticatedSession = false;
     _recoveringPostAuthClose = false;
     _failPending(const _Cancelled());
     if (_connection != TuiProtocolConnectionState.disconnected) {
       _connection = TuiProtocolConnectionState.awaitingAuthKey;
+      _setHandshakePhase(_HandshakePhase.awaitingAuthKey);
     }
     _emit('authkey 与会话材料已从内存清除。');
   }
 
-  Future<void> connect(TuiTransportDevice device,
-      {DeviceProfile? profile}) async {
+  Future<void> connect(
+    TuiTransportDevice device, {
+    DeviceProfile? profile,
+    required TuiBackendBindingMaterial? bindingMaterial,
+  }) async {
     if (!Platform.isMacOS)
       throw UnsupportedError('Wristload TUI only supports macOS.');
     if (!kSppAuthProtocolVerified) throw StateError('SPP 鉴权尚未通过真机验证。');
@@ -166,10 +217,19 @@ class TuiProtocolBackend {
     _profile = resolvedProfile;
     _connection = TuiProtocolConnectionState.connecting;
     _accumulator = Accumulator();
-    _clearSensitiveSessionMaterial();
+    _clearSensitiveSessionMaterial(clearBinding: true);
+    // disconnect() and the explicit cleanup above erased all retired session
+    // material. Lock this exact per-device binding only after that boundary so
+    // it survives the logical session, including a post-auth RFCOMM rebuild.
+    // This is optional explicit WearAuthV2 material for the exact device. The
+    // official Classic path also permits f=26 without it; never derive a
+    // replacement from the Bluetooth address or authkey.
+    _sessionBinding = bindingMaterial;
     _resumeAuthenticatedSession = false;
     _postAuthReconnectAttempts = 0;
     final epoch = ++_sessionEpoch;
+    final generation = ++_transportGeneration;
+    _setHandshakePhase(_HandshakePhase.connecting);
     _emit('正在通过 macOS RFCOMM 连接 ${device.address}。');
     try {
       await _transport.connect(device);
@@ -179,12 +239,14 @@ class TuiProtocolBackend {
       // cannot arrive on this new byte stream and the sequence space may be
       // created afresh here. Never reset it before that boundary.
       _sequenceAllocator = SppSequenceAllocator();
+      final phaseToken = _setHandshakePhase(_HandshakePhase.l1StartSent);
       _failureCode = null;
       _connection = TuiProtocolConnectionState.authenticating;
       _emit('RFCOMM 已连接，发送 L1START。');
-      await _transport.write(SppProtocol.buildL1StartRequest());
+      await _writeOrdered(SppProtocol.buildL1StartRequest(), generation);
+      _journalL1StartSent(resumed: false);
       if (_disposed || epoch != _sessionEpoch) return;
-      _armWatchdog('15 秒内未收到 L1START 响应。');
+      _armWatchdog('15 秒内未收到 L1START 响应。', expectedPhaseToken: phaseToken);
     } on Object catch (error) {
       if (epoch == _sessionEpoch) {
         _invalidateSession();
@@ -199,11 +261,13 @@ class TuiProtocolBackend {
       return;
     _explicitDisconnect = true;
     ++_sessionEpoch;
+    ++_transportGeneration;
+    _setHandshakePhase(_HandshakePhase.none);
     _watchdog?.cancel();
     _watchdog = null;
     if (_installing) await cancelInstall();
     _failPending(const _Cancelled());
-    _clearSensitiveSessionMaterial();
+    _clearSensitiveSessionMaterial(clearBinding: true);
     _resumeAuthenticatedSession = false;
     _recoveringPostAuthClose = false;
     _postAuthReconnectAttempts = 0;
@@ -321,11 +385,27 @@ class TuiProtocolBackend {
     final previousStage = entry.stage;
     final previousMessage = entry.message;
     final previousAttempts = entry.failureAttempts;
+    _journalEvent(
+      event: 'install.retry',
+      category: DiagnosticCategory.install,
+      message: 'Installation retry requested.',
+      stage: previousStage.name,
+      retry: previousAttempts + 1,
+      fields: <String, Object?>{'kind': entry.request.kind.name},
+    );
     try {
       if (!sessionReady) {
         final device = _device;
         if (device == null) throw StateError('没有要重连的设备。');
-        await connect(device, profile: _profile);
+        // A retry reuses the exact optional material captured for this logical
+        // session. Its absence selects the official nonce-only Classic branch;
+        // never derive a replacement from the device identity or authkey.
+        final bindingMaterial = _sessionBinding;
+        await connect(
+          device,
+          profile: _profile,
+          bindingMaterial: bindingMaterial,
+        );
         await _waitForReady();
       }
       entry
@@ -356,6 +436,16 @@ class TuiProtocolBackend {
       return;
     }
     _installing = true;
+    _journalEvent(
+      event: 'install.requested',
+      category: DiagnosticCategory.install,
+      message: 'Installation requested.',
+      stage: 'requested',
+      fields: <String, Object?>{
+        'kind': request.kind.name,
+        'totalBytes': request.metadata.fileSize,
+      },
+    );
     _cancelled = false;
     _lastRequest = request;
     _cancelSignal = Completer<void>();
@@ -400,6 +490,16 @@ class TuiProtocolBackend {
 
   Future<void> cancelInstall() async {
     if (!_installing) return;
+    _journalEvent(
+      event: 'install.cancel_requested',
+      category: DiagnosticCategory.install,
+      severity: DiagnosticSeverity.warning,
+      message: 'Installation cancellation requested.',
+      stage: _latestTask?.stage.name ?? 'running',
+      fields: <String, Object?>{
+        if (_latestTask != null) 'kind': _latestTask!.kind.name,
+      },
+    );
     _cancelled = true;
     if (!(_cancelSignal?.isCompleted ?? true)) _cancelSignal!.complete();
     _invalidateTransportSession(const _Cancelled());
@@ -766,40 +866,109 @@ class TuiProtocolBackend {
     if (data.isEmpty) return _onTransportClosed();
     _accumulator.buffer = [..._accumulator.buffer, ...data];
     for (final packet in SppProtocol.parse(_accumulator)) {
-      _handlePacket(packet);
+      final attribution = _FrameAttribution(
+        epoch: _sessionEpoch,
+        generation: _transportGeneration,
+      );
+      _orderedPacketHandling = _orderedPacketHandling.then((_) async {
+        if (!_attributionIsCurrent(attribution)) {
+          _log('忽略来自旧连接代际的 SPP 帧。');
+          return;
+        }
+        await _handlePacket(packet, attribution);
+      }).catchError((Object error, StackTrace stack) {
+        if (_attributionIsCurrent(attribution)) {
+          _rejectHandshake('处理 SPP 握手帧失败：$error');
+        }
+      });
     }
   }
 
-  void _handlePacket(SppPacket packet) {
+  Future<void> _handlePacket(
+    SppPacket packet,
+    _FrameAttribution attribution,
+  ) async {
+    if (_connection == TuiProtocolConnectionState.disconnected ||
+        _handshake == _HandshakePhase.none ||
+        !_attributionIsCurrent(attribution)) {
+      _log('忽略失效连接的握手帧。');
+      return;
+    }
     if (packet.type == SppProtocol.typeCmd &&
         packet.payload.isNotEmpty &&
         packet.payload.first == SppProtocol.cmdL1StartRsp) {
+      if (_handshake != _HandshakePhase.l1StartSent) {
+        _rejectHandshake('拒绝无归属、过期或重复的 L1START 响应。');
+        return;
+      }
+      final L1StartConfiguration configuration;
+      try {
+        configuration = SppProtocol.parseL1StartResponse(packet.payload);
+      } on FormatException {
+        _rejectHandshake('拒绝格式错误的 L1START 配置响应。');
+        return;
+      }
       if (_resumeAuthenticatedSession && _cipher != null) {
+        _setHandshakePhase(_HandshakePhase.ready);
         _resumeAuthenticatedSession = false;
         _recoveringPostAuthClose = false;
         _authenticatedAt = null;
         _connection = TuiProtocolConnectionState.ready;
         _watchdog?.cancel();
+        _journalEvent(
+          event: 'protocol.l1start.accepted',
+          category: DiagnosticCategory.framing,
+          message: 'L1START response accepted.',
+          stage: 'l1start.response',
+          fields: _l1StartResponseFields(configuration, resumed: true),
+        );
+        _journalReady(resumed: true);
         _emit('RFCOMM 传输已恢复，继续使用已确认的会话密钥。');
       } else if (_authKey == null) {
+        _setHandshakePhase(_HandshakePhase.awaitingAuthKey);
         _connection = TuiProtocolConnectionState.awaitingAuthKey;
         _watchdog?.cancel();
+        _journalEvent(
+          event: 'protocol.l1start.accepted',
+          category: DiagnosticCategory.framing,
+          message: 'L1START response accepted.',
+          stage: 'l1start.response',
+          fields: _l1StartResponseFields(configuration, resumed: false),
+        );
         _emit('L1 会话已建立，请输入 authkey 继续鉴权。');
       } else {
+        _setHandshakePhase(_HandshakePhase.f26Sent);
         _connection = TuiProtocolConnectionState.authenticating;
+        _journalEvent(
+          event: 'protocol.l1start.accepted',
+          category: DiagnosticCategory.framing,
+          message: 'L1START response accepted.',
+          stage: 'l1start.response',
+          fields: _l1StartResponseFields(configuration, resumed: false),
+        );
         _runHandshakeStep(
-          (epoch) => _sendAuthStep1(expectedEpoch: epoch),
+          (epoch, token) =>
+              _sendAuthStep1(expectedEpoch: epoch, expectedPhaseToken: token),
           '发送 f=26',
         );
       }
       return;
     }
     if (packet.type == SppProtocol.typeData) {
-      _runHandshakeStep(
-        (_) => _transport.write(SppProtocol.buildAck(packet.seq)),
-        '发送 SPP ACK',
+      if (packet.payload.length < 2) {
+        _rejectHandshake('拒绝缺少 L2 channel/opcode 的 DATA 帧。');
+        return;
+      }
+      final channel = packet.payload[0] & 0x0f;
+      final opcode = packet.payload[1];
+      if (!_acceptDataFrame(channel, opcode, packet.payload.sublist(2))) return;
+      await _writeOrdered(
+        SppProtocol.buildAck(packet.seq),
+        attribution.generation,
+        expectedEpoch: attribution.epoch,
       );
-      if (packet.payload.length >= 2) _handleData(packet.payload);
+      if (!_attributionIsCurrent(attribution)) return;
+      await _handleData(packet.payload, attribution);
       return;
     }
     if (packet.type == SppProtocol.typeAck) {
@@ -846,7 +1015,10 @@ class TuiProtocolBackend {
     }
   }
 
-  void _handleData(List<int> payload) {
+  Future<void> _handleData(
+    List<int> payload,
+    _FrameAttribution attribution,
+  ) async {
     final channel = payload[0] & 0x0f;
     final opcode = payload[1];
     final data = payload.sublist(2);
@@ -866,49 +1038,184 @@ class TuiProtocolBackend {
       return;
     }
     final auth = XiaomiAuth.parse(data);
-    if (auth?.watchNonce != null && _phoneNonce != null) {
-      _runHandshakeStep(
-        (epoch) => _sendAuthConfirm(
-          auth!.watchNonce!,
-          auth.watchHmac ?? const [],
-          expectedEpoch: epoch,
-        ),
-        '发送 f=27',
+    if (_handshake == _HandshakePhase.f26Sent &&
+        auth?.type == XiaomiAuth.commandType &&
+        auth?.subtype == XiaomiAuth.cmdNonce &&
+        auth?.watchNonce != null &&
+        auth!.watchNonce!.isNotEmpty &&
+        auth.watchHmac != null &&
+        auth.watchHmac!.isNotEmpty &&
+        _phoneNonce != null) {
+      final phaseToken = _setHandshakePhase(_HandshakePhase.f27Sent);
+      _journalEvent(
+        event: 'auth.f26.response_received',
+        category: DiagnosticCategory.auth,
+        message: 'WearAuthV2 f=26 response accepted.',
+        stage: 'f26.response',
       );
+      await _sendAuthConfirm(
+        auth.watchNonce!,
+        auth.watchHmac!,
+        expectedEpoch: attribution.epoch,
+        expectedPhaseToken: phaseToken,
+      );
+      return;
     }
-    if (auth?.subtype == XiaomiAuth.cmdAuth && auth?.authStatus == 1) {
+    if (_handshake == _HandshakePhase.f27Sent &&
+        auth?.type == XiaomiAuth.commandType &&
+        auth?.subtype == XiaomiAuth.cmdAuth &&
+        auth?.authStatus == 1) {
       final keys = _pendingKeys;
-      if (keys == null) return;
+      if (keys == null) {
+        _rejectHandshake('拒绝没有当前 f=27 派生密钥的鉴权确认。');
+        return;
+      }
       _cipher = SessionCipher(keys);
+      _setHandshakePhase(_HandshakePhase.ready);
       _pendingKeys = null;
+      _wipeBytes(_phoneNonce);
+      _phoneNonce = null;
       _retireOptionalAcks(_sessionEpoch);
       _connection = TuiProtocolConnectionState.ready;
       _armPostAuthTransition();
       _watchdog?.cancel();
+      _journalEvent(
+        event: 'auth.success',
+        category: DiagnosticCategory.auth,
+        message: 'WearAuthV2 authentication succeeded.',
+        stage: 'f27.confirmed',
+        fields: const <String, Object?>{'result': 'success'},
+      );
+      _journalReady(resumed: false);
       _emit('鉴权完成，设备就绪。');
+      return;
     }
+    _rejectHandshake('拒绝与当前握手阶段不匹配的 channel/opcode/auth 帧。');
   }
 
-  Future<void> _sendAuthStep1({required int expectedEpoch}) async {
-    if (_disposed || expectedEpoch != _sessionEpoch) return;
+  bool _acceptDataFrame(int channel, int opcode, List<int> data) {
+    if (_handshake == _HandshakePhase.ready) {
+      if (channel == SppProtocol.channelPb &&
+          opcode == SppProtocol.opCodeWriteEnc) {
+        return true;
+      }
+      _rejectHandshake('拒绝 ready 会话中的错误 channel/opcode DATA 帧。');
+      return false;
+    }
+    if (_handshake != _HandshakePhase.f26Sent &&
+        _handshake != _HandshakePhase.f27Sent) {
+      _rejectHandshake('拒绝当前阶段未请求的鉴权 DATA 帧。');
+      return false;
+    }
+    if (channel != SppProtocol.channelPb || opcode != SppProtocol.opCodeWrite) {
+      _rejectHandshake('拒绝鉴权阶段的错误 channel/opcode DATA 帧。');
+      return false;
+    }
+    final auth = XiaomiAuth.parse(data);
+    final validF26 = _handshake == _HandshakePhase.f26Sent &&
+        auth?.type == XiaomiAuth.commandType &&
+        auth?.subtype == XiaomiAuth.cmdNonce &&
+        auth?.watchNonce != null &&
+        auth!.watchNonce!.isNotEmpty &&
+        auth.watchHmac != null &&
+        auth.watchHmac!.isNotEmpty &&
+        _phoneNonce != null;
+    final validF27 = _handshake == _HandshakePhase.f27Sent &&
+        auth?.type == XiaomiAuth.commandType &&
+        auth?.subtype == XiaomiAuth.cmdAuth &&
+        auth?.authStatus == 1 &&
+        _pendingKeys != null;
+    if (validF26 || validF27) return true;
+    _rejectHandshake('拒绝无归属、过期、重复或 opcode 不匹配的鉴权帧。');
+    return false;
+  }
+
+  bool _attributionIsCurrent(_FrameAttribution attribution) =>
+      !_disposed &&
+      attribution.epoch == _sessionEpoch &&
+      attribution.generation == _transportGeneration;
+
+  Future<void> _writeOrdered(
+    List<int> bytes,
+    int generation, {
+    int? expectedEpoch,
+  }) {
+    final result = Completer<void>();
+    _orderedWrite = _orderedWrite.catchError((Object _) {}).then((_) async {
+      if (_disposed ||
+          generation != _transportGeneration ||
+          (expectedEpoch != null && expectedEpoch != _sessionEpoch)) {
+        throw const _StaleHandshakeOperation();
+      }
+      await _transport.write(bytes);
+    });
+    _orderedWrite.then(
+      (_) => result.complete(),
+      onError: (Object error, StackTrace stack) =>
+          result.completeError(error, stack),
+    );
+    return result.future;
+  }
+
+  void _rejectHandshake(String message) {
+    if (_connection == TuiProtocolConnectionState.disconnected) {
+      _log(message);
+      return;
+    }
+    final failure = _InvalidDeviceResponse(message);
+    _journalAuthFailure('invalid_handshake_frame');
+    _invalidateTransportSession(failure);
+    _emit('$message 会话已失效。');
+  }
+
+  Future<void> _sendAuthStep1({
+    required int expectedEpoch,
+    required int expectedPhaseToken,
+  }) async {
+    if (_disposed ||
+        expectedEpoch != _sessionEpoch ||
+        expectedPhaseToken != _handshakePhaseToken) return;
+    final binding = _sessionBinding;
     final nonce = List<int>.generate(16, (_) => _random.nextInt(256));
     _phoneNonce = nonce;
     final sequence = _nextSequence();
     final ack = _registerAck(sequence);
     try {
-      await _transport.write(SppProtocol.buildDataFrame(
-          sequence, XiaomiAuth.buildNonceCommand(nonce)));
+      await _writeOrdered(
+          SppProtocol.buildDataFrame(
+              sequence,
+              XiaomiAuth.buildNonceCommand(
+                nonce,
+                appDeviceId: binding?.appDeviceId,
+                hasOob: binding?.hasOob ?? false,
+              )),
+          _transportGeneration,
+          expectedEpoch: expectedEpoch);
     } on Object {
       _discardAck(ack);
       rethrow;
     }
-    if (_disposed || expectedEpoch != _sessionEpoch) return;
-    _armWatchdog('15 秒内未收到设备 nonce。');
+    if (_disposed ||
+        expectedEpoch != _sessionEpoch ||
+        expectedPhaseToken != _handshakePhaseToken) return;
+    _journalEvent(
+      event: 'auth.f26.sent',
+      category: DiagnosticCategory.auth,
+      message: 'WearAuthV2 f=26 request sent.',
+      stage: 'f26.sent',
+      fields: <String, Object?>{
+        'sequence': sequence,
+        'bindingMaterial': binding == null ? 'absent' : 'provided',
+      },
+    );
+    _armWatchdog('15 秒内未收到设备 nonce。', expectedPhaseToken: expectedPhaseToken);
   }
 
   Future<void> _sendAuthConfirm(List<int> watchNonce, List<int> watchHmac,
-      {required int expectedEpoch}) async {
-    if (_disposed || expectedEpoch != _sessionEpoch) return;
+      {required int expectedEpoch, required int expectedPhaseToken}) async {
+    if (_disposed ||
+        expectedEpoch != _sessionEpoch ||
+        expectedPhaseToken != _handshakePhaseToken) return;
     _retireOptionalAcks(expectedEpoch);
     final secret = XiaomiAuth.secretKeyFromHex(_authKey ?? '');
     if (secret == null) throw StateError('authkey 无效。');
@@ -928,26 +1235,64 @@ class TuiProtocolBackend {
         phoneNonce: phoneNonce,
         watchNonce: watchNonce,
         watchHmac: watchHmac,
-        phoneModel: phoneModel);
-    if (command == null) throw StateError('设备签名校验失败。');
+        phoneModel: phoneModel,
+        oob: _sessionBinding?.oob);
+    if (command == null) {
+      _rejectDeviceSignatureMismatch(
+        expectedEpoch: expectedEpoch,
+        expectedPhaseToken: expectedPhaseToken,
+      );
+      return;
+    }
     final pendingKeys = SessionKeys.fromHkdf(
       XiaomiAuth.computeStep3Hmac(secret, phoneNonce, watchNonce),
     );
-    if (_disposed || expectedEpoch != _sessionEpoch) return;
+    if (_disposed ||
+        expectedEpoch != _sessionEpoch ||
+        expectedPhaseToken != _handshakePhaseToken) return;
     _pendingKeys = pendingKeys;
     final sequence = _nextSequence();
     final ack = _registerAck(sequence);
     try {
-      await _transport.write(SppProtocol.buildDataFrame(sequence, command));
+      await _writeOrdered(
+          SppProtocol.buildDataFrame(sequence, command), _transportGeneration,
+          expectedEpoch: expectedEpoch);
     } on Object {
       _discardAck(ack);
       rethrow;
     }
-    if (_disposed || expectedEpoch != _sessionEpoch) {
+    if (_disposed ||
+        expectedEpoch != _sessionEpoch ||
+        expectedPhaseToken != _handshakePhaseToken) {
       if (identical(_pendingKeys, pendingKeys)) _clearPendingKeys();
       return;
     }
-    _armWatchdog('15 秒内未收到 f=27 鉴权确认。');
+    _journalEvent(
+      event: 'auth.f27.sent',
+      category: DiagnosticCategory.auth,
+      message: 'WearAuthV2 f=27 request sent.',
+      stage: 'f27.sent',
+      fields: <String, Object?>{'sequence': sequence},
+    );
+    _armWatchdog('15 秒内未收到 f=27 鉴权确认。', expectedPhaseToken: expectedPhaseToken);
+  }
+
+  void _rejectDeviceSignatureMismatch({
+    required int expectedEpoch,
+    required int expectedPhaseToken,
+  }) {
+    if (_disposed ||
+        expectedEpoch != _sessionEpoch ||
+        expectedPhaseToken != _handshakePhaseToken) {
+      return;
+    }
+    _failureCode = deviceSignatureMismatchFailureCode;
+    _journalAuthFailure(
+      deviceSignatureMismatchFailureCode,
+      stage: 'f26.response',
+    );
+    _invalidateTransportSession(const _DeviceSignatureMismatch());
+    _emit('设备签名校验失败；未发送 f=27，会话已关闭。');
   }
 
   Future<T> _withCancellation<T>(Future<T> future) {
@@ -970,21 +1315,28 @@ class TuiProtocolBackend {
   }
 
   void _runHandshakeStep(
-    Future<void> Function(int epoch) action,
+    Future<void> Function(int epoch, int phaseToken) action,
     String description,
   ) {
     final epoch = _sessionEpoch;
+    final phaseToken = _handshakePhaseToken;
     unawaited(() async {
       try {
-        await action(epoch);
-        if (_disposed || epoch != _sessionEpoch) return;
+        await action(epoch, phaseToken);
+        if (_disposed ||
+            epoch != _sessionEpoch ||
+            phaseToken != _handshakePhaseToken) return;
       } on Object catch (error) {
-        if (_disposed || epoch != _sessionEpoch) return;
+        if (_disposed ||
+            epoch != _sessionEpoch ||
+            phaseToken != _handshakePhaseToken) return;
         if (error is SppSequenceSpaceExhausted) {
+          _journalAuthFailure('sequence_space_exhausted');
           _failureCode = sppSequenceSpaceExhaustedFailureCode;
           _invalidateTransportSession(error);
           _emit('$description 失败：${error.userMessage}');
         } else {
+          _journalAuthFailure('handshake_write_failed');
           _invalidateSession();
           _failPending(error);
           _emit('$description 失败，会话已失效：$error');
@@ -1008,14 +1360,33 @@ class TuiProtocolBackend {
         return;
       }
       _accumulator = Accumulator();
-      await _transport.connect(device);
-      if (_disposed || epoch != _sessionEpoch) return;
+      final generation = ++_transportGeneration;
+      final connectingToken = _setHandshakePhase(_HandshakePhase.connecting);
+      _journalEvent(
+        event: 'session.retry',
+        category: DiagnosticCategory.session,
+        message: 'Post-authentication RFCOMM recovery requested.',
+        stage: 'post_auth_reconnect',
+        retry: _postAuthReconnectAttempts,
+      );
+      final reconnect = _postAuthReconnect;
+      if (reconnect != null) {
+        await reconnect(device);
+      } else {
+        await _transport.connect(device);
+      }
+      if (_disposed ||
+          epoch != _sessionEpoch ||
+          connectingToken != _handshakePhaseToken) return;
       // This is a new physical RFCOMM generation after the post-auth close.
       // Only now may sequence numbers start at zero again.
       _sequenceAllocator = SppSequenceAllocator();
+      final phaseToken = _setHandshakePhase(_HandshakePhase.l1StartSent);
       _failureCode = null;
-      await _transport.write(SppProtocol.buildL1StartRequest());
-      _armWatchdog('15 秒内未收到恢复链路的 L1START 响应。');
+      await _writeOrdered(SppProtocol.buildL1StartRequest(), generation,
+          expectedEpoch: epoch);
+      _journalL1StartSent(resumed: true);
+      _armWatchdog('15 秒内未收到恢复链路的 L1START 响应。', expectedPhaseToken: phaseToken);
     } on Object catch (error) {
       if (epoch != _sessionEpoch || _disposed) return;
       _recoveringPostAuthClose = false;
@@ -1121,16 +1492,48 @@ class TuiProtocolBackend {
     _lastSpeedBytes = bytes;
   }
 
-  void _armWatchdog(String message) {
+  void _armWatchdog(String message, {required int expectedPhaseToken}) {
     _watchdog?.cancel();
     final epoch = _sessionEpoch;
-    _watchdog = Timer(const Duration(seconds: 15), () {
-      if (_disposed || sessionReady || epoch != _sessionEpoch) return;
+    _watchdog = Timer(_handshakeTimeout, () {
+      if (_disposed ||
+          sessionReady ||
+          epoch != _sessionEpoch ||
+          expectedPhaseToken != _handshakePhaseToken) return;
+      final timedOutPhase = _handshake.name;
+      _journalEvent(
+        event: 'watchdog.timeout',
+        category: DiagnosticCategory.session,
+        severity: DiagnosticSeverity.error,
+        message: 'Protocol watchdog timed out.',
+        stage: timedOutPhase,
+        timeoutMs: _handshakeTimeout.inMilliseconds,
+        fields: const <String, Object?>{'result': 'timeout'},
+      );
+      _journalAuthFailure('watchdog_timeout', stage: timedOutPhase);
       _invalidateSession();
       _failPending(TimeoutException(message));
       _emit(message);
       unawaited(_transport.disconnect().catchError((_) {}));
     });
+  }
+
+  int _setHandshakePhase(_HandshakePhase phase) {
+    final previous = _handshake;
+    _handshake = phase;
+    if (previous != phase) {
+      _journalEvent(
+        event: 'session.transition',
+        category: DiagnosticCategory.session,
+        message: 'Protocol session phase changed.',
+        stage: phase.name,
+        fields: <String, Object?>{
+          'from': previous.name,
+          'to': phase.name,
+        },
+      );
+    }
+    return ++_handshakePhaseToken;
   }
 
   void _onTransportError(Object error, [StackTrace? stack]) {
@@ -1168,6 +1571,8 @@ class TuiProtocolBackend {
       _recoveringPostAuthClose = true;
       _resumeAuthenticatedSession = true;
       _connection = TuiProtocolConnectionState.connecting;
+      _setHandshakePhase(_HandshakePhase.connecting);
+      ++_transportGeneration;
       _failPending(StateError('RFCOMM 正在切换到鉴权后的新连接。'));
       final epoch = ++_sessionEpoch;
       _emit('检测到 f=27 后的传输切换，正在重建持久 RFCOMM 链路。');
@@ -1190,18 +1595,27 @@ class TuiProtocolBackend {
     }
   }
 
-  void _invalidateSession() {
+  void _invalidateSession({bool clearBinding = false}) {
     ++_sessionEpoch;
+    ++_transportGeneration;
+    _setHandshakePhase(_HandshakePhase.none);
     _watchdog?.cancel();
     _watchdog = null;
-    _clearSensitiveSessionMaterial();
+    // Keep the exact optional material only for an in-memory retry of this
+    // logical device attempt. Explicit disconnect, new connect, clear-key,
+    // and dispose paths clear it. Never synthesize a replacement.
+    _clearSensitiveSessionMaterial(clearBinding: clearBinding);
     _resumeAuthenticatedSession = false;
     _recoveringPostAuthClose = false;
     _connection = TuiProtocolConnectionState.disconnected;
   }
 
-  void _clearSensitiveSessionMaterial({bool clearAuthKey = false}) {
+  void _clearSensitiveSessionMaterial({
+    bool clearAuthKey = false,
+    bool clearBinding = true,
+  }) {
     if (clearAuthKey) _authKey = null;
+    if (clearBinding) _sessionBinding = null;
     _wipeBytes(_phoneNonce);
     _phoneNonce = null;
     _clearPendingKeys();
@@ -1287,7 +1701,163 @@ class TuiProtocolBackend {
         bytesPerSecond: bytesPerSecond,
         successVerifiedByDeviceBusinessEvent:
             successVerifiedByDeviceBusinessEvent);
+    _journalInstallStage(
+      request,
+      stage,
+      currentSegment: currentSegment,
+      totalSegments: totalSegments,
+      confirmedBytes: confirmedBytes,
+      queuedBytes: queuedBytes,
+      totalBytes: totalBytes,
+      successVerifiedByDeviceBusinessEvent:
+          successVerifiedByDeviceBusinessEvent,
+    );
     _emit(message);
+  }
+
+  void _journalL1StartSent({required bool resumed}) {
+    _journalEvent(
+      event: 'protocol.l1start.sent',
+      category: DiagnosticCategory.framing,
+      message: 'L1START request sent.',
+      stage: 'l1start.sent',
+      fields: <String, Object?>{'resumed': resumed},
+    );
+  }
+
+  Map<String, Object?> _l1StartResponseFields(
+    L1StartConfiguration configuration, {
+    required bool resumed,
+  }) =>
+      <String, Object?>{
+        'resumed': resumed,
+        'configTlvCount': configuration.tlvCount,
+        'unknownConfigTlvCount': configuration.unknownTlvCount,
+        if (configuration.version != null)
+          'remoteVersion': configuration.version,
+        if (configuration.remoteMps != null)
+          'remoteMps': configuration.remoteMps,
+        if (configuration.remoteTxWindow != null)
+          'remoteTxWindow': configuration.remoteTxWindow,
+        if (configuration.remoteSendTimeoutMs != null)
+          'remoteSendTimeoutMs': configuration.remoteSendTimeoutMs,
+      };
+
+  void _journalReady({required bool resumed}) {
+    _journalEvent(
+      event: 'session.ready',
+      category: DiagnosticCategory.session,
+      message: 'Protocol session is ready.',
+      stage: 'ready',
+      fields: <String, Object?>{
+        'result': 'ready',
+        'resumed': resumed,
+      },
+    );
+  }
+
+  void _journalAuthFailure(String reason, {String? stage}) {
+    _journalEvent(
+      event: 'auth.failure',
+      category: DiagnosticCategory.auth,
+      severity: DiagnosticSeverity.error,
+      message: 'WearAuthV2 authentication failed.',
+      stage: stage ?? _handshake.name,
+      fields: <String, Object?>{
+        'result': 'failure',
+        'reason': reason,
+      },
+    );
+  }
+
+  void _journalInstallStage(
+    InstallRequest request,
+    InstallStage stage, {
+    int? currentSegment,
+    int? totalSegments,
+    int? confirmedBytes,
+    int? queuedBytes,
+    int? totalBytes,
+    required bool successVerifiedByDeviceBusinessEvent,
+  }) {
+    final event = switch (stage) {
+      InstallStage.idle => 'install.idle',
+      InstallStage.validating => 'install.started',
+      InstallStage.waitingForProtocol => 'install.deferred',
+      InstallStage.transferring => 'install.progress',
+      InstallStage.awaitingDevice => 'install.awaiting_device',
+      InstallStage.succeeded => 'install.succeeded',
+      InstallStage.cancelled => 'install.cancelled',
+      InstallStage.stateUnknown => 'install.state_unknown',
+      InstallStage.failed => 'install.failed',
+    };
+    final severity = switch (stage) {
+      InstallStage.cancelled ||
+      InstallStage.stateUnknown =>
+        DiagnosticSeverity.warning,
+      InstallStage.failed => DiagnosticSeverity.error,
+      _ => DiagnosticSeverity.info,
+    };
+    _journalEvent(
+      event: event,
+      category: DiagnosticCategory.install,
+      severity: severity,
+      message: 'Installation entered ${stage.name}.',
+      stage: stage.name,
+      fields: <String, Object?>{
+        'kind': request.kind.name,
+        if (currentSegment != null) 'currentSegment': currentSegment,
+        if (totalSegments != null) 'totalSegments': totalSegments,
+        if (confirmedBytes != null) 'confirmedBytes': confirmedBytes,
+        if (queuedBytes != null) 'queuedBytes': queuedBytes,
+        if (totalBytes != null) 'totalBytes': totalBytes,
+        'deviceBusinessEventVerified': successVerifiedByDeviceBusinessEvent,
+      },
+    );
+  }
+
+  void _journalEvent({
+    required String event,
+    required DiagnosticCategory category,
+    required String message,
+    DiagnosticSeverity severity = DiagnosticSeverity.info,
+    String? stage,
+    int? timeoutMs,
+    int? retry,
+    Map<String, Object?> fields = const <String, Object?>{},
+  }) {
+    final journal = _diagnosticJournal;
+    if (journal == null) return;
+    final transport = _transport.snapshot;
+    final diagnostic = DiagnosticEvent(
+      timestamp: DateTime.now().toUtc(),
+      severity: severity,
+      category: category,
+      component: 'wristload.TuiProtocolBackend',
+      event: event,
+      message: message,
+      deviceId: transport.addressKey ?? _device?.addressKey,
+      sessionId: transport.activeSessionId,
+      connectionId: transport.connectionId,
+      generation: transport.connectionGeneration ?? _transportGeneration,
+      transport: transport.transport,
+      endpoint: transport.endpoint,
+      serviceUuid: transport.serviceUuid,
+      channel: transport.channel,
+      stage: stage,
+      timeoutMs: timeoutMs,
+      retry: retry,
+      fields: <String, Object?>{
+        'sessionEpoch': _sessionEpoch,
+        'transportGeneration': _transportGeneration,
+        ...fields,
+      },
+    );
+    final next = _journalTail.then<void>(
+      (_) => journal.append(diagnostic),
+      onError: (_) => journal.append(diagnostic),
+    );
+    _journalTail = next.then<void>((_) {}, onError: (_) {});
   }
 
   void _log(String message) {
@@ -1320,8 +1890,9 @@ class TuiProtocolBackend {
   Future<void> dispose() async {
     if (_disposed) return;
     await disconnect();
-    _clearSensitiveSessionMaterial(clearAuthKey: true);
+    _clearSensitiveSessionMaterial(clearAuthKey: true, clearBinding: true);
     _lastRequest = null;
+    await _journalTail;
     _disposed = true;
     ++_sessionEpoch;
     await _inputSubscription?.cancel();
@@ -1330,6 +1901,27 @@ class TuiProtocolBackend {
     await _snapshots.close();
     await _transport.dispose();
   }
+}
+
+enum _HandshakePhase {
+  none,
+  connecting,
+  l1StartSent,
+  awaitingAuthKey,
+  f26Sent,
+  f27Sent,
+  ready,
+}
+
+final class _FrameAttribution {
+  const _FrameAttribution({required this.epoch, required this.generation});
+
+  final int epoch;
+  final int generation;
+}
+
+final class _StaleHandshakeOperation implements Exception {
+  const _StaleHandshakeOperation();
 }
 
 class _PendingAck {
@@ -1387,6 +1979,10 @@ class _DeviceFailure implements Exception {
 class _InvalidDeviceResponse implements Exception {
   const _InvalidDeviceResponse(this.message);
   final String message;
+}
+
+class _DeviceSignatureMismatch implements Exception {
+  const _DeviceSignatureMismatch();
 }
 
 class _BusinessWaiter {

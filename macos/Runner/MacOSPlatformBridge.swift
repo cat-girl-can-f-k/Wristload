@@ -1,7 +1,7 @@
 import Cocoa
+import CoreBluetooth
 import FlutterMacOS
 import IOBluetooth
-import IOBluetoothUI
 import Security
 
 private let appOwnedBookmarkPrefix = "wristload-app-owned-v1:"
@@ -28,6 +28,127 @@ private struct PlatformBridgeError: Error {
   }
 }
 
+/// Bridges macOS CoreBluetooth's TCC authorization state to Flutter. Creating
+/// the central manager is the supported trigger for the first authorization
+/// prompt. macOS does not expose a public API to force a second prompt after a
+/// denial, so callers receive the current state and can open System Settings.
+private final class MacOSBluetoothPermissionService: NSObject, CBCentralManagerDelegate {
+  private var centralManager: CBCentralManager?
+  private var pendingResults: [FlutterResult] = []
+
+  func requestAuthorization(completion: @escaping FlutterResult) {
+    runOnMain { [weak self] in
+      guard let self else { return }
+      let authorization = Self.authorizationStatus()
+      guard authorization == .notDetermined else {
+        completion(Self.reply(for: authorization))
+        return
+      }
+      self.pendingResults.append(completion)
+      if self.centralManager == nil {
+        self.centralManager = CBCentralManager(
+          delegate: self,
+          queue: .main,
+          options: [CBCentralManagerOptionShowPowerAlertKey: false]
+        )
+      }
+
+      // Manager construction can synchronously invoke the delegate. Check the
+      // current authorization after construction before scheduling a fallback.
+      self.finishPendingAuthorizationRequests()
+    }
+  }
+
+  func getAuthorizationStatus(completion: @escaping FlutterResult) {
+    runOnMain {
+      completion(Self.reply(for: Self.authorizationStatus()))
+    }
+  }
+
+  func openBluetoothPrivacySettings(completion: @escaping FlutterResult) {
+    runOnMain {
+      let deepLinks = [
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_Bluetooth",
+        "x-apple.systempreferences:com.apple.preference.security?Privacy",
+        "x-apple.systempreferences:"
+      ].compactMap(URL.init(string:))
+      for url in deepLinks where NSWorkspace.shared.open(url) {
+        completion(true)
+        return
+      }
+      let settingsURL = URL(fileURLWithPath: "/System/Applications/System Settings.app")
+      if NSWorkspace.shared.open(settingsURL) {
+        completion(true)
+        return
+      }
+      let preferencesURL = URL(fileURLWithPath: "/System/Library/PreferencePanes/Security.prefPane")
+      completion(NSWorkspace.shared.open(preferencesURL))
+    }
+  }
+
+  func centralManagerDidUpdateState(_ central: CBCentralManager) {
+    runOnMain { [weak self] in
+      self?.finishPendingAuthorizationRequests()
+    }
+  }
+
+  func invalidate() {
+    runOnMain { [weak self] in
+      guard let self else { return }
+      self.centralManager?.delegate = nil
+      self.centralManager = nil
+      let pending = self.pendingResults
+      self.pendingResults.removeAll()
+      for completion in pending {
+        completion(FlutterError(
+          code: "bluetooth_permission_unavailable",
+          message: "The macOS Bluetooth permission bridge was released.",
+          details: nil
+        ))
+      }
+    }
+  }
+
+  private func finishPendingAuthorizationRequests() {
+    guard !pendingResults.isEmpty else { return }
+    let authorization = Self.authorizationStatus()
+    // The TCC prompt may remain on screen for longer than an arbitrary timeout.
+    // Keep the Flutter request pending until CoreBluetooth reports an actual
+    // decision, rather than turning an unanswered prompt into a denial.
+    guard authorization != .notDetermined else {
+      return
+    }
+    let pending = pendingResults
+    pendingResults.removeAll()
+    let reply = Self.reply(for: authorization)
+    for completion in pending { completion(reply) }
+  }
+
+  private static func authorizationStatus() -> CBManagerAuthorization {
+    CBManager.authorization
+  }
+
+  private static func reply(for authorization: CBManagerAuthorization) -> [String: Any] {
+    let status: String
+    switch authorization {
+    case .notDetermined: status = "notDetermined"
+    case .restricted: status = "restricted"
+    case .denied: status = "denied"
+    case .allowedAlways: status = "authorized"
+    @unknown default: status = "unknown"
+    }
+    return ["status": status]
+  }
+
+  private func runOnMain(_ action: @escaping () -> Void) {
+    if Thread.isMainThread {
+      action()
+    } else {
+      DispatchQueue.main.async(execute: action)
+    }
+  }
+}
+
 /// Owns native services for the primary Flutter engine. Secondary windows only
 /// render snapshots and deliberately do not create another Bluetooth transport.
 final class MacOSPlatformBridge: NSObject, FlutterStreamHandler {
@@ -36,6 +157,8 @@ final class MacOSPlatformBridge: NSObject, FlutterStreamHandler {
   private let rfcommChannel: FlutterMethodChannel
   private let rfcommEventChannel: FlutterEventChannel
   private let securityScopeChannel: FlutterMethodChannel
+  private let bluetoothPermissionChannel: FlutterMethodChannel
+  private let bluetoothPermissionService = MacOSBluetoothPermissionService()
   private let rfcommTransport = MacOSRFCOMMTransport()
   private var rfcommEventSink: FlutterEventSink?
   private var pendingRFCOMMEvents: [[String: Any]] = []
@@ -63,6 +186,10 @@ final class MacOSPlatformBridge: NSObject, FlutterStreamHandler {
       name: "wristload/security_scope",
       binaryMessenger: binaryMessenger
     )
+    bluetoothPermissionChannel = FlutterMethodChannel(
+      name: "wristload/bluetooth_permission",
+      binaryMessenger: binaryMessenger
+    )
     super.init()
 
     secureStoreChannel.setMethodCallHandler { [weak self] call, result in
@@ -77,6 +204,9 @@ final class MacOSPlatformBridge: NSObject, FlutterStreamHandler {
     rfcommEventChannel.setStreamHandler(self)
     securityScopeChannel.setMethodCallHandler { [weak self] call, result in
       self?.handleSecurityScope(call, result: result)
+    }
+    bluetoothPermissionChannel.setMethodCallHandler { [weak self] call, result in
+      self?.handleBluetoothPermission(call, result: result)
     }
 
     rfcommTransport.onData = { [weak self] data in
@@ -104,8 +234,30 @@ final class MacOSPlatformBridge: NSObject, FlutterStreamHandler {
     rfcommChannel.setMethodCallHandler(nil)
     rfcommEventChannel.setStreamHandler(nil)
     securityScopeChannel.setMethodCallHandler(nil)
+    bluetoothPermissionChannel.setMethodCallHandler(nil)
+    bluetoothPermissionService.invalidate()
     for (_, url) in securityScopeURLs { url.stopAccessingSecurityScopedResource() }
     rfcommTransport.disconnect()
+  }
+
+  private func handleBluetoothPermission(
+    _ call: FlutterMethodCall,
+    result: @escaping FlutterResult
+  ) {
+    switch call.method {
+    case "requestBluetoothAuthorization":
+      // Allocating a CBCentralManager is the supported way to make macOS
+      // evaluate an undetermined Bluetooth TCC decision. A prior denial cannot
+      // be programmatically re-prompted; the returned status tells Dart when
+      // it must offer the System Settings route instead.
+      bluetoothPermissionService.requestAuthorization(completion: result)
+    case "getBluetoothAuthorizationStatus":
+      bluetoothPermissionService.getAuthorizationStatus(completion: result)
+    case "openBluetoothPrivacySettings":
+      bluetoothPermissionService.openBluetoothPrivacySettings(completion: result)
+    default:
+      result(FlutterMethodNotImplemented)
+    }
   }
 
   private func handleSecurityScope(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -824,17 +976,109 @@ private final class MacOSRFCOMMSession {
   }
 }
 
-/// Owns a system classic-Bluetooth selection/pairing operation independently
-/// of an RFCOMM session. A selected device is still only a candidate until
-/// the Dart application layer finishes its authkey handshake.
+/// Performs a public Classic Bluetooth inquiry. The inquiry is retained until
+/// its terminal callback so name updates can
+/// complete before identity matching.
+private final class MacOSClassicDeviceInquiry: NSObject, IOBluetoothDeviceInquiryDelegate {
+  private let completion: (MacOSClassicDeviceInquiry, [IOBluetoothDevice], IOReturn, Bool) -> Void
+  private var found: [String: IOBluetoothDevice] = [:]
+  private var finished = false
+  private(set) var inquiry: IOBluetoothDeviceInquiry?
+
+  init(
+    completion: @escaping (MacOSClassicDeviceInquiry, [IOBluetoothDevice], IOReturn, Bool) -> Void
+  ) {
+    self.completion = completion
+    super.init()
+  }
+
+  func start() -> IOReturn {
+    guard !finished else { return kIOReturnNotPermitted }
+    guard let inquiry = IOBluetoothDeviceInquiry(delegate: self) else {
+      return kIOReturnNoMemory
+    }
+    self.inquiry = inquiry
+    inquiry.inquiryLength = 10
+    inquiry.updateNewDeviceNames = true
+    inquiry.searchType = kIOBluetoothDeviceSearchClassic.rawValue
+    return inquiry.start()
+  }
+
+  func stop() {
+    guard let inquiry else { return }
+    _ = inquiry.stop()
+  }
+
+  func deviceInquiryStarted(_ sender: IOBluetoothDeviceInquiry) {}
+
+  func deviceInquiryDeviceFound(
+    _ sender: IOBluetoothDeviceInquiry,
+    device: IOBluetoothDevice
+  ) {
+    guard let address = device.addressString?.uppercased(), !address.isEmpty else {
+      return
+    }
+    found[address] = device
+  }
+
+  func deviceInquiryUpdatingDeviceNamesStarted(
+    _ sender: IOBluetoothDeviceInquiry,
+    devicesRemaining: UInt32
+  ) {}
+
+  func deviceInquiryDeviceNameUpdated(
+    _ sender: IOBluetoothDeviceInquiry,
+    device: IOBluetoothDevice,
+    devicesRemaining: UInt32
+  ) {
+    guard let address = device.addressString?.uppercased(), !address.isEmpty else {
+      return
+    }
+    found[address] = device
+  }
+
+  func deviceInquiryComplete(
+    _ sender: IOBluetoothDeviceInquiry,
+    error: IOReturn,
+    aborted: Bool
+  ) {
+    guard !finished else { return }
+    finished = true
+    for device in sender.foundDevices().compactMap({ $0 as? IOBluetoothDevice }) {
+      guard let address = device.addressString?.uppercased(), !address.isEmpty else {
+        continue
+      }
+      found[address] = device
+    }
+    inquiry = nil
+    let devices = Array(found.values)
+    found.removeAll()
+    runOnMain { [weak self, completion] in
+      guard let self else { return }
+      completion(self, devices, error, aborted)
+    }
+  }
+
+  private func runOnMain(_ action: @escaping () -> Void) {
+    if Thread.isMainThread {
+      action()
+    } else {
+      DispatchQueue.main.async(execute: action)
+    }
+  }
+}
+
+/// Owns a system classic-Bluetooth pairing operation independently of an
+/// RFCOMM session. A resolved device is still only a candidate until the Dart
+/// application layer finishes its authkey handshake.
 private final class MacOSClassicPairingOperation: NSObject {
   let peripheralID: String
   let advertisedName: String
   let completion: FlutterResult
-  var selector: IOBluetoothDeviceSelectorController?
+  var inquiry: MacOSClassicDeviceInquiry?
   var attempt: MacOSClassicPairingAttempt?
   var timeout: Timer?
-  var phase = "selector"
+  var phase = "resolving"
   var completed = false
 
   init(
@@ -1308,9 +1552,6 @@ private final class MacOSRFCOMMTransport: NSObject {
   private var retiredSessions: [UInt64: MacOSRFCOMMSession] = [:]
   private var provisionalMappings: [String: String] = [:]
   private var pairingOperation: MacOSClassicPairingOperation?
-  // A selector owns a nested AppKit modal loop. Keep it gated until that loop
-  // returns, so cancellation cannot race a new selector into existence.
-  private var selectorModalOperation: MacOSClassicPairingOperation?
   private let teardownTimeoutInterval: TimeInterval = 5
   private let retiredCleanupInterval: TimeInterval = 30
   private let pairingTimeoutInterval: TimeInterval = 90
@@ -1546,19 +1787,6 @@ private final class MacOSRFCOMMTransport: NSObject {
     advertisedName: String,
     completion: @escaping FlutterResult
   ) {
-    guard selectorModalOperation == nil else {
-      emitEvent("pairing_rejected", fields: [
-        "peripheral": peripheralID,
-        "advertisedName": advertisedName,
-        "reason": "selector_dismissing",
-      ])
-      completion(FlutterError(
-        code: "pairing_closing",
-        message: "The previous Classic Bluetooth device selector is still closing. Try again in a moment.",
-        details: nil
-      ))
-      return
-    }
     guard pairingOperation == nil else {
       completion(FlutterError(
         code: "pairing_in_progress",
@@ -1594,10 +1822,10 @@ private final class MacOSRFCOMMTransport: NSObject {
       ) {
       case .resolved(let selected):
         completePairingOperation(operation, with: .success(selected))
-      case .needsSelection(let matchingCandidates):
-        presentClassicDeviceSelector(
+      case .requiresInquiry(let matchingPairedCandidates):
+        startClassicDeviceInquiry(
           for: operation,
-          matchingCandidates: matchingCandidates
+          matchingPairedCandidates: matchingPairedCandidates
         )
       }
     } catch let error as PlatformBridgeError {
@@ -1613,8 +1841,6 @@ private final class MacOSRFCOMMTransport: NSObject {
   private func schedulePairingTimeout(
     for operation: MacOSClassicPairingOperation
   ) {
-    // IOBluetoothDeviceSelectorController.runModal() switches the main run
-    // loop into a modal mode, so the deadline must be in the common mode.
     operation.timeout = scheduleCommonModeTimer(interval: pairingTimeoutInterval) {
       [weak self, weak operation] _ in
       guard let self,
@@ -1632,89 +1858,104 @@ private final class MacOSRFCOMMTransport: NSObject {
     }
   }
 
-  /// Presents macOS's public classic-device selector. No SPP UUID filter is
-  /// applied here: a band may not expose its SPP SDP record until pairing, and
-  /// the existing RFCOMM SDP phase remains the authoritative validation.
-  private func presentClassicDeviceSelector(
+  /// Discovers the Classic endpoint with the public IOBluetooth inquiry API.
+  /// A CoreBluetooth UUID is not a Classic address, so no address-based lookup
+  /// is possible here. The strict name rule is deliberately retained and only
+  /// a single live Classic candidate is allowed to proceed to system pairing.
+  private func startClassicDeviceInquiry(
     for operation: MacOSClassicPairingOperation,
-    matchingCandidates: Int
+    matchingPairedCandidates: Int
   ) {
     guard pairingOperation === operation, !operation.completed else { return }
-    guard let selector = IOBluetoothDeviceSelectorController.deviceSelector()
-    else {
-      completePairingOperation(operation, with: .failure(PlatformBridgeError(
-        "device_selector",
-        "macOS could not create the Classic Bluetooth device selector."
+    operation.phase = "inquiry"
+    let inquiry = MacOSClassicDeviceInquiry { [weak self, weak operation] completedInquiry, devices, status, aborted in
+      guard let self,
+            let operation,
+            self.pairingOperation === operation,
+            !operation.completed,
+            operation.inquiry === completedInquiry else { return }
+      operation.inquiry = nil
+      self.completeClassicDeviceInquiry(
+        operation,
+        devices: devices,
+        status: status,
+        aborted: aborted,
+        matchingPairedCandidates: matchingPairedCandidates
+      )
+    }
+    operation.inquiry = inquiry
+    emitEvent("classic_inquiry_started", fields: [
+      "peripheral": operation.peripheralID,
+      "advertisedName": operation.advertisedName,
+      "matchingPairedCandidates": matchingPairedCandidates,
+      "sppValidation": "deferred_to_sdp",
+    ])
+    let status = inquiry.start()
+    // The delegate may have synchronously completed before start() returned.
+    guard pairingOperation === operation,
+          !operation.completed,
+          operation.inquiry === inquiry else { return }
+    guard status == kIOReturnSuccess else {
+      operation.inquiry = nil
+      completePairingOperation(operation, with: .failure(ioError(
+        code: "classic_inquiry_start",
+        message: "macOS could not start Classic Bluetooth discovery.",
+        status: status
       )))
       return
     }
+  }
 
-    operation.selector = selector
-    operation.phase = "selector"
-    selector.setOptions(
-      IOBluetoothServiceBrowserControllerOptions(
-        kIOBluetoothServiceBrowserControllerOptionsAutoStartInquiry
-      )
-    )
-    selector.setTitle("Select Classic Bluetooth Device")
-    selector.setDescriptionText(
-      "Select the Classic Bluetooth device matching \"\(operation.advertisedName)\". The SPP service is verified after pairing."
-    )
-    selector.setPrompt("Select")
-    emitEvent("selector_opening", fields: [
-      "peripheral": operation.peripheralID,
-      "advertisedName": operation.advertisedName,
-      "matchingCandidates": matchingCandidates,
-      "sppValidation": "deferred_to_sdp",
-    ])
-
-    // runModal owns a nested AppKit event loop. A Flutter disconnect request
-    // can therefore cancel this operation while the panel is visible.
-    selectorModalOperation = operation
-    defer {
-      if self.selectorModalOperation === operation {
-        self.selectorModalOperation = nil
-      }
-    }
-    let status = selector.runModal()
-    let results = selector.getResults()
-    let resultCount = results?.count ?? 0
+  private func completeClassicDeviceInquiry(
+    _ operation: MacOSClassicPairingOperation,
+    devices: [IOBluetoothDevice],
+    status: IOReturn,
+    aborted: Bool,
+    matchingPairedCandidates: Int
+  ) {
     guard pairingOperation === operation, !operation.completed else { return }
-    operation.selector = nil
-    emitEvent("selector_finished", fields: [
+    guard status == kIOReturnSuccess, !aborted else {
+      completePairingOperation(operation, with: .failure(PlatformBridgeError(
+        aborted ? "classic_inquiry_aborted" : "classic_inquiry_failed",
+        aborted
+          ? "Classic Bluetooth discovery stopped before a device could be resolved."
+          : "Classic Bluetooth discovery failed (IOBluetooth status \(status)).",
+        details: ["status": Int(status), "aborted": aborted, "foundCandidates": devices.count]
+      )))
+      return
+    }
+    let matches = devices.filter { candidate in
+      classicNameMatchesAdvertisement(
+        advertisedName: operation.advertisedName,
+        classicName: candidate.name ?? candidate.nameOrAddress ?? ""
+      )
+    }
+    emitEvent("classic_inquiry_completed", fields: [
       "peripheral": operation.peripheralID,
       "advertisedName": operation.advertisedName,
       "status": Int(status),
-      "resultsCount": resultCount,
-      "success": status == kIOBluetoothUISuccess,
+      "foundCandidates": devices.count,
+      "matchingCandidates": matches.count,
+      "matchingPairedCandidates": matchingPairedCandidates,
+      "matchModes": matches.map { candidate in
+        classicNameMatchMode(
+          advertisedName: operation.advertisedName,
+          classicName: candidate.name ?? candidate.nameOrAddress ?? ""
+        ) ?? "unknown"
+      },
     ])
-    guard status == kIOBluetoothUISuccess else {
-      let wasCancelled = status == kIOBluetoothUIUserCanceledErr
+    guard matches.count == 1, let selected = matches.first else {
+      let isEmpty = matches.isEmpty
       completePairingOperation(operation, with: .failure(PlatformBridgeError(
-        wasCancelled ? "pairing_cancelled" : "device_selector",
-        wasCancelled
-          ? "Classic Bluetooth device selection was cancelled."
-          : "Classic Bluetooth device selection did not complete (macOS status \(status)).",
-        details: ["status": Int(status), "resultsCount": resultCount]
-      )))
-      return
-    }
-    guard let selected = results?.first as? IOBluetoothDevice else {
-      completePairingOperation(operation, with: .failure(PlatformBridgeError(
-        "pairing_no_result",
-        "macOS reported a successful device selection without a selected Classic Bluetooth device.",
-        details: ["status": Int(status), "resultsCount": resultCount]
-      )))
-      return
-    }
-    let selectedName = selected.name ?? selected.nameOrAddress ?? ""
-    guard classicNameMatchesAdvertisement(
-      advertisedName: operation.advertisedName,
-      classicName: selectedName
-    ) else {
-      completePairingOperation(operation, with: .failure(PlatformBridgeError(
-        "paired_device_mismatch",
-        "The selected Classic Bluetooth device does not match the scanned BLE device name."
+        isEmpty ? "classic_device_not_found" : "classic_device_ambiguous",
+        isEmpty
+          ? "No nearby Classic Bluetooth device matched the scanned BLE device name."
+          : "Multiple nearby Classic Bluetooth devices matched the scanned BLE device name; Wristload did not choose one automatically.",
+        details: [
+          "foundCandidates": devices.count,
+          "matchingCandidates": matches.count,
+          "matchingPairedCandidates": matchingPairedCandidates,
+        ]
       )))
       return
     }
@@ -1762,9 +2003,13 @@ private final class MacOSRFCOMMTransport: NSObject {
     operation.completed = true
     operation.timeout?.invalidate()
     operation.timeout = nil
-    operation.selector = nil
+    let inquiry = operation.inquiry
+    operation.inquiry = nil
     operation.attempt = nil
     pairingOperation = nil
+    // Stopping after clearing the owner link makes an asynchronous aborted
+    // callback observational only; the Flutter result remains exactly-once.
+    inquiry?.stop()
 
     switch result {
     case .success(let selected):
@@ -1811,24 +2056,7 @@ private final class MacOSRFCOMMTransport: NSObject {
     ])
     operation.attempt?.cancelSilently()
     operation.attempt = nil
-    let selector = operation.selector
-    // Complete first: abortModal() can synchronously unwind runModal(), and
-    // the old selector must never win that race with a successful result.
     completePairingOperation(operation, with: .failure(error))
-    closeClassicDeviceSelector(selector, for: operation)
-  }
-
-  private func closeClassicDeviceSelector(
-    _ selector: IOBluetoothDeviceSelectorController?,
-    for operation: MacOSClassicPairingOperation
-  ) {
-    guard let selector else { return }
-    // Only abort a nested modal loop that this transport owns. Comparing the
-    // window objects is not reliable on all macOS releases.
-    if selectorModalOperation === operation {
-      NSApp.abortModal()
-    }
-    selector.close()
   }
 
   private func emitPairingFailure(
@@ -2456,12 +2684,12 @@ private final class MacOSRFCOMMTransport: NSObject {
 
   private enum ClassicDeviceResolution {
     case resolved(IOBluetoothDevice)
-    case needsSelection(matchingCandidates: Int)
+    case requiresInquiry(matchingPairedCandidates: Int)
   }
 
-  /// Resolves only devices that are already known to macOS. A missing or
-  /// ambiguous identity is deliberately left to the system selector rather
-  /// than guessed from a BLE name.
+  /// Resolves only devices already known to macOS. A missing or ambiguous
+  /// identity is never guessed from a BLE name; pairing performs a separate
+  /// public Classic inquiry and accepts only one strict name match.
   private func resolveClassicDevice(
     peripheralID: String,
     advertisedName: String
@@ -2542,8 +2770,7 @@ private final class MacOSRFCOMMTransport: NSObject {
     ])
     if matches.count == 1 {
       // A single exact (or the documented one-way BLE instance-suffix) match
-      // is sufficient to reuse the system pairing. Do not present a second
-      // selector after macOS has already paired that unique device.
+      // is sufficient to reuse the system pairing.
       let selected = matches[0]
       emitEvent("classic_pairing_reused", fields: [
         "peripheral": peripheralID,
@@ -2563,11 +2790,11 @@ private final class MacOSRFCOMMTransport: NSObject {
         "matchingCandidates": matches.count,
       ])
     }
-    return .needsSelection(matchingCandidates: matches.count)
+    return .requiresInquiry(matchingPairedCandidates: matches.count)
   }
 
-  /// RFCOMM can use only a known paired device. This intentionally never
-  /// opens a selector: the earlier pair request owns all user interaction.
+  /// RFCOMM can use only a known paired device. The earlier pair request owns
+  /// discovery and any system pairing interaction.
   private func resolveDevice(
     peripheralID: String,
     advertisedName: String
@@ -2578,13 +2805,13 @@ private final class MacOSRFCOMMTransport: NSObject {
     ) {
     case .resolved(let selected):
       return selected
-    case .needsSelection(let matchingCandidates):
-      let isUnpaired = matchingCandidates == 0
+    case .requiresInquiry(let matchingPairedCandidates):
+      let isUnpaired = matchingPairedCandidates == 0
       throw PlatformBridgeError(
         isUnpaired ? "device_not_paired" : "device_not_confirmed",
         isUnpaired
           ? "The matching classic Bluetooth device is not paired. Reconnect and complete the macOS pairing dialog."
-          : "The classic Bluetooth device association is not confirmed. Reconnect and explicitly select the intended device."
+          : "The classic Bluetooth device association is ambiguous. Reconnect while only the intended device is nearby."
       )
     }
   }

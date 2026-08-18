@@ -36,7 +36,11 @@ final class TuiApplicationUiPortAdapter implements UiNextPort {
 
   @override
   Future<UiActionResult> connect(String macAddress) =>
-      _mapAction(_application.connectDevice(macAddress));
+      _mapAction(_application.connectSelectedScannedDevice(macAddress));
+
+  @override
+  Future<UiActionResult> connectDirectedExactAddress() =>
+      _mapAction(_application.connectDirectedExactAddress());
 
   @override
   Future<UiActionResult> disconnect() => _mapAction(_application.disconnect());
@@ -86,20 +90,29 @@ final class TuiApplicationUiPortAdapter implements UiNextPort {
       revision: source.revision,
       devices: source.devices.map(_mapDevice).toList(growable: false),
       connectionPhase: switch (source.connection) {
-        TuiApplicationConnectionState.disconnected =>
+        TuiApplicationConnectionState.idle ||
+        TuiApplicationConnectionState.scanning ||
+        TuiApplicationConnectionState.selected =>
           UiConnectionPhase.disconnected,
+        TuiApplicationConnectionState.waitingAuthkey =>
+          UiConnectionPhase.awaitingAuthKey,
         TuiApplicationConnectionState.connecting =>
           UiConnectionPhase.connecting,
-        TuiApplicationConnectionState.awaitingAuthKey =>
-          UiConnectionPhase.awaitingAuthKey,
+        // The current UI port has no raw-transport-only phase. Preserve the
+        // critical invariant by mapping it to connecting, never ready.
+        TuiApplicationConnectionState.connected => UiConnectionPhase.connecting,
         TuiApplicationConnectionState.authenticating =>
           UiConnectionPhase.authenticating,
-        TuiApplicationConnectionState.ready => UiConnectionPhase.ready,
+        TuiApplicationConnectionState.ready ||
+        TuiApplicationConnectionState.installing =>
+          UiConnectionPhase.ready,
         TuiApplicationConnectionState.disconnecting =>
           UiConnectionPhase.disconnecting,
         TuiApplicationConnectionState.failed => UiConnectionPhase.failed,
       },
       connectedDeviceId: source.activeDeviceId,
+      pendingAuthDeviceId: source.pendingAuthDeviceId,
+      connectionGeneration: source.connectionGeneration,
       scanning: source.scanning,
       autoConnect: source.autoConnectEnabled,
       autoConnectState: switch (source.autoConnectState) {
@@ -153,6 +166,7 @@ final class TuiApplicationUiPortAdapter implements UiNextPort {
       saved: source.saved,
       savedAuthKey: source.savedAuthKey,
       connected: source.connected,
+      isDirectedSessionTarget: source.isDirectedSessionTarget,
     );
   }
 }

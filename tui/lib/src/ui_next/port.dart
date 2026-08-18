@@ -43,6 +43,7 @@ class UiDevice {
     this.saved = false,
     this.savedAuthKey,
     this.connected = false,
+    this.isDirectedSessionTarget = false,
   })  : name = _displayName(name),
         macAddress = normalizeMac(macAddress);
 
@@ -52,6 +53,7 @@ class UiDevice {
   final bool saved;
   final String? savedAuthKey;
   final bool connected;
+  final bool isDirectedSessionTarget;
 
   String get id => macAddress;
   String get authKeyLabel =>
@@ -83,6 +85,7 @@ class UiDevice {
     String? savedAuthKey,
     bool clearSavedAuthKey = false,
     bool? connected,
+    bool? isDirectedSessionTarget,
   }) {
     return UiDevice(
       name: name ?? this.name,
@@ -92,6 +95,8 @@ class UiDevice {
       savedAuthKey:
           clearSavedAuthKey ? null : (savedAuthKey ?? this.savedAuthKey),
       connected: connected ?? this.connected,
+      isDirectedSessionTarget:
+          isDirectedSessionTarget ?? this.isDirectedSessionTarget,
     );
   }
 }
@@ -149,6 +154,8 @@ class UiSnapshot {
     List<UiDevice> devices = const [],
     this.connectionPhase = UiConnectionPhase.disconnected,
     this.connectedDeviceId,
+    this.pendingAuthDeviceId,
+    this.connectionGeneration = 0,
     this.scanning = false,
     this.autoConnect = false,
     this.autoConnectState = UiAutoConnectState.idle,
@@ -162,6 +169,16 @@ class UiSnapshot {
   final List<UiDevice> devices;
   final UiConnectionPhase connectionPhase;
   final String? connectedDeviceId;
+
+  /// Stable connection target that requested authkey input.
+  ///
+  /// This is intentionally distinct from [connectedDeviceId]: a reconnecting
+  /// application can publish a stale active transport identity while the
+  /// pending credential belongs to a newer attempt.
+  final String? pendingAuthDeviceId;
+
+  /// Monotonic identity for the application-owned connection attempt.
+  final int connectionGeneration;
   final bool scanning;
   final bool autoConnect;
   final UiAutoConnectState autoConnectState;
@@ -176,6 +193,9 @@ class UiSnapshot {
     UiConnectionPhase? connectionPhase,
     String? connectedDeviceId,
     bool clearConnectedDeviceId = false,
+    String? pendingAuthDeviceId,
+    bool clearPendingAuthDeviceId = false,
+    int? connectionGeneration,
     bool? scanning,
     bool? autoConnect,
     UiAutoConnectState? autoConnectState,
@@ -193,6 +213,10 @@ class UiSnapshot {
       connectedDeviceId: clearConnectedDeviceId
           ? null
           : (connectedDeviceId ?? this.connectedDeviceId),
+      pendingAuthDeviceId: clearPendingAuthDeviceId
+          ? null
+          : (pendingAuthDeviceId ?? this.pendingAuthDeviceId),
+      connectionGeneration: connectionGeneration ?? this.connectionGeneration,
       scanning: scanning ?? this.scanning,
       autoConnect: autoConnect ?? this.autoConnect,
       autoConnectState: autoConnectState ?? this.autoConnectState,
@@ -223,6 +247,7 @@ abstract interface class UiNextPort {
   Future<UiActionResult> initialize();
   Future<UiActionResult> scan();
   Future<UiActionResult> connect(String macAddress);
+  Future<UiActionResult> connectDirectedExactAddress();
   Future<UiActionResult> disconnect();
   Future<UiActionResult> saveDevice(String macAddress);
   Future<UiActionResult> removeSavedDevice(String macAddress);

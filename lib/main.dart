@@ -158,7 +158,8 @@ class WristloadApp extends StatefulWidget {
   State<WristloadApp> createState() => _WristloadAppState();
 }
 
-class _WristloadAppState extends State<WristloadApp> {
+class _WristloadAppState extends State<WristloadApp>
+    with WidgetsBindingObserver {
   final controller = DeviceController(logger: appLogger);
   final _appShellKey = GlobalKey<_AppShellState>();
   final _installRequestPreflight = const InstallRequestPreflight();
@@ -176,10 +177,14 @@ class _WristloadAppState extends State<WristloadApp> {
   late final ThemeController _themeController;
   Future<void> _preferenceWrites = Future.value();
   bool _floatingInitialized = false;
+  bool _macOSPermissionRefreshInFlight = false;
 
   @override
   void initState() {
     super.initState();
+    if (Platform.isMacOS) {
+      WidgetsBinding.instance.addObserver(this);
+    }
     _oobeCompleted = widget.initialOobeCompleted;
     _preferredInstallTarget = widget.initialPreference;
     _autoOpenDiagnosticLog = widget.initialAutoOpenDiagnosticLog;
@@ -203,6 +208,23 @@ class _WristloadAppState extends State<WristloadApp> {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) unawaited(_setDiagnosticLogWindowOpen(true));
       });
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    if (!Platform.isMacOS || state != AppLifecycleState.resumed) return;
+    unawaited(_refreshMacOSBluetoothPermissionAfterResume());
+  }
+
+  Future<void> _refreshMacOSBluetoothPermissionAfterResume() async {
+    if (_macOSPermissionRefreshInFlight || !mounted) return;
+    _macOSPermissionRefreshInFlight = true;
+    try {
+      await controller.refreshMacOSBluetoothAuthorization();
+    } finally {
+      _macOSPermissionRefreshInFlight = false;
     }
   }
 
@@ -304,7 +326,9 @@ class _WristloadAppState extends State<WristloadApp> {
       if (!mounted) return;
       setState(() => _autoOpenDiagnosticLog = enabled);
       appLogger.info(
-        enabled ? 'automatic diagnostic log enabled' : 'automatic diagnostic log disabled',
+        enabled
+            ? 'automatic diagnostic log enabled'
+            : 'automatic diagnostic log disabled',
         category: DiagnosticLogCategory.ui,
       );
     } on Object catch (error, stackTrace) {
@@ -324,7 +348,10 @@ class _WristloadAppState extends State<WristloadApp> {
   void _handleDiagnosticWindowClosed() {
     if (!mounted || !_diagnosticLogWindowOpen) return;
     setState(() => _diagnosticLogWindowOpen = false);
-    appLogger.info('diagnostic log window closed', category: DiagnosticLogCategory.ui);
+    appLogger.info(
+      'diagnostic log window closed',
+      category: DiagnosticLogCategory.ui,
+    );
   }
 
   Future<InstallRequest?> _prepareQueuedRequest(InstallRequest request) async {
@@ -384,6 +411,9 @@ class _WristloadAppState extends State<WristloadApp> {
 
   @override
   void dispose() {
+    if (Platform.isMacOS) {
+      WidgetsBinding.instance.removeObserver(this);
+    }
     controller.queueInstallPreparer = null;
     unawaited(_floatingWindowCoordinator.dispose());
     unawaited(_diagnosticLogWindowCoordinator.dispose());
@@ -426,38 +456,41 @@ class _WristloadAppState extends State<WristloadApp> {
       routes: {
         '/': (context) => _buildAppShell(),
         '/oobe': (context) => _buildOobePage(),
-        for (final module in generatedPageModules.where((module) => module.route != '/'))
+        for (final module in generatedPageModules.where(
+          (module) => module.route != '/',
+        ))
           module.route: (context) => _buildRegisteredPage(module),
       },
     ),
   );
 
-  Widget _buildRegisteredPage(WristloadPageModule module) =>
-      module.build(WristloadPageContext(
-        controller: controller,
-        preferredInstallTarget: _preferredInstallTarget,
-        onPreferredInstallTargetChanged: _setOobePreference,
-        floatingInstallWindowEnabled: _floatingInstallWindowEnabled,
-        onFloatingInstallWindowEnabledChanged: widget.desktopIntegrationEnabled
-            ? (enabled) => unawaited(_setFloatingInstallWindowEnabled(enabled))
-            : null,
-        autoOpenDiagnosticLog: _autoOpenDiagnosticLog,
-        onAutoOpenDiagnosticLogChanged: (Platform.isWindows || Platform.isMacOS)
-            ? _setAutoOpenDiagnosticLog
-            : null,
-        diagnosticLogWindowOpen: _diagnosticLogWindowOpen,
-        onDiagnosticLogWindowChanged: (Platform.isWindows || Platform.isMacOS)
-            ? _setDiagnosticLogWindowOpen
-            : null,
-        themeSeedColor: _themeController.seedColor,
-        onThemeSeedChanged: (color) {
-          unawaited(_themeController.setSeed(color));
-          unawaited(_floatingWindowCoordinator.updateTheme());
-          unawaited(_diagnosticLogWindowCoordinator.updateTheme());
-        },
-        onReplayOobe: _replayOobe,
-        onEditAuthKey: () => _appShellKey.currentState?._editAuthKey(),
-      ));
+  Widget _buildRegisteredPage(WristloadPageModule module) => module.build(
+    WristloadPageContext(
+      controller: controller,
+      preferredInstallTarget: _preferredInstallTarget,
+      onPreferredInstallTargetChanged: _setOobePreference,
+      floatingInstallWindowEnabled: _floatingInstallWindowEnabled,
+      onFloatingInstallWindowEnabledChanged: widget.desktopIntegrationEnabled
+          ? (enabled) => unawaited(_setFloatingInstallWindowEnabled(enabled))
+          : null,
+      autoOpenDiagnosticLog: _autoOpenDiagnosticLog,
+      onAutoOpenDiagnosticLogChanged: (Platform.isWindows || Platform.isMacOS)
+          ? _setAutoOpenDiagnosticLog
+          : null,
+      diagnosticLogWindowOpen: _diagnosticLogWindowOpen,
+      onDiagnosticLogWindowChanged: (Platform.isWindows || Platform.isMacOS)
+          ? _setDiagnosticLogWindowOpen
+          : null,
+      themeSeedColor: _themeController.seedColor,
+      onThemeSeedChanged: (color) {
+        unawaited(_themeController.setSeed(color));
+        unawaited(_floatingWindowCoordinator.updateTheme());
+        unawaited(_diagnosticLogWindowCoordinator.updateTheme());
+      },
+      onReplayOobe: _replayOobe,
+      onEditAuthKey: () => _appShellKey.currentState?._editAuthKey(),
+    ),
+  );
 }
 
 class AppShell extends StatefulWidget {
@@ -510,25 +543,23 @@ class _AppShellState extends State<AppShell> {
         ..sort((a, b) => a.order.compareTo(b.order));
 
   WristloadPageContext _pageContext() => WristloadPageContext(
-        controller: widget.controller,
-        preferredInstallTarget: widget.preferredInstallTarget,
-        onPreferredInstallTargetChanged: widget.onPreferredInstallTargetChanged,
-        floatingInstallWindowEnabled: widget.floatingInstallWindowEnabled,
-        onFloatingInstallWindowEnabledChanged:
-            widget.onFloatingInstallWindowEnabledChanged,
-        autoOpenDiagnosticLog: widget.autoOpenDiagnosticLog,
-        onAutoOpenDiagnosticLogChanged: widget.onAutoOpenDiagnosticLogChanged,
-        diagnosticLogWindowOpen: widget.diagnosticLogWindowOpen,
-        onDiagnosticLogWindowChanged: widget.onDiagnosticLogWindowChanged,
-        themeSeedColor: widget.themeSeedColor,
-        onThemeSeedChanged: widget.onThemeSeedChanged,
-        onReplayOobe: widget.onReplayOobe,
-        onEditAuthKey: _editAuthKey,
-      );
+    controller: widget.controller,
+    preferredInstallTarget: widget.preferredInstallTarget,
+    onPreferredInstallTargetChanged: widget.onPreferredInstallTargetChanged,
+    floatingInstallWindowEnabled: widget.floatingInstallWindowEnabled,
+    onFloatingInstallWindowEnabledChanged:
+        widget.onFloatingInstallWindowEnabledChanged,
+    autoOpenDiagnosticLog: widget.autoOpenDiagnosticLog,
+    onAutoOpenDiagnosticLogChanged: widget.onAutoOpenDiagnosticLogChanged,
+    diagnosticLogWindowOpen: widget.diagnosticLogWindowOpen,
+    onDiagnosticLogWindowChanged: widget.onDiagnosticLogWindowChanged,
+    themeSeedColor: widget.themeSeedColor,
+    onThemeSeedChanged: widget.onThemeSeedChanged,
+    onReplayOobe: widget.onReplayOobe,
+    onEditAuthKey: _editAuthKey,
+  );
 
-  NavigationRailDestination _navigationDestination(
-    WristloadPageModule module,
-  ) {
+  NavigationRailDestination _navigationDestination(WristloadPageModule module) {
     Widget icon(IconData iconData) {
       if (module.id != 'queue') return Icon(iconData);
       return Badge.count(
@@ -816,7 +847,6 @@ class _AppShellState extends State<AppShell> {
       ),
     );
   }
-
 }
 
 class _AuthKeyBindingPicker extends StatefulWidget {

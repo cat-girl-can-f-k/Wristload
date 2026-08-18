@@ -46,3 +46,45 @@ This file is part of the repository and MUST be committed to Git. Read it before
 - Never use `git reset --hard`, `git checkout --`, `git clean`, or broad destructive deletion.
 - Never discard existing user modifications or stash entries.
 - Do not commit secrets, authkeys, logs containing credentials, or generated build artifacts.
+
+## TUI Design System
+
+For any task involving TUI visual design, layout, interaction, responsive behavior, device list rendering, connection status presentation, installation views, logs, mouse input, keyboard navigation, terminal resize handling, theme design, or frontend usability, **MUST use `$tui-design-system`**.
+
+The TUI frontend must follow the visual and interaction rules defined by `$tui-design-system`.
+
+The intended design direction is:
+
+`OpenCode-inspired visual language + lazygit-style information organization + Wristload-specific connection inspector`.
+
+The frontend rewrite must remain frontend-only. Do not modify the already-working TUI backend, Bluetooth transport, Xiaomi protocol, authentication/session logic, or native macOS communication code merely to satisfy visual requirements.
+
+The primary TUI layout should prioritize:
+
+`Header / Global Status → Device Browser + Device Inspector → Activity → Command Bar`
+
+The selected device inspector should expose the actual connection pipeline when backend state is available, including states such as:
+
+`Identity → Pairing → SDP → RFCOMM → L1 → f=26 → f=27 → Session`
+
+Do not reduce connection status to a generic `Connected` label when richer verified backend state exists.
+
+The TUI must use a centralized black-blue default theme, restrained borders, compact spacing, high information density, clear selection/focus states, mouse and keyboard support, and responsive layouts.
+
+The device list must preserve complete device-name accessibility. Do not blindly truncate names using fixed-width columns. When terminal width becomes limited, first reduce optional spacing/metadata, then wrap or switch to stacked layouts, and truncate only as a final fallback.
+
+Mouse and keyboard must share the same authoritative selection/focus model. `Enter` must trigger the primary action for the current context; for a selected disconnected device, the primary action is connection, not viewing details.
+
+Authkey input must be explicitly tied to the pending/selected device and must not silently retarget when selection changes.
+
+The main TUI should contain only a compact recent-activity view. Full diagnostic logs must be available through a dedicated shortcut and separate log viewer/window where supported, without affecting the main TUI or Bluetooth connection lifecycle.
+
+Installation should have a dedicated progress/state view rather than only a percentage.
+
+The frontend must consume backend state and must never invent transport, authentication, readiness, or installation success.
+
+When frontend work exposes a backend, Bluetooth, protocol, TCC, or APK-analysis issue, invoke the appropriate existing Skill instead of silently changing backend behavior from the UI layer.
+
+Before declaring the TUI frontend complete, verify at minimum:
+
+`wide terminal → medium terminal → narrow terminal → runtime resize → mouse selection → keyboard selection → Enter primary action → authkey input → saved-device display → connected/failed states → installation view → activity panel → separate log viewer → clean exit`

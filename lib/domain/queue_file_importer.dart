@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 
 import 'install_metadata_reader.dart';
+import 'install_file_classifier.dart';
 import 'install_models.dart';
 import 'install_task.dart';
 import '../application/diagnostic_log_service.dart';
@@ -13,16 +14,21 @@ import '../platform/security_scoped_file_access.dart';
 /// The implementation lives outside any page so the main queue and the
 /// floating installation view enforce the same type, duplicate and metadata
 /// rules.
-typedef InstallMetadataLoader = Future<InstallMetadata> Function(
-  InstallKind kind,
-  String path,
-);
+typedef InstallMetadataLoader =
+    Future<InstallMetadata> Function(InstallKind kind, String path);
+
+typedef InstallFileClassificationLoader =
+    Future<InstallableFileType> Function(String path);
 
 class QueueFileImporter {
-  QueueFileImporter({InstallMetadataLoader? metadataLoader})
-      : _metadataLoader = metadataLoader;
+  QueueFileImporter({
+    InstallMetadataLoader? metadataLoader,
+    InstallFileClassificationLoader? classificationLoader,
+  }) : _metadataLoader = metadataLoader,
+       _classificationLoader = classificationLoader;
 
   final InstallMetadataLoader? _metadataLoader;
+  final InstallFileClassificationLoader? _classificationLoader;
 
   Future<QueueFileImportResult> prepare(
     Iterable<Object> sourcePaths, {
@@ -30,9 +36,7 @@ class QueueFileImporter {
     InstallKind? expectedKind,
   }) async {
     final sourceList = sourcePaths.toList(growable: false);
-    final knownPaths = {
-      for (final path in existingPaths) normalizePath(path),
-    };
+    final knownPaths = {for (final path in existingPaths) normalizePath(path)};
     appLogger.trace(
       '安装队列导入开始',
       category: DiagnosticLogCategory.installation,
@@ -58,15 +62,17 @@ class QueueFileImporter {
         path: selectedPath,
         bookmark: source.bookmark,
       );
-      final sourceKind = kindForPath(selectedPath);
-      final shouldResolveMacBookmark =
-          defaultTargetPlatform == TargetPlatform.macOS &&
-          normalizedSource.hasBookmark;
+      final isMacOS = defaultTargetPlatform == TargetPlatform.macOS;
+      final shouldResolveMacBookmark = isMacOS && normalizedSource.hasBookmark;
       // A macOS bookmark may resolve a stale filename to a file whose current
       // extension is supported. Defer type filtering until after the lease is
       // acquired in that case. Unbookmarked external paths remain cheap
       // unsupported entries instead of prompting for access.
-      if (sourceKind == null && !shouldResolveMacBookmark) {
+      final isSupported = isMacOS
+          ? InstallFileClassifier.supportsPath(selectedPath) ||
+                shouldResolveMacBookmark
+          : kindForPath(selectedPath) != null;
+      if (!isSupported) {
         unsupportedCount++;
         appLogger.warning(
           '安装队列导入跳过不支持的文件类型',
@@ -77,12 +83,12 @@ class QueueFileImporter {
       }
       var failurePath = selectedPath;
       try {
-        if (defaultTargetPlatform == TargetPlatform.macOS &&
-            !normalizedSource.hasBookmark) {
+        if (isMacOS && !normalizedSource.hasBookmark) {
           throw StateError('拖入文件缺少 macOS 持久访问权限，请改用文件选择器');
         }
-        final lease =
-            await SecurityScopedFileAccess.instance.acquire(normalizedSource);
+        final lease = await SecurityScopedFileAccess.instance.acquire(
+          normalizedSource,
+        );
         try {
           final resolvedPath = File(lease.file.path).absolute.path;
           failurePath = resolvedPath;
@@ -97,20 +103,29 @@ class QueueFileImporter {
             continue;
           }
 
-          final kind = kindForPath(resolvedPath);
+          final classification = isMacOS
+              ? await _classifyResolved(resolvedPath)
+              : _classificationForLegacyPath(resolvedPath);
+          final kind = switch (classification) {
+            InstallableFileType.quickApp => InstallKind.quickApp,
+            InstallableFileType.watchface => InstallKind.watchface,
+            InstallableFileType.firmware ||
+            InstallableFileType.unsupported => null,
+          };
           if (kind == null) {
             unsupportedCount++;
             appLogger.warning(
               '安装队列导入解析后类型不支持',
               category: DiagnosticLogCategory.installation,
-              fields: <String, Object?>{'extension': _extension(resolvedPath)},
+              fields: <String, Object?>{
+                'extension': _extension(resolvedPath),
+                'classification': classification.name,
+              },
             );
             continue;
           }
           if (expectedKind != null && kind != expectedKind) {
-            throw const FormatException(
-              '解析后的文件类型与当前安装目标不一致，请重新选择文件',
-            );
+            throw const FormatException('解析后的文件类型与当前安装目标不一致，请重新选择文件');
           }
 
           // Reserve before metadata parsing so repeated sources in one import
@@ -205,6 +220,11 @@ class QueueFileImporter {
     return result.requests.single;
   }
 
+  /// Fast extension-only hint for non-macOS import paths.
+  ///
+  /// macOS callers must classify `.bin` content while holding a
+  /// security-scoped lease. Other platforms retain the established extension
+  /// contract and never read a `.bin` merely to determine its queue kind.
   static InstallKind? kindForPath(String path) {
     final extension = path.split('.').last.toLowerCase();
     return switch (extension) {
@@ -212,6 +232,26 @@ class QueueFileImporter {
       'rpk' => InstallKind.quickApp,
       _ => null,
     };
+  }
+
+  static InstallableFileType _classificationForLegacyPath(String path) =>
+      switch (kindForPath(path)) {
+        InstallKind.quickApp => InstallableFileType.quickApp,
+        InstallKind.watchface => InstallableFileType.watchface,
+        null => InstallableFileType.unsupported,
+      };
+
+  Future<InstallableFileType> _classifyResolved(String path) {
+    final loader = _classificationLoader;
+    if (loader != null) return loader(path);
+    // Existing tests and embedders may inject a metadata loader with virtual
+    // paths. Preserve that seam without weakening real-file classification.
+    if (_metadataLoader != null && !File(path).existsSync()) {
+      final extension = _extension(path);
+      if (extension == 'bin')
+        return Future.value(InstallableFileType.watchface);
+    }
+    return const InstallFileClassifier().classifyResolvedPath(path);
   }
 
   static String normalizePath(String path) {
@@ -224,7 +264,9 @@ class QueueFileImporter {
   static String _extension(String path) {
     final name = path.split(RegExp(r'[/\\]')).last;
     final dot = name.lastIndexOf('.');
-    return dot >= 0 && dot + 1 < name.length ? name.substring(dot + 1).toLowerCase() : '';
+    return dot >= 0 && dot + 1 < name.length
+        ? name.substring(dot + 1).toLowerCase()
+        : '';
   }
 }
 

@@ -22,7 +22,6 @@
 
 /* Begin PBXBuildFile section */
 		57A000032E10000100A00001 /* IOBluetooth.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 57A000042E10000100A00001 /* IOBluetooth.framework */; };
-		57A000052E10000100A00001 /* IOBluetoothUI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 57A000062E10000100A00001 /* IOBluetoothUI.framework */; };
 		57A000012E10000100A00001 /* MacOSPlatformBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 57A000022E10000100A00001 /* MacOSPlatformBridge.swift */; };
 		335BBD1B22A9A15E00E9071D /* GeneratedPluginRegistrant.swift in Sources */ = {isa = PBXBuildFile; fileRef = 335BBD1A22A9A15E00E9071D /* GeneratedPluginRegistrant.swift */; };
 		33CC10F12044A3C60003C045 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33CC10F02044A3C60003C045 /* AppDelegate.swift */; };
@@ -58,7 +57,6 @@
 
 /* Begin PBXFileReference section */
 		57A000042E10000100A00001 /* IOBluetooth.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOBluetooth.framework; path = System/Library/Frameworks/IOBluetooth.framework; sourceTree = SDKROOT; };
-		57A000062E10000100A00001 /* IOBluetoothUI.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOBluetoothUI.framework; path = System/Library/Frameworks/IOBluetoothUI.framework; sourceTree = SDKROOT; };
 		57A000022E10000100A00001 /* MacOSPlatformBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacOSPlatformBridge.swift; sourceTree = "<group>"; };
 		333000ED22D3DE5D00554162 /* Warnings.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Warnings.xcconfig; sourceTree = "<group>"; };
 		335BBD1A22A9A15E00E9071D /* GeneratedPluginRegistrant.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = GeneratedPluginRegistrant.swift; sourceTree = "<group>"; };
@@ -90,7 +88,6 @@
 			files = (
 				78A318202AECB46A00862997 /* FlutterGeneratedPluginSwiftPackage in Frameworks */,
 				57A000032E10000100A00001 /* IOBluetooth.framework in Frameworks */,
-				57A000052E10000100A00001 /* IOBluetoothUI.framework in Frameworks */,
 				CC0B098B211E0948E46E62C0 /* Pods_Runner.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -169,7 +166,6 @@
 			isa = PBXGroup;
 			children = (
 				57A000042E10000100A00001 /* IOBluetooth.framework */,
-				57A000062E10000100A00001 /* IOBluetoothUI.framework */,
 				39921C44D639FF2E70CBEF5B /* Pods_Runner.framework */,
 			);
 			name = Frameworks;
