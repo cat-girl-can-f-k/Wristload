@@ -1,0 +1,1 @@
+/usr/bin/clang++ -O3 -DNDEBUG -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/wearable_macos_bridge_identity_name_match_test.dir/tests/identity_name_match_test.mm.o -o wearable_macos_bridge_identity_name_match_test  -framework Foundation

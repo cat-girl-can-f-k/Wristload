@@ -1,0 +1,6 @@
+wearable_macos_bridge_sdp_query_contract 22 0.00358915
+wearable_macos_bridge_bundle_jsonl_hello 22 0.00698947
+wearable_macos_bridge_bundle_layout 22 0.0184813
+wearable_macos_bridge_identity_name_match 20 0.00362016
+wearable_macos_bridge_direct_pair_contract 7 0.0115401
+---

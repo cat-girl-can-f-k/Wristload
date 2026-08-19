@@ -10,6 +10,7 @@ set(CMAKE_MAKEFILE_DEPENDS
   "/Users/ikun_cxkpro/WearableInstall/tui/macos_bridge/CMakeLists.txt"
   "CMakeFiles/4.3.1/CMakeOBJCXXCompiler.cmake"
   "CMakeFiles/4.3.1/CMakeSystem.cmake"
+  "/Users/ikun_cxkpro/WearableInstall/tui/macos_bridge/packaging/Info.plist.in"
   "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/CMakeCommonLanguageInclude.cmake"
   "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/CMakeGenericSystem.cmake"
   "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/CMakeInitializeConfigs.cmake"
@@ -17,11 +18,15 @@ set(CMAKE_MAKEFILE_DEPENDS
   "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/CMakeOBJCXXInformation.cmake"
   "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/CMakeSystemSpecificInformation.cmake"
   "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/CMakeSystemSpecificInitialize.cmake"
+  "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/CTest.cmake"
+  "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/CTestTargets.cmake"
+  "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/CTestUseLaunchers.cmake"
   "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/Compiler/AppleClang-OBJCXX.cmake"
   "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/Compiler/CMakeCommonCompilerMacros.cmake"
   "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/Compiler/Clang-OBJCXX.cmake"
   "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/Compiler/Clang.cmake"
   "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/Compiler/GNU.cmake"
+  "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/DartConfiguration.tcl.in"
   "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/Internal/CMakeCommonLinkerInformation.cmake"
   "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/Internal/CMakeOBJCXXLinkerInformation.cmake"
   "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/Linker/AppleClang-C.cmake"
@@ -34,6 +39,7 @@ set(CMAKE_MAKEFILE_DEPENDS
   "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/Platform/Linker/Apple-AppleClang-C.cmake"
   "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/Platform/Linker/Apple-AppleClang.cmake"
   "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Modules/Platform/UnixPaths.cmake"
+  "/usr/local/lib/python3.13/site-packages/cmake/data/share/cmake-4.3/Templates/CTestScript.cmake.in"
   )
 
 # The corresponding makefile is:
@@ -44,10 +50,45 @@ set(CMAKE_MAKEFILE_OUTPUTS
 
 # Byproducts of CMake generate step:
 set(CMAKE_MAKEFILE_PRODUCTS
+  "DartConfiguration.tcl"
+  "CMakeFiles/CTestScript.cmake"
+  "wearable_macos_bridge.app/Contents/MacOS"
+  "wearable_macos_bridge.app/Contents/Info.plist"
+  "wearable_macos_bridge.app/Contents/Info.plist"
   "CMakeFiles/CMakeDirectoryInformation.cmake"
   )
 
 # Dependency information for all targets:
 set(CMAKE_DEPEND_INFO_FILES
   "CMakeFiles/wearable_macos_bridge.dir/DependInfo.cmake"
+  "CMakeFiles/wearable_macos_bridge_bundle.dir/DependInfo.cmake"
+  "CMakeFiles/Experimental.dir/DependInfo.cmake"
+  "CMakeFiles/Nightly.dir/DependInfo.cmake"
+  "CMakeFiles/Continuous.dir/DependInfo.cmake"
+  "CMakeFiles/NightlyMemoryCheck.dir/DependInfo.cmake"
+  "CMakeFiles/NightlyStart.dir/DependInfo.cmake"
+  "CMakeFiles/NightlyUpdate.dir/DependInfo.cmake"
+  "CMakeFiles/NightlyConfigure.dir/DependInfo.cmake"
+  "CMakeFiles/NightlyBuild.dir/DependInfo.cmake"
+  "CMakeFiles/NightlyTest.dir/DependInfo.cmake"
+  "CMakeFiles/NightlyCoverage.dir/DependInfo.cmake"
+  "CMakeFiles/NightlyMemCheck.dir/DependInfo.cmake"
+  "CMakeFiles/NightlySubmit.dir/DependInfo.cmake"
+  "CMakeFiles/ExperimentalStart.dir/DependInfo.cmake"
+  "CMakeFiles/ExperimentalUpdate.dir/DependInfo.cmake"
+  "CMakeFiles/ExperimentalConfigure.dir/DependInfo.cmake"
+  "CMakeFiles/ExperimentalBuild.dir/DependInfo.cmake"
+  "CMakeFiles/ExperimentalTest.dir/DependInfo.cmake"
+  "CMakeFiles/ExperimentalCoverage.dir/DependInfo.cmake"
+  "CMakeFiles/ExperimentalMemCheck.dir/DependInfo.cmake"
+  "CMakeFiles/ExperimentalSubmit.dir/DependInfo.cmake"
+  "CMakeFiles/ContinuousStart.dir/DependInfo.cmake"
+  "CMakeFiles/ContinuousUpdate.dir/DependInfo.cmake"
+  "CMakeFiles/ContinuousConfigure.dir/DependInfo.cmake"
+  "CMakeFiles/ContinuousBuild.dir/DependInfo.cmake"
+  "CMakeFiles/ContinuousTest.dir/DependInfo.cmake"
+  "CMakeFiles/ContinuousCoverage.dir/DependInfo.cmake"
+  "CMakeFiles/ContinuousMemCheck.dir/DependInfo.cmake"
+  "CMakeFiles/ContinuousSubmit.dir/DependInfo.cmake"
+  "CMakeFiles/wearable_macos_bridge_identity_name_match_test.dir/DependInfo.cmake"
   )

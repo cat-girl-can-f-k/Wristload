@@ -1,0 +1,1 @@
+/usr/bin/clang++ -O3 -DNDEBUG -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/wearable_macos_bridge_bundle.dir/main.mm.o -o wearable_macos_bridge.app/Contents/MacOS/wearable_macos_bridge  -framework AppKit -framework Foundation -framework IOBluetooth -framework IOKit

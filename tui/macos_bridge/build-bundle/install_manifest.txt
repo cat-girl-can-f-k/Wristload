@@ -1,0 +1,2 @@
+/Users/ikun_cxkpro/Projects/WearableInstall/tui/macos_bridge/build-bundle/stage/wearable_macos_bridge.app/Contents/MacOS/wearable_macos_bridge
+/Users/ikun_cxkpro/Projects/WearableInstall/tui/macos_bridge/build-bundle/stage/wearable_macos_bridge.app/Contents/Info.plist
