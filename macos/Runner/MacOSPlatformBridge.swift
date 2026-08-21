@@ -209,10 +209,12 @@ final class MacOSPlatformBridge: NSObject, FlutterStreamHandler {
       self?.handleBluetoothPermission(call, result: result)
     }
 
-    rfcommTransport.onData = { [weak self] data in
+    rfcommTransport.onData = { [weak self] peripheralID, data, generation in
       self?.emitRFCOMM([
         "kind": "data",
         "event": "read",
+        "peripheral": peripheralID,
+        "generation": Int(generation),
         "direction": "RX",
         "bytes": data.count,
         "wireHex": wireHex(data),
@@ -223,8 +225,17 @@ final class MacOSPlatformBridge: NSObject, FlutterStreamHandler {
     rfcommTransport.onEvent = { [weak self] event in
       self?.emitRFCOMM(event)
     }
-    rfcommTransport.onClosed = { [weak self] error in
-      self?.emitRFCOMM(error)
+    rfcommTransport.onClosed = { [weak self] peripheralID, error, generation in
+      self?.emitRFCOMM([
+        "kind": "closed",
+        "event": "closed",
+        "peripheral": peripheralID,
+        "generation": Int(generation),
+        "code": error.code,
+        "message": error.message ?? "RFCOMM connection closed.",
+        "transport": "RFCOMM/SPP",
+        "platform": "macos",
+      ])
     }
   }
 
@@ -237,7 +248,7 @@ final class MacOSPlatformBridge: NSObject, FlutterStreamHandler {
     bluetoothPermissionChannel.setMethodCallHandler(nil)
     bluetoothPermissionService.invalidate()
     for (_, url) in securityScopeURLs { url.stopAccessingSecurityScopedResource() }
-    rfcommTransport.disconnect()
+    rfcommTransport.disconnectAll()
   }
 
   private func handleBluetoothPermission(
@@ -442,9 +453,12 @@ final class MacOSPlatformBridge: NSObject, FlutterStreamHandler {
         return
       }
       // `pair` runs before Dart starts the RFCOMM stream for the first time.
-      // Preserve native diagnostic events until the stream attaches, while
-      // deliberately not retaining arbitrary binary traffic.
+      // Preserve native diagnostic events until the stream attaches. Raw data
+      // and close notifications are tied to a specific live RFCOMM generation;
+      // replaying either after an EventChannel resubscription could feed stale
+      // bytes or a stale close into a newly authenticated device session.
       guard let nativeEvent = event as? [String: Any] else { return }
+      guard nativeEvent["kind"] as? String == "native" else { return }
       self.pendingRFCOMMEvents.append(nativeEvent)
       if self.pendingRFCOMMEvents.count > 128 {
         self.pendingRFCOMMEvents.removeFirst(
@@ -592,20 +606,34 @@ final class MacOSPlatformBridge: NSObject, FlutterStreamHandler {
           completion: result
         )
       case "write":
+        guard let values = call.arguments as? [String: Any] else {
+          throw PlatformBridgeError(
+            "rfcomm_arguments",
+            "RFCOMM write requires a CoreBluetooth device identifier and byte data."
+          )
+        }
+        let peripheralID = try rfcommPeripheralID(from: values)
         let data: Data
-        if let value = call.arguments as? FlutterStandardTypedData {
+        if let value = values["data"] as? FlutterStandardTypedData {
           data = value.data
-        } else if let value = call.arguments as? Data {
+        } else if let value = values["data"] as? Data {
           data = value
+        } else if let value = values["data"] as? [UInt8] {
+          data = Data(value)
         } else {
           throw PlatformBridgeError(
             "rfcomm_arguments",
             "RFCOMM write requires byte data."
           )
         }
-        try rfcommTransport.write(data, completion: result)
+        try rfcommTransport.write(
+          data,
+          peripheralID: peripheralID,
+          completion: result
+        )
       case "disconnect":
-        rfcommTransport.disconnect(completion: result)
+        let peripheralID = try rfcommPeripheralID(from: call.arguments)
+        rfcommTransport.disconnect(peripheralID: peripheralID, completion: result)
       default:
         result(FlutterMethodNotImplemented)
       }
@@ -781,10 +809,10 @@ private enum MacOSAuthKeyStore {
 private final class MacOSRFCOMMSessionDelegate: NSObject, IOBluetoothRFCOMMChannelDelegate {
   // The bridge owns the transport. A weak link prevents a late Bluetooth
   // callback from keeping the whole Flutter bridge alive after shutdown.
-  weak var owner: MacOSRFCOMMTransport?
+  weak var owner: MacOSRFCOMMConnection?
   let generation: UInt64
 
-  init(owner: MacOSRFCOMMTransport, generation: UInt64) {
+  init(owner: MacOSRFCOMMConnection, generation: UInt64) {
     self.owner = owner
     self.generation = generation
     super.init()
@@ -1009,6 +1037,14 @@ private final class MacOSClassicDeviceInquiry: NSObject, IOBluetoothDeviceInquir
     _ = inquiry.stop()
   }
 
+  /// IOBluetooth may still dispatch internal cleanup after its terminal
+  /// delegate callback. Releasing the native inquiry from that callback has
+  /// caused `IOBluetoothDeviceInquiry.dealloc` to dereference stale state on
+  /// macOS 15, so the transport calls this only after a short safe delay.
+  func releaseNativeInquiryAfterTerminal() {
+    inquiry = nil
+  }
+
   func deviceInquiryStarted(_ sender: IOBluetoothDeviceInquiry) {}
 
   func deviceInquiryDeviceFound(
@@ -1050,7 +1086,6 @@ private final class MacOSClassicDeviceInquiry: NSObject, IOBluetoothDeviceInquir
       }
       found[address] = device
     }
-    inquiry = nil
     let devices = Array(found.values)
     found.removeAll()
     runOnMain { [weak self, completion] in
@@ -1109,6 +1144,8 @@ private final class MacOSClassicPairingAttempt: NSObject, IOBluetoothDevicePairD
   private var activePrompt: NSAlert?
   private weak var activePromptHost: NSWindow?
   private var activePromptToken: UUID?
+  private var startedAt: Date?
+  private var callbackTrace: [String] = []
 
   init(
     device: IOBluetoothDevice,
@@ -1147,7 +1184,9 @@ private final class MacOSClassicPairingAttempt: NSObject, IOBluetoothDevicePairD
       // This must happen before start(): a nearby device can immediately
       // produce a delegate callback on some macOS versions.
       pair.delegate = self
-      self.emit("pairing_started")
+      self.startedAt = Date()
+      self.recordCallback("start_requested")
+      self.emit("pairing_started", fields: self.deviceSnapshot())
       let status = pair.start()
       // A pairing delegate can synchronously report a terminal outcome while
       // start() is still on the stack. That terminal callback wins.
@@ -1179,24 +1218,28 @@ private final class MacOSClassicPairingAttempt: NSObject, IOBluetoothDevicePairD
 
   func devicePairingStarted(_ sender: Any!) {
     receiveCallback(sender) { attempt, _ in
+      attempt.recordCallback("started")
       attempt.emit("pairing_started_callback")
     }
   }
 
   func devicePairingConnecting(_ sender: Any!) {
     receiveCallback(sender) { attempt, _ in
+      attempt.recordCallback("connecting")
       attempt.emit("pairing_connecting")
     }
   }
 
   func devicePairingConnected(_ sender: Any!) {
     receiveCallback(sender) { attempt, _ in
+      attempt.recordCallback("connected")
       attempt.emit("pairing_connected")
     }
   }
 
   func devicePairingPINCodeRequest(_ sender: Any!) {
     receiveCallback(sender) { attempt, pair in
+      attempt.recordCallback("pin_request")
       attempt.emit("pairing_user_input_required", fields: [
         "kind": "pin",
       ])
@@ -1241,6 +1284,7 @@ private final class MacOSClassicPairingAttempt: NSObject, IOBluetoothDevicePairD
     numericValue: BluetoothNumericValue
   ) {
     receiveCallback(sender) { attempt, pair in
+      attempt.recordCallback("numeric_confirmation_request")
       // Never auto-approve a numeric comparison or write its value to the
       // diagnostic journal. The user makes the explicit decision in macOS.
       attempt.emit("pairing_user_input_required", fields: [
@@ -1284,6 +1328,7 @@ private final class MacOSClassicPairingAttempt: NSObject, IOBluetoothDevicePairD
     passkey: BluetoothPasskey
   ) {
     receiveCallback(sender) { attempt, pair in
+      attempt.recordCallback("passkey_notification")
       // Passkey notification does not require a reply. Show it to the user
       // and keep the pairing operation alive while it is entered on the band.
       attempt.emit("pairing_user_input_required", fields: [
@@ -1314,6 +1359,7 @@ private final class MacOSClassicPairingAttempt: NSObject, IOBluetoothDevicePairD
     status: BluetoothHCIEventStatus
   ) {
     receiveCallback(sender) { attempt, _ in
+      attempt.recordCallback("simple_pairing_complete")
       // This is not terminal: Apple may perform another low-level pairing.
       attempt.emit("pairing_simple_complete", fields: [
         "status": Int(status),
@@ -1323,17 +1369,23 @@ private final class MacOSClassicPairingAttempt: NSObject, IOBluetoothDevicePairD
 
   func devicePairingFinished(_ sender: Any!, error: IOReturn) {
     receiveCallback(sender) { attempt, _ in
+      attempt.recordCallback("finished")
       let paired = attempt.device.isPaired()
-      attempt.emit("pairing_finished", fields: [
+      var diagnosticFields = attempt.deviceSnapshot()
+      diagnosticFields.merge([
         "status": Int(error),
         "paired": paired,
-      ])
+        "hciStatusName": attempt.hciStatusName(error),
+        "callbackTrace": attempt.callbackTrace,
+        "elapsedMilliseconds": attempt.elapsedMilliseconds(),
+      ]) { _, new in new }
+      attempt.emit("pairing_finished", fields: diagnosticFields)
       guard error == kIOReturnSuccess, paired else {
         attempt.finish(
           .failure(PlatformBridgeError(
             "pairing_failed",
             "Classic Bluetooth pairing did not complete (IOBluetooth status \(error)).",
-            details: ["status": Int(error), "paired": paired]
+            details: diagnosticFields
           )),
           stopPairing: true
         )
@@ -1516,6 +1568,34 @@ private final class MacOSClassicPairingAttempt: NSObject, IOBluetoothDevicePairD
     emitEvent(name, event)
   }
 
+  private func recordCallback(_ callback: String) {
+    callbackTrace.append(callback)
+  }
+
+  private func elapsedMilliseconds() -> Int {
+    guard let startedAt else { return 0 }
+    return Int(Date().timeIntervalSince(startedAt) * 1000)
+  }
+
+  private func deviceSnapshot() -> [String: Any] {
+    [
+      "deviceName": device.name ?? "",
+      "deviceAddress": device.addressString ?? "",
+      "basebandConnected": device.isConnected(),
+      "paired": device.isPaired(),
+    ]
+  }
+
+  private func hciStatusName(_ status: IOReturn) -> String {
+    switch Int(status) {
+    case Int(kBluetoothHCIErrorSuccess): return "success"
+    case Int(kBluetoothHCIErrorNoConnection): return "no_connection"
+    case Int(kBluetoothHCIErrorAuthenticationFailure): return "authentication_failure"
+    case Int(kBluetoothHCIErrorPairingNotAllowed): return "pairing_not_allowed"
+    default: return "unmapped"
+    }
+  }
+
   private func finish(
     _ result: Result<IOBluetoothDevice, PlatformBridgeError>,
     stopPairing: Bool
@@ -1541,20 +1621,42 @@ private final class MacOSClassicPairingAttempt: NSObject, IOBluetoothDevicePairD
   }
 }
 
-private final class MacOSRFCOMMTransport: NSObject {
-  var onData: ((Data) -> Void)?
-  var onClosed: ((FlutterError) -> Void)?
+/// One physical Classic/RFCOMM connection. This class deliberately preserves
+/// the previously verified SDP, channel-selection, write and teardown flow.
+/// [MacOSRFCOMMTransport] below owns one instance per CoreBluetooth identity.
+private final class MacOSRFCOMMConnection: NSObject {
+  var onData: ((Data, UInt64) -> Void)?
+  var onClosed: ((FlutterError, UInt64) -> Void)?
   var onEvent: (([String: Any]) -> Void)?
 
+  // Each physical Classic device owns its own timeout and session lifecycle.
+  // The pool below can therefore connect another device without cancelling an
+  // SDP query, open callback, or write on an already established channel.
   private var connectTimeout: Timer?
   private var nextGeneration: UInt64 = 0
+  // A connection object intentionally owns only one physical device. The
+  // transport wrapper owns one such object per CoreBluetooth identity.
   private var session: MacOSRFCOMMSession?
   private var retiredSessions: [UInt64: MacOSRFCOMMSession] = [:]
   private var provisionalMappings: [String: String] = [:]
   private var pairingOperation: MacOSClassicPairingOperation?
+  // Keep terminal Classic inquiries alive briefly beyond their delegate
+  // callback. IOBluetooth can enqueue its own cleanup onto the main queue;
+  // releasing the inquiry in the callback itself crashes in dealloc.
+  private var retiredClassicInquiries: [ObjectIdentifier: MacOSClassicDeviceInquiry] = [:]
   private let teardownTimeoutInterval: TimeInterval = 5
   private let retiredCleanupInterval: TimeInterval = 30
   private let pairingTimeoutInterval: TimeInterval = 90
+  // RW6 may intermittently disappear from IOBluetoothDeviceInquiry even while
+  // CoreBluetooth is still advertising it. This address was supplied by the
+  // user for this exact CoreBluetooth identity and remains constrained by the
+  // advertised-name validation below; it is not a general name-to-address map.
+  private let knownClassicBootstrapCandidates: [String: (name: String, address: String)] = [
+    "96dad189-bafe-fd89-086b-250c75c91d15": (
+      name: "REDMI Watch 6 17B1",
+      address: "E8:E6:09:C2:17:B1"
+    ),
+  ]
   private let sdpCachePollInterval: TimeInterval = 0.35
 
   private func scheduleCommonModeTimer(
@@ -1565,6 +1667,22 @@ private final class MacOSRFCOMMTransport: NSObject {
     let timer = Timer(timeInterval: interval, repeats: repeats, block: handler)
     RunLoop.main.add(timer, forMode: .common)
     return timer
+  }
+
+  private func retainClassicInquiryUntilSafeRelease(
+    _ inquiry: MacOSClassicDeviceInquiry
+  ) {
+    let identifier = ObjectIdentifier(inquiry)
+    retiredClassicInquiries[identifier] = inquiry
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+      guard let self,
+            let retained = self.retiredClassicInquiries[identifier],
+            retained === inquiry else { return }
+      // The terminal callback and any framework cleanup dispatched from it
+      // have returned before dropping the final native IOBluetooth reference.
+      retained.releaseNativeInquiryAfterTerminal()
+      self.retiredClassicInquiries.removeValue(forKey: identifier)
+    }
   }
 
   private func emitEvent(
@@ -1708,7 +1826,7 @@ private final class MacOSRFCOMMTransport: NSObject {
   ) -> BluetoothRFCOMMChannelID? {
     let records = serviceRecords(device)
     var sppRecordCount = 0
-    var channels = [BluetoothRFCOMMChannelID]()
+    var channels = [(id: BluetoothRFCOMMChannelID, serviceName: String)]()
 
     for (index, record) in records.enumerated() {
       let matchesSPP = record.matchesUUID16(0x1101)
@@ -1727,11 +1845,11 @@ private final class MacOSRFCOMMTransport: NSObject {
       guard matchesSPP else { continue }
       sppRecordCount += 1
       if channelStatus == kIOReturnSuccess {
-        channels.append(channelID)
+        channels.append((channelID, record.getServiceName() ?? ""))
       }
     }
 
-    let uniqueChannels = Array(Set(channels)).sorted()
+    let uniqueChannels = Array(Set(channels.map(\.id))).sorted()
     guard !uniqueChannels.isEmpty else {
       let error = PlatformBridgeError(
         sppRecordCount == 0 ? "spp_service_missing" : "spp_channel_missing",
@@ -1748,12 +1866,31 @@ private final class MacOSRFCOMMTransport: NSObject {
       finishPending(error, session: current)
       return nil
     }
+    // Android's createRfcommSocketToServiceRecord(SPP_UUID) resolves the
+    // standard Serial Port Profile endpoint. RW6 also advertises a separate
+    // vendor "Private COM" record with UUID 0x1101; choose the uniquely
+    // named standard endpoint, but retain the ambiguity failure for devices
+    // whose records do not establish that distinction.
+    let standardSPPChannels = Array(Set(channels.compactMap { candidate in
+      canonicalName(candidate.serviceName) == "serial port"
+        ? candidate.id : nil
+    })).sorted()
+    if standardSPPChannels.count == 1 {
+      let selected = standardSPPChannels[0]
+      emitEvent("spp_channel_selected", generation: current.generation, fields: [
+        "channelId": Int(selected),
+        "selectionReason": "unique_standard_serial_port_service",
+        "candidateChannels": uniqueChannels.map(Int.init),
+      ])
+      return selected
+    }
     guard uniqueChannels.count == 1 else {
       finishPending(PlatformBridgeError(
         "spp_channel_ambiguous",
         "The device exposes multiple SPP RFCOMM channels; no channel was selected automatically.",
         details: [
           "channels": uniqueChannels.map(Int.init),
+          "standardSerialPortChannels": standardSPPChannels.map(Int.init),
           "serviceCount": records.count,
           "sppRecordCount": sppRecordCount,
           "queryKind": current.sdpQueryKind,
@@ -1821,7 +1958,14 @@ private final class MacOSRFCOMMTransport: NSObject {
         advertisedName: advertisedName
       ) {
       case .resolved(let selected):
-        completePairingOperation(operation, with: .success(selected))
+        if selected.isPaired() {
+          completePairingOperation(operation, with: .success(selected))
+        } else {
+          // A remembered live candidate is intentionally allowed to bypass a
+          // flaky repeat inquiry, but it must still complete the ordinary
+          // macOS system pairing operation before it can be used for SPP.
+          startSystemPairing(selected, for: operation)
+        }
       case .requiresInquiry(let matchingPairedCandidates):
         startClassicDeviceInquiry(
           for: operation,
@@ -1869,8 +2013,9 @@ private final class MacOSRFCOMMTransport: NSObject {
     guard pairingOperation === operation, !operation.completed else { return }
     operation.phase = "inquiry"
     let inquiry = MacOSClassicDeviceInquiry { [weak self, weak operation] completedInquiry, devices, status, aborted in
-      guard let self,
-            let operation,
+      guard let self else { return }
+      self.retainClassicInquiryUntilSafeRelease(completedInquiry)
+      guard let operation,
             self.pairingOperation === operation,
             !operation.completed,
             operation.inquiry === completedInquiry else { return }
@@ -1914,26 +2059,37 @@ private final class MacOSRFCOMMTransport: NSObject {
     matchingPairedCandidates: Int
   ) {
     guard pairingOperation === operation, !operation.completed else { return }
-    guard status == kIOReturnSuccess, !aborted else {
-      completePairingOperation(operation, with: .failure(PlatformBridgeError(
-        aborted ? "classic_inquiry_aborted" : "classic_inquiry_failed",
-        aborted
-          ? "Classic Bluetooth discovery stopped before a device could be resolved."
-          : "Classic Bluetooth discovery failed (IOBluetooth status \(status)).",
-        details: ["status": Int(status), "aborted": aborted, "foundCandidates": devices.count]
-      )))
-      return
-    }
+    // Some macOS 15 IOBluetooth inquiries report a non-zero terminal status
+    // after discovery has already populated the result list. Do not discard a
+    // single strict BLE-name match in that case: it is the same identity check
+    // used for a successful inquiry, and it remains safer than guessing.
     let matches = devices.filter { candidate in
       classicNameMatchesAdvertisement(
         advertisedName: operation.advertisedName,
         classicName: candidate.name ?? candidate.nameOrAddress ?? ""
       )
     }
+    let canUseDiscoveredMatch = !aborted && matches.count == 1
+    if status != kIOReturnSuccess && !canUseDiscoveredMatch {
+      completePairingOperation(operation, with: .failure(PlatformBridgeError(
+        aborted ? "classic_inquiry_aborted" : "classic_inquiry_failed",
+        aborted
+          ? "Classic Bluetooth discovery stopped before a device could be resolved."
+          : "Classic Bluetooth discovery failed (IOBluetooth status \(status)).",
+        details: [
+          "status": Int(status),
+          "aborted": aborted,
+          "foundCandidates": devices.count,
+          "matchingCandidates": matches.count,
+        ]
+      )))
+      return
+    }
     emitEvent("classic_inquiry_completed", fields: [
       "peripheral": operation.peripheralID,
       "advertisedName": operation.advertisedName,
       "status": Int(status),
+      "acceptedNonSuccessStatus": status != kIOReturnSuccess,
       "foundCandidates": devices.count,
       "matchingCandidates": matches.count,
       "matchingPairedCandidates": matchingPairedCandidates,
@@ -1959,6 +2115,17 @@ private final class MacOSRFCOMMTransport: NSObject {
       )))
       return
     }
+    // Persist only a strict, live inquiry match as a retry candidate. macOS
+    // inquiry can intermittently terminate with status 1 and no results even
+    // though it resolved the same nearby Classic device moments earlier. This
+    // candidate is not a trusted identity: it merely lets the next system
+    // pairing request target the already observed address. It becomes a
+    // confirmed mapping only after the application authentication succeeds.
+    rememberClassicCandidate(
+      selected,
+      peripheralID: operation.peripheralID,
+      advertisedName: operation.advertisedName
+    )
     if selected.isPaired() {
       completePairingOperation(operation, with: .success(selected))
       return
@@ -2009,7 +2176,13 @@ private final class MacOSRFCOMMTransport: NSObject {
     pairingOperation = nil
     // Stopping after clearing the owner link makes an asynchronous aborted
     // callback observational only; the Flutter result remains exactly-once.
-    inquiry?.stop()
+    if let inquiry {
+      // Cancellation can deliver its terminal callback asynchronously. Retain
+      // through that cleanup instead of letting the native object deallocate
+      // on the current callback stack.
+      retainClassicInquiryUntilSafeRelease(inquiry)
+      inquiry.stop()
+    }
 
     switch result {
     case .success(let selected):
@@ -2074,7 +2247,9 @@ private final class MacOSRFCOMMTransport: NSObject {
 
   func confirmIdentity(peripheralID: String, advertisedName: String) throws {
     let mapping = mappingKey(peripheralID)
-    guard let address = provisionalMappings[mapping],
+    let provisionalAddress = provisionalMappings[mapping]
+    let persistedAddress = UserDefaults.standard.string(forKey: mapping)
+    guard let address = provisionalAddress ?? persistedAddress,
           let selected = IOBluetoothDevice(addressString: address),
           selected.isPaired(),
           classicNameMatchesAdvertisement(
@@ -2088,7 +2263,11 @@ private final class MacOSRFCOMMTransport: NSObject {
     }
     UserDefaults.standard.set(address, forKey: mapping)
     provisionalMappings.removeValue(forKey: mapping)
-    emitEvent("identity_confirmed", fields: ["address": address, "name": advertisedName])
+    emitEvent("identity_confirmed", fields: [
+      "address": address,
+      "name": advertisedName,
+      "source": provisionalAddress == nil ? "confirmed_mapping" : "provisional_mapping",
+    ])
   }
 
   /// Clears only Wristload's local CoreBluetooth-to-classic-device association.
@@ -2141,7 +2320,7 @@ private final class MacOSRFCOMMTransport: NSObject {
           "RFCOMM is already connected to a different classic Bluetooth device."
         )
       }
-      completion(deviceDescription(active))
+      completion(deviceDescription(active, generation: current.generation))
       return
     }
 
@@ -2431,7 +2610,10 @@ private final class MacOSRFCOMMTransport: NSObject {
         current.phase = .connected
         let completion = current.completion
         current.completion = nil
-        completion?(self.deviceDescription(openedChannel.getDevice()))
+        completion?(self.deviceDescription(
+          openedChannel.getDevice(),
+          generation: generation
+        ))
       case .closingLocal:
         guard status == kIOReturnSuccess else {
           self.finishSession(current)
@@ -2640,7 +2822,7 @@ private final class MacOSRFCOMMTransport: NSObject {
             current.generation == generation,
             current.phase == .connected,
             self.matches(source, session: current) else { return }
-      self.onData?(data)
+      self.onData?(data, generation)
     }
   }
 
@@ -2677,7 +2859,7 @@ private final class MacOSRFCOMMTransport: NSObject {
           code: "rfcomm_closed",
           message: "The remote device closed the RFCOMM connection.",
           details: nil
-        ))
+        ), generation)
       }
     }
   }
@@ -2746,6 +2928,30 @@ private final class MacOSRFCOMMTransport: NSObject {
       }
       provisionalMappings.removeValue(forKey: mapping)
     }
+    if let candidate = rememberedClassicCandidate(
+      peripheralID: peripheralID,
+      advertisedName: advertisedName
+    ) {
+      emitEvent("classic_candidate_reused", fields: [
+        "peripheral": peripheralID,
+        "address": candidate.addressString ?? "",
+        "name": candidate.name ?? candidate.nameOrAddress ?? "",
+        "paired": candidate.isPaired(),
+      ])
+      return .resolved(candidate)
+    }
+    if let bootstrap = knownClassicBootstrapCandidate(
+      peripheralID: peripheralID,
+      advertisedName: advertisedName
+    ) {
+      emitEvent("classic_bootstrap_candidate_resolved", fields: [
+        "peripheral": peripheralID,
+        "address": bootstrap.addressString ?? "",
+        "name": bootstrap.name ?? bootstrap.nameOrAddress ?? "",
+        "paired": bootstrap.isPaired(),
+      ])
+      return .resolved(bootstrap)
+    }
 
     let pairedCandidates = (IOBluetoothDevice.pairedDevices() ?? [])
       .compactMap { $0 as? IOBluetoothDevice }
@@ -2804,6 +3010,12 @@ private final class MacOSRFCOMMTransport: NSObject {
       advertisedName: advertisedName
     ) {
     case .resolved(let selected):
+      guard selected.isPaired() else {
+        throw PlatformBridgeError(
+          "device_not_paired",
+          "The matching Classic Bluetooth device is not paired. Complete the macOS pairing request before opening SPP."
+        )
+      }
       return selected
     case .requiresInquiry(let matchingPairedCandidates):
       let isUnpaired = matchingPairedCandidates == 0
@@ -2824,8 +3036,78 @@ private final class MacOSRFCOMMTransport: NSObject {
     provisionalMappings[mappingKey(peripheralID)] = address
   }
 
+  private func rememberClassicCandidate(
+    _ selected: IOBluetoothDevice,
+    peripheralID: String,
+    advertisedName: String
+  ) {
+    guard let address = selected.addressString,
+          classicNameMatchesAdvertisement(
+            advertisedName: advertisedName,
+            classicName: selected.name ?? selected.nameOrAddress ?? ""
+          ) else { return }
+    UserDefaults.standard.set([
+      "address": address,
+      "advertisedName": advertisedName,
+    ], forKey: candidateMappingKey(peripheralID))
+    emitEvent("classic_candidate_remembered", fields: [
+      "peripheral": peripheralID,
+      "address": address,
+      "paired": selected.isPaired(),
+    ])
+  }
+
+  private func rememberedClassicCandidate(
+    peripheralID: String,
+    advertisedName: String
+  ) -> IOBluetoothDevice? {
+    let key = candidateMappingKey(peripheralID)
+    guard let record = UserDefaults.standard.dictionary(forKey: key),
+          let address = record["address"] as? String,
+          let rememberedName = record["advertisedName"] as? String,
+          canonicalName(rememberedName) == canonicalName(advertisedName),
+          let device = IOBluetoothDevice(addressString: address) else {
+      UserDefaults.standard.removeObject(forKey: key)
+      return nil
+    }
+    let deviceName = device.name ?? device.nameOrAddress ?? ""
+    guard classicNameMatchesAdvertisement(
+      advertisedName: advertisedName,
+      classicName: deviceName
+    ) else {
+      UserDefaults.standard.removeObject(forKey: key)
+      return nil
+    }
+    return device
+  }
+
+  private func knownClassicBootstrapCandidate(
+    peripheralID: String,
+    advertisedName: String
+  ) -> IOBluetoothDevice? {
+    guard let candidate = knownClassicBootstrapCandidates[peripheralID.lowercased()],
+          canonicalName(candidate.name) == canonicalName(advertisedName),
+          let device = IOBluetoothDevice(addressString: candidate.address) else {
+      return nil
+    }
+    // IOBluetooth can expose an address object without a current remote name.
+    // When it does have a name, it must remain the exact intended device.
+    let deviceName = device.name ?? device.nameOrAddress
+    guard deviceName == nil || classicNameMatchesAdvertisement(
+      advertisedName: advertisedName,
+      classicName: deviceName ?? ""
+    ) else {
+      return nil
+    }
+    return device
+  }
+
   private func mappingKey(_ peripheralID: String) -> String {
     "wristload.rfcomm.\(peripheralID.lowercased())"
+  }
+
+  private func candidateMappingKey(_ peripheralID: String) -> String {
+    "\(mappingKey(peripheralID)).classic-candidate"
   }
 
   private func canonicalName(_ value: String) -> String {
@@ -2877,11 +3159,16 @@ private final class MacOSRFCOMMTransport: NSObject {
     return "advertised_trailing_hex"
   }
 
-  private func deviceDescription(_ selected: IOBluetoothDevice) -> [String: Any] {
-    [
+  private func deviceDescription(
+    _ selected: IOBluetoothDevice,
+    generation: UInt64? = nil
+  ) -> [String: Any] {
+    var description: [String: Any] = [
       "address": selected.addressString ?? "",
       "name": selected.name ?? selected.nameOrAddress ?? "",
     ]
+    if let generation { description["generation"] = Int(generation) }
+    return description
   }
 
   private func bind(
@@ -3207,5 +3494,312 @@ private final class MacOSRFCOMMTransport: NSObject {
     } else {
       DispatchQueue.main.async(execute: action)
     }
+  }
+}
+
+/// Native connection pool for macOS Classic Bluetooth.  RFCOMM channel IDs are
+/// scoped to a remote device, not globally to the local adapter, so each
+/// CoreBluetooth identity can safely retain an independent SDP result and
+/// `IOBluetoothRFCOMMChannel`, even when two watches expose the same channel
+/// number.  The per-device connection above deliberately retains the proven
+/// single-device pairing, SDP and teardown behaviour.
+private final class MacOSRFCOMMTransport: NSObject {
+  typealias DataHandler = (String, Data, UInt64) -> Void
+  typealias ClosedHandler = (String, FlutterError, UInt64) -> Void
+
+  var onData: DataHandler?
+  var onClosed: ClosedHandler?
+  var onEvent: (([String: Any]) -> Void)?
+
+  /// A single logical pairing request. Several Dart callers can join the same
+  /// physical pairing ceremony for one CoreBluetooth identity, but macOS must
+  /// never receive duplicate IOBluetoothDevicePair requests for that device.
+  private final class PairingRequest {
+    let key: String
+    let peripheralID: String
+    let advertisedName: String
+    private var completions: [FlutterResult]
+    private(set) var completed = false
+
+    init(
+      key: String,
+      peripheralID: String,
+      advertisedName: String,
+      completion: @escaping FlutterResult
+    ) {
+      self.key = key
+      self.peripheralID = peripheralID
+      self.advertisedName = advertisedName
+      completions = [completion]
+    }
+
+    func append(_ completion: @escaping FlutterResult) {
+      guard !completed else { return }
+      completions.append(completion)
+    }
+
+    func complete(_ result: Any?) {
+      guard !completed else { return }
+      completed = true
+      let callbacks = completions
+      completions.removeAll()
+      for callback in callbacks { callback(result) }
+    }
+  }
+
+  private var connections: [String: MacOSRFCOMMConnection] = [:]
+  private var displayPeripheralIDs: [String: String] = [:]
+  // macOS owns one global pairing UI at a time.  Opening already-paired SPP
+  // channels remains independent; only the system pairing ceremony is queued.
+  private var pairingQueue: [PairingRequest] = []
+  private var activePairing: PairingRequest?
+  // `IOBluetoothDevicePair.stop()` dismisses the system ceremony before its
+  // framework cleanup has necessarily left the current main-loop turn. Keep
+  // a cancelled request in the global slot briefly so a queued device cannot
+  // present a second pairing flow while the first one is still unwinding.
+  private let cancelledPairingDrainInterval: TimeInterval = 1
+
+  func pair(
+    peripheralID: String,
+    advertisedName: String,
+    completion: @escaping FlutterResult
+  ) {
+    let key = connectionKey(peripheralID)
+    displayPeripheralIDs[key] = peripheralID
+    // A reconnect button, a delayed Flutter method result, and a system
+    // pairing callback can overlap. Coalesce same-device callers instead of
+    // enqueuing a second IOBluetooth pairing request for the same watch.
+    if let active = activePairing, active.key == key, !active.completed {
+      active.append(completion)
+      return
+    }
+    if let queued = pairingQueue.first(where: { $0.key == key }) {
+      queued.append(completion)
+      return
+    }
+    pairingQueue.append(PairingRequest(
+      key: key,
+      peripheralID: peripheralID,
+      advertisedName: advertisedName,
+      completion: completion
+    ))
+    startNextPairingIfPossible()
+  }
+
+  func connect(
+    peripheralID: String,
+    advertisedName: String,
+    completion: @escaping FlutterResult
+  ) throws {
+    let connection = connection(
+      peripheralID: peripheralID,
+      advertisedName: advertisedName
+    )
+    try connection.connect(
+      peripheralID: peripheralID,
+      advertisedName: advertisedName,
+      completion: completion
+    )
+  }
+
+  func write(
+    _ data: Data,
+    peripheralID: String,
+    completion: @escaping FlutterResult
+  ) throws {
+    let key = connectionKey(peripheralID)
+    guard let connection = connections[key] else {
+      throw PlatformBridgeError(
+        "rfcomm_not_connected",
+        "RFCOMM is not connected for the requested Bluetooth device."
+      )
+    }
+    try connection.write(data, completion: completion)
+  }
+
+  func disconnect(peripheralID: String, completion: FlutterResult? = nil) {
+    let key = connectionKey(peripheralID)
+    cancelQueuedPairings(for: key)
+    cancelActivePairing(for: key)
+    guard let connection = connections[key] else {
+      completion?(nil)
+      return
+    }
+    connection.disconnect(completion: completion)
+  }
+
+  func disconnectAll() {
+    let queued = pairingQueue
+    pairingQueue.removeAll()
+    for request in queued {
+      completeQueuedPairing(request, result: pairingCancelledError())
+    }
+    if let active = activePairing {
+      completeQueuedPairing(active, result: pairingCancelledError())
+    }
+    for connection in connections.values {
+      connection.disconnect()
+    }
+  }
+
+  func confirmIdentity(peripheralID: String, advertisedName: String) throws {
+    let key = connectionKey(peripheralID)
+    guard let connection = connections[key] else {
+      throw PlatformBridgeError(
+        "device_identity_unconfirmed",
+        "The authenticated classic Bluetooth identity is no longer available."
+      )
+    }
+    try connection.confirmIdentity(
+      peripheralID: peripheralID,
+      advertisedName: advertisedName
+    )
+  }
+
+  func forgetIdentity(peripheralID: String) {
+    let key = connectionKey(peripheralID)
+    if let connection = connections[key] {
+      connection.forgetIdentity(peripheralID: peripheralID)
+      return
+    }
+    // Identity mappings are owned by the per-device object.  Constructing a
+    // dormant object here is safe and lets a user forget a saved device after
+    // an application restart without opening an RFCOMM channel.
+    connection(peripheralID: peripheralID, advertisedName: "")
+      .forgetIdentity(peripheralID: peripheralID)
+  }
+
+  private func startNextPairingIfPossible() {
+    guard activePairing == nil, !pairingQueue.isEmpty else { return }
+    let request = pairingQueue.removeFirst()
+    activePairing = request
+    let connection = connection(
+      peripheralID: request.peripheralID,
+      advertisedName: request.advertisedName
+    )
+    connection.pair(
+      peripheralID: request.peripheralID,
+      advertisedName: request.advertisedName
+    ) { [weak self, request] result in
+      self?.completeActivePairing(request, result: result)
+    }
+  }
+
+  private func completeActivePairing(
+    _ request: PairingRequest,
+    result: Any?
+  ) {
+    if !Thread.isMainThread {
+      DispatchQueue.main.async { [weak self, request] in
+        self?.completeActivePairing(request, result: result)
+      }
+      return
+    }
+    // A late completion from a cancelled pairing must never clear or advance
+    // a newer request for the same or another device. A disconnect returns
+    // cancellation to Dart first, then the per-device operation stops the
+    // native pairing ceremony. Keep the global slot occupied while that stop
+    // operation drains on the main run loop.
+    guard activePairing === request else { return }
+    let wasCancelled = request.completed
+    if !wasCancelled {
+      activePairing = nil
+      request.complete(result)
+      // A normal completion arrives from the terminal native callback, so the
+      // next queued system pairing may begin on the next main-loop turn.
+      DispatchQueue.main.async { [weak self] in
+        self?.startNextPairingIfPossible()
+      }
+      return
+    }
+
+    // The Flutter callers already received cancellation through
+    // [cancelActivePairing]. Do not clear [activePairing] yet: doing so would
+    // let [pair] start a new system prompt synchronously while IOBluetooth is
+    // still closing the old request. The identity guard makes a duplicate
+    // callback or a later disconnect observational only.
+    DispatchQueue.main.asyncAfter(
+      deadline: .now() + cancelledPairingDrainInterval
+    ) { [weak self, request] in
+      guard let self, self.activePairing === request else { return }
+      self.activePairing = nil
+      self.startNextPairingIfPossible()
+    }
+  }
+
+  private func completeQueuedPairing(_ request: PairingRequest, result: Any?) {
+    request.complete(result)
+  }
+
+  private func pairingCancelledError() -> FlutterError {
+    FlutterError(
+      code: "pairing_cancelled",
+      message: "Classic Bluetooth pairing was cancelled.",
+      details: nil
+    )
+  }
+
+  /// Mark a cancelled request complete for Dart, but leave the native pairing
+  /// slot occupied until [completeActivePairing] observes the per-device stop
+  /// and drains the IOBluetooth main-loop cleanup interval. A retry therefore
+  /// queues instead of overlapping the previous system ceremony.
+  private func cancelActivePairing(for key: String) {
+    guard let active = activePairing, active.key == key else { return }
+    completeQueuedPairing(active, result: pairingCancelledError())
+  }
+
+  private func cancelQueuedPairings(for key: String) {
+    guard !pairingQueue.isEmpty else { return }
+    var remaining: [PairingRequest] = []
+    for request in pairingQueue {
+      if connectionKey(request.peripheralID) == key {
+        completeQueuedPairing(request, result: pairingCancelledError())
+      } else {
+        remaining.append(request)
+      }
+    }
+    pairingQueue = remaining
+  }
+
+  private func connection(
+    peripheralID: String,
+    advertisedName: String
+  ) -> MacOSRFCOMMConnection {
+    let key = connectionKey(peripheralID)
+    displayPeripheralIDs[key] = peripheralID
+    if let existing = connections[key] { return existing }
+
+    let connection = MacOSRFCOMMConnection()
+    connection.onData = { [weak self] data, generation in
+      guard let self else { return }
+      self.onData?(
+        self.displayPeripheralIDs[key] ?? peripheralID,
+        data,
+        generation
+      )
+    }
+    connection.onClosed = { [weak self] error, generation in
+      guard let self else { return }
+      self.onClosed?(
+        self.displayPeripheralIDs[key] ?? peripheralID,
+        error,
+        generation
+      )
+    }
+    connection.onEvent = { [weak self] event in
+      guard let self else { return }
+      var tagged = event
+      // The Dart routing key is authoritative at the transport boundary.
+      // Individual IOBluetooth callbacks may omit it, but must never inherit a
+      // different device's identifier.
+      tagged["peripheral"] = self.displayPeripheralIDs[key] ?? peripheralID
+      self.onEvent?(tagged)
+    }
+    connections[key] = connection
+    return connection
+  }
+
+  private func connectionKey(_ peripheralID: String) -> String {
+    peripheralID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
   }
 }

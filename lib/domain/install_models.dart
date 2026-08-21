@@ -36,10 +36,7 @@ class InstallMetadata {
   final List<WatchfaceResolution> watchfaceResolutions;
   final bool containsLua;
 
-  InstallMetadata copyWith({
-    String? faceId,
-    int? versionCode,
-  }) =>
+  InstallMetadata copyWith({String? faceId, int? versionCode}) =>
       InstallMetadata(
         fileName: fileName,
         fileSize: fileSize,
@@ -61,6 +58,7 @@ class InstallRequest {
     this.source,
     this.unsupportedLuaConfirmed = false,
     this.watchfaceResolutionConfirmed = false,
+    this.targetDeviceIds = const [],
   });
 
   final InstallKind kind;
@@ -70,23 +68,29 @@ class InstallRequest {
   final bool unsupportedLuaConfirmed;
   final bool watchfaceResolutionConfirmed;
 
+  /// Authenticated device identities chosen at import time. An empty list
+  /// preserves the legacy single-session route; the application controller
+  /// resolves non-empty targets to independent macOS RFCOMM protocol sessions.
+  final List<String> targetDeviceIds;
+
   /// Updates interactive install choices without discarding the resolved
   /// path and persistent file-access bookmark.
   InstallRequest copyWith({
     InstallMetadata? metadata,
     bool? unsupportedLuaConfirmed,
     bool? watchfaceResolutionConfirmed,
-  }) =>
-      InstallRequest(
-        kind: kind,
-        path: path,
-        metadata: metadata ?? this.metadata,
-        source: source,
-        unsupportedLuaConfirmed:
-            unsupportedLuaConfirmed ?? this.unsupportedLuaConfirmed,
-        watchfaceResolutionConfirmed:
-            watchfaceResolutionConfirmed ?? this.watchfaceResolutionConfirmed,
-      );
+    List<String>? targetDeviceIds,
+  }) => InstallRequest(
+    kind: kind,
+    path: path,
+    metadata: metadata ?? this.metadata,
+    source: source,
+    unsupportedLuaConfirmed:
+        unsupportedLuaConfirmed ?? this.unsupportedLuaConfirmed,
+    watchfaceResolutionConfirmed:
+        watchfaceResolutionConfirmed ?? this.watchfaceResolutionConfirmed,
+    targetDeviceIds: targetDeviceIds ?? this.targetDeviceIds,
+  );
 }
 
 /// 只保存已确认状态，用于断线后重新协商断点；绝不保存密钥或文件内容。
@@ -120,19 +124,19 @@ class InstallCheckpoint {
   final Uint8List? bookmark;
 
   Map<String, Object?> toJson() => {
-        'kind': kind == InstallKind.watchface ? 'watchface' : 'quickapp',
-        'path': path,
-        'fileSize': fileSize,
-        'md5Hex': md5Hex,
-        'sha256Hex': sha256Hex,
-        'dataType': dataType,
-        'lastAcknowledgedSegment': lastAcknowledgedSegment,
-        'phase': phase,
-        'faceId': faceId,
-        'packageName': packageName,
-        'versionCode': versionCode,
-        if (bookmark != null) 'bookmark': base64Encode(bookmark!),
-      };
+    'kind': kind == InstallKind.watchface ? 'watchface' : 'quickapp',
+    'path': path,
+    'fileSize': fileSize,
+    'md5Hex': md5Hex,
+    'sha256Hex': sha256Hex,
+    'dataType': dataType,
+    'lastAcknowledgedSegment': lastAcknowledgedSegment,
+    'phase': phase,
+    'faceId': faceId,
+    'packageName': packageName,
+    'versionCode': versionCode,
+    if (bookmark != null) 'bookmark': base64Encode(bookmark!),
+  };
 
   /// 解析检查点 JSON；字段缺失或越界时返回 null（不可恢复）。
   static InstallCheckpoint? fromJson(Map<String, Object?> value) {
@@ -184,8 +188,8 @@ class InstallCheckpoint {
       } on FormatException {
         return null;
       }
-      if (bookmark.isEmpty ||
-          bookmark.length > maxSecurityScopedBookmarkBytes) return null;
+      if (bookmark.isEmpty || bookmark.length > maxSecurityScopedBookmarkBytes)
+        return null;
     }
     return InstallCheckpoint(
       kind: kind,

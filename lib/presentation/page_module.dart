@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../application/device_controller.dart';
@@ -55,6 +56,7 @@ class WristloadPageModule {
     required this.selectedIcon,
     required this.order,
     required this.build,
+    this.supportedPlatforms = const <TargetPlatform>{},
   });
 
   final String id;
@@ -64,4 +66,13 @@ class WristloadPageModule {
   final IconData selectedIcon;
   final int order;
   final WristloadPageBuilder build;
+
+  /// An empty set preserves the existing all-platform behavior. A page can
+  /// opt into a specific desktop platform without adding page-specific
+  /// navigation conditions to the application shell.
+  final Set<TargetPlatform> supportedPlatforms;
+
+  bool get isAvailableOnCurrentPlatform =>
+      supportedPlatforms.isEmpty ||
+      supportedPlatforms.contains(defaultTargetPlatform);
 }

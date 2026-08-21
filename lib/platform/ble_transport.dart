@@ -28,6 +28,36 @@ extension BluetoothAuthorizationStatusX on BluetoothAuthorizationStatus {
       this == BluetoothAuthorizationStatus.restricted;
 }
 
+/// A native RFCOMM payload paired with the CoreBluetooth identity that owns
+/// the channel. macOS uses this tag to keep one watch's protocol frames out of
+/// another watch's authenticated session.
+class RfcommDataEvent {
+  const RfcommDataEvent({
+    required this.data,
+    this.peripheralId,
+    this.generation,
+  });
+
+  final Uint8List data;
+  final String? peripheralId;
+  final int? generation;
+}
+
+/// A per-device RFCOMM close notification from the macOS native bridge.
+class RfcommClosedEvent {
+  const RfcommClosedEvent({
+    required this.peripheralId,
+    required this.code,
+    required this.message,
+    this.generation,
+  });
+
+  final String peripheralId;
+  final String? code;
+  final String? message;
+  final int? generation;
+}
+
 /// Cross-platform BLE central wrapper plus the verified RFCOMM bridges.
 ///
 /// Darwin's CoreBluetooth identifier is deliberately kept opaque: it is not a
@@ -488,7 +518,9 @@ class BleTransport {
     String? advertisedName,
   }) async {
     final peripheralId = uuid.toString();
-    final epoch = _beginRfcommEpoch();
+    final epoch = _beginRfcommEpoch(uuid);
+    final lane = _rfcommWriteLane(uuid);
+    if (_isMacOS) lane.awaitingMacOSGeneration = true;
     _trace(
       'RFCOMM 连接开始',
       fields: <String, Object?>{
@@ -520,11 +552,18 @@ class BleTransport {
           _macosIdentity(uuid, advertisedName),
         );
         final address = _macosAddress(reply, 'connect');
+        final nativeGeneration = _macosConnectionGeneration(reply);
+        _acceptMacOSConnectionGeneration(
+          uuid,
+          dartEpoch: epoch,
+          nativeGeneration: nativeGeneration,
+        );
         _info(
           'RFCOMM 连接成功',
           fields: <String, Object?>{
             'peripheral': peripheralId,
             'epoch': epoch,
+            'nativeGeneration': nativeGeneration,
             'hasAddress': address != null,
           },
         );
@@ -549,6 +588,10 @@ class BleTransport {
       );
       return formatted;
     } on Object catch (error) {
+      if (_isMacOS && lane.epoch == epoch) {
+        lane.awaitingMacOSGeneration = false;
+        lane.activeMacOSGeneration = null;
+      }
       _error(
         'RFCOMM 连接失败：$error',
         fields: <String, Object?>{
@@ -561,21 +604,124 @@ class BleTransport {
     }
   }
 
-  // StreamSocket.OutputStream only supports one pending write. ACK and the
-  // following command can be scheduled from the same inbound callback, so all
-  // platforms share this small FIFO instead of racing two native DataWriters.
-  Future<void> _rfcommWriteTail = Future<void>.value();
-  int _rfcommWriteEpoch = 0;
+  // A native RFCOMM channel permits only one pending write, but that limit is
+  // per channel. A reconnect of device A must never cancel an in-flight write
+  // to device B, so every device gets its own FIFO and epoch. The FIFO itself
+  // remains intact across A's reconnect: the next generation must not issue a
+  // native write while an old write is still executing against A's channel.
+  final Map<String, _RfcommWriteLane> _rfcommWriteLanes =
+      <String, _RfcommWriteLane>{};
 
-  int _beginRfcommEpoch() {
-    _rfcommWriteEpoch++;
-    _rfcommWriteTail = Future<void>.value();
-    return _rfcommWriteEpoch;
+  _RfcommWriteLane _rfcommWriteLane(UUID uuid) => _rfcommWriteLanes.putIfAbsent(
+    uuid.toString().toLowerCase(),
+    _RfcommWriteLane.new,
+  );
+
+  int _beginRfcommEpoch(UUID uuid) {
+    final lane = _rfcommWriteLane(uuid);
+    lane.epoch++;
+    if (_isMacOS) {
+      // Do not route an old native channel while a new Dart session is being
+      // established. The current generation is adopted from `sdp_started` or
+      // the connect reply before any application bytes are accepted.
+      lane.activeMacOSGeneration = null;
+      lane.awaitingMacOSGeneration = false;
+    } else {
+      // Preserve the established Android/Windows reconnection behavior. The
+      // per-device native generation contract exists only on macOS.
+      lane.tail = Future<void>.value();
+    }
+    return lane.epoch;
+  }
+
+  int _macosConnectionGeneration(Object? reply) {
+    final raw = reply is Map ? reply['generation'] : null;
+    final generation = _macosGeneration(raw);
+    if (generation != null) return generation;
+    throw PlatformException(
+      code: 'rfcomm_invalid_reply',
+      message: 'macOS RFCOMM connect did not return a session generation.',
+      details: reply,
+    );
+  }
+
+  int? _macosGeneration(Object? value) {
+    final parsed = switch (value) {
+      int number => number,
+      num number => number.toInt(),
+      String text => int.tryParse(text.trim()),
+      _ => null,
+    };
+    return parsed != null && parsed > 0 ? parsed : null;
+  }
+
+  void _acceptMacOSConnectionGeneration(
+    UUID uuid, {
+    required int dartEpoch,
+    required int nativeGeneration,
+  }) {
+    final lane = _rfcommWriteLane(uuid);
+    // A stale method result must never re-enable packets for a newer Dart
+    // connection attempt. Native generations are monotonic per peripheral.
+    if (lane.epoch != dartEpoch) return;
+    final highest = lane.highestMacOSGeneration;
+    if (highest != null && nativeGeneration < highest) {
+      throw PlatformException(
+        code: 'rfcomm_generation_regressed',
+        message: 'macOS RFCOMM returned an older session generation.',
+        details: <String, Object?>{
+          'peripheral': uuid.toString(),
+          'nativeGeneration': nativeGeneration,
+          'highestGeneration': highest,
+        },
+      );
+    }
+    lane
+      ..highestMacOSGeneration = highest == null
+          ? nativeGeneration
+          : nativeGeneration > highest
+          ? nativeGeneration
+          : highest
+      ..activeMacOSGeneration = nativeGeneration
+      ..awaitingMacOSGeneration = false;
+  }
+
+  void _observeMacOSConnectionGeneration(
+    String peripheralId,
+    String eventName,
+    Object? generationValue,
+  ) {
+    // `sdp_started` is emitted immediately after native allocates a distinct
+    // per-device session. `opened` is retained as a fallback in case an SDK
+    // delivers only the later lifecycle event. Never learn a generation from
+    // raw traffic or a close event.
+    if (eventName != 'sdp_started' && eventName != 'opened') return;
+    final generation = _macosGeneration(generationValue);
+    if (generation == null) return;
+    final key = peripheralId.trim().toLowerCase();
+    final lane = _rfcommWriteLanes[key];
+    if (lane == null || !lane.awaitingMacOSGeneration) return;
+    final highest = lane.highestMacOSGeneration;
+    // A late event from a retired connection cannot satisfy a newer attempt.
+    if (highest != null && generation <= highest) return;
+    lane
+      ..highestMacOSGeneration = generation
+      ..activeMacOSGeneration = generation
+      ..awaitingMacOSGeneration = false;
+  }
+
+  bool _isActiveMacOSGeneration(String peripheralId, int? generation) {
+    if (generation == null) return false;
+    final lane = _rfcommWriteLanes[peripheralId.trim().toLowerCase()];
+    return lane != null &&
+        !lane.awaitingMacOSGeneration &&
+        lane.activeMacOSGeneration == generation;
   }
 
   /// 写 RFCOMM 数据（严格串行）。
   Future<void> rfcommWrite(UUID uuid, List<int> data) {
-    final epoch = _rfcommWriteEpoch;
+    final lane = _rfcommWriteLane(uuid);
+    final epoch = lane.epoch;
     _trace(
       'RFCOMM 写入排队',
       fields: <String, Object?>{
@@ -586,12 +732,12 @@ class BleTransport {
         'wireHex': _wireHex(data),
       },
     );
-    final operation = _rfcommWriteTail.then((_) async {
-      if (epoch != _rfcommWriteEpoch) {
+    final operation = lane.tail.then((_) async {
+      if (epoch != lane.epoch) {
         throw StateError('RFCOMM connection changed while writing.');
       }
       await _rfcommWriteDirect(uuid, List<int>.from(data));
-      if (epoch != _rfcommWriteEpoch) {
+      if (epoch != lane.epoch) {
         throw StateError('RFCOMM connection changed while writing.');
       }
       _trace(
@@ -606,7 +752,7 @@ class BleTransport {
       );
     });
     // A failed packet is reported to its caller but must not poison the queue.
-    _rfcommWriteTail = operation.then<void>(
+    lane.tail = operation.then<void>(
       (_) {},
       onError: (Object error, StackTrace stack) {
         _error(
@@ -650,7 +796,10 @@ class BleTransport {
       return;
     }
     if (_isMacOS) {
-      await _macosMethods.invokeMethod<void>('write', Uint8List.fromList(data));
+      await _macosMethods.invokeMethod<void>('write', <String, Object>{
+        'peripheralId': uuid.toString(),
+        'data': Uint8List.fromList(data),
+      });
       return;
     }
     _requireRfcommPlatform();
@@ -669,7 +818,7 @@ class BleTransport {
 
   /// 断开 RFCOMM。
   Future<void> disconnectRfcomm(UUID uuid) async {
-    final epoch = _beginRfcommEpoch();
+    final epoch = _beginRfcommEpoch(uuid);
     _trace(
       'RFCOMM 断开请求',
       fields: <String, Object?>{'peripheral': uuid.toString(), 'epoch': epoch},
@@ -680,7 +829,9 @@ class BleTransport {
         return;
       }
       if (_isMacOS) {
-        await _macosMethods.invokeMethod<void>('disconnect');
+        await _macosMethods.invokeMethod<void>('disconnect', <String, Object>{
+          'peripheralId': uuid.toString(),
+        });
         return;
       }
       _requireRfcommPlatform();
@@ -710,8 +861,11 @@ class BleTransport {
       );
       rethrow;
     } finally {
-      if (epoch == _rfcommWriteEpoch) {
-        _rfcommWriteTail = Future<void>.value();
+      if (!_isMacOS) {
+        final lane = _rfcommWriteLane(uuid);
+        if (epoch == lane.epoch) {
+          lane.tail = Future<void>.value();
+        }
       }
     }
   }
@@ -738,9 +892,56 @@ class BleTransport {
 
   final StreamController<Uint8List> _rfcommDataController =
       StreamController<Uint8List>.broadcast();
+  final StreamController<RfcommDataEvent> _rfcommDataEventController =
+      StreamController<RfcommDataEvent>.broadcast();
+  final StreamController<RfcommClosedEvent> _rfcommClosedEventController =
+      StreamController<RfcommClosedEvent>.broadcast();
   StreamSubscription<dynamic>? _androidRfcommSubscription;
   StreamSubscription<dynamic>? _macosRfcommSubscription;
   Stream<Uint8List> get rfcommData => _rfcommDataController.stream;
+
+  /// Tagged packets emitted by the macOS native RFCOMM connection pool.
+  Stream<RfcommDataEvent> get rfcommDataEvents =>
+      _rfcommDataEventController.stream;
+
+  /// Device-scoped remote-close events from the macOS native bridge.
+  Stream<RfcommClosedEvent> get rfcommClosedEvents =>
+      _rfcommClosedEventController.stream;
+
+  /// Selects exactly one macOS RFCOMM channel. The macOS native bridge always
+  /// tags its events with the owning CoreBluetooth identity. Keep that routing
+  /// contract stable from subscription time: falling back to [rfcommData]
+  /// before the EventChannel has started would let a later second device's
+  /// packet enter the first device's authenticated session.
+  ///
+  /// Other platforms retain their established single-stream behavior until
+  /// their native transports expose a comparable device identity.
+  Stream<Uint8List> rfcommDataFor(UUID uuid) {
+    if (!_isMacOS) return rfcommData;
+    final requested = uuid.toString().trim().toLowerCase();
+    return _rfcommDataEventController.stream
+        .where(
+          (event) =>
+              event.peripheralId?.trim().toLowerCase() == requested &&
+              _isActiveMacOSGeneration(
+                event.peripheralId ?? '',
+                event.generation,
+              ),
+        )
+        .map((event) => event.data);
+  }
+
+  Stream<RfcommClosedEvent> rfcommClosedFor(UUID uuid) {
+    if (!_isMacOS) {
+      return const Stream<RfcommClosedEvent>.empty();
+    }
+    final requested = uuid.toString().trim().toLowerCase();
+    return _rfcommClosedEventController.stream.where(
+      (event) =>
+          event.peripheralId.trim().toLowerCase() == requested &&
+          _isActiveMacOSGeneration(event.peripheralId, event.generation),
+    );
+  }
 
   static const _androidMethods = MethodChannel('wristload/rfcomm');
   static const _androidEvents = EventChannel('wristload/rfcomm/events');
@@ -882,6 +1083,9 @@ class BleTransport {
                   },
                 );
                 _rfcommDataController.add(value);
+                if (!_rfcommDataEventController.isClosed) {
+                  _rfcommDataEventController.add(RfcommDataEvent(data: value));
+                }
               }
             },
             onError: (Object error, StackTrace stackTrace) {
@@ -915,6 +1119,17 @@ class BleTransport {
               'nativeEvent': eventName,
               ...event,
             };
+            final peripheral = event['peripheral']?.toString().trim();
+            final generation = _macosGeneration(event['generation']);
+            if (event['kind'] == 'native' &&
+                peripheral != null &&
+                peripheral.isNotEmpty) {
+              _observeMacOSConnectionGeneration(
+                peripheral,
+                eventName,
+                event['generation'],
+              );
+            }
             switch (level) {
               case DiagnosticLogLevel.error:
                 _logger.error(
@@ -937,39 +1152,70 @@ class BleTransport {
             // diagnostic window; the byte stream is handled below.
             if (event['kind'] == 'data' && event['wireHex'] is String) {
               final bytes = _decodeWireHex(event['wireHex']!.toString());
-              if (bytes != null && !_rfcommDataController.isClosed) {
-                _rfcommDataController.add(bytes);
+              if (bytes != null &&
+                  peripheral != null &&
+                  peripheral.isNotEmpty &&
+                  _isActiveMacOSGeneration(peripheral, generation)) {
+                if (!_rfcommDataController.isClosed) {
+                  _rfcommDataController.add(bytes);
+                }
+                if (!_rfcommDataEventController.isClosed) {
+                  _rfcommDataEventController.add(
+                    RfcommDataEvent(
+                      data: bytes,
+                      peripheralId: peripheral,
+                      generation: generation,
+                    ),
+                  );
+                }
+              } else if (bytes != null) {
+                _error(
+                  'macOS RFCOMM 数据不属于当前设备会话，已拒绝路由。',
+                  fields: <String, Object?>{
+                    'platform': 'macos',
+                    'nativeEvent': eventName,
+                    'hasPeripheral': peripheral?.isNotEmpty == true,
+                    'generation': generation,
+                  },
+                );
+              }
+            }
+            if (event['kind'] == 'closed') {
+              if (peripheral != null &&
+                  peripheral.isNotEmpty &&
+                  _isActiveMacOSGeneration(peripheral, generation) &&
+                  !_rfcommClosedEventController.isClosed) {
+                _rfcommClosedEventController.add(
+                  RfcommClosedEvent(
+                    peripheralId: peripheral,
+                    code: event['code']?.toString(),
+                    message: event['message']?.toString(),
+                    generation: generation,
+                  ),
+                );
+              } else if (peripheral != null && peripheral.isNotEmpty) {
+                _trace(
+                  'macOS RFCOMM 关闭事件不属于当前设备会话，已忽略。',
+                  fields: <String, Object?>{
+                    'peripheral': peripheral,
+                    'generation': generation,
+                  },
+                );
               }
             }
             // `entry` is intentionally retained through the logger; no extra
             // controller-side history exists in this transport wrapper.
             return;
           }
-          if (value is Uint8List && !_rfcommDataController.isClosed) {
-            _trace(
-              'RFCOMM RX',
-              fields: <String, Object?>{
-                'bytes': value.length,
-                'platform': 'macos',
-                'transport': 'RFCOMM/SPP',
-                'direction': 'RX',
-                'wireHex': _wireHex(value),
-              },
+          if (value is Uint8List || value is List<int>) {
+            // macOS's multi-session bridge must always label a live packet
+            // with both CoreBluetooth identity and native generation. Accepting
+            // legacy bare bytes here could let one watch's old channel mutate
+            // another session after an EventChannel resubscription.
+            _error(
+              'macOS RFCOMM 收到未标记数据，已拒绝路由。',
+              fields: <String, Object?>{'platform': 'macos'},
             );
-            _rfcommDataController.add(value);
-          } else if (value is List<int> && !_rfcommDataController.isClosed) {
-            final bytes = Uint8List.fromList(value);
-            _trace(
-              'RFCOMM RX',
-              fields: <String, Object?>{
-                'bytes': bytes.length,
-                'platform': 'macos',
-                'transport': 'RFCOMM/SPP',
-                'direction': 'RX',
-                'wireHex': _wireHex(bytes),
-              },
-            );
-            _rfcommDataController.add(bytes);
           }
         },
         onError: (Object error, StackTrace stackTrace) {
@@ -1007,6 +1253,9 @@ class BleTransport {
           },
         );
         _rfcommDataController.add(data);
+        if (!_rfcommDataEventController.isClosed) {
+          _rfcommDataEventController.add(RfcommDataEvent(data: data));
+        }
       }
       return null;
     });
@@ -1032,6 +1281,12 @@ class BleTransport {
     }
     if (!_rfcommDataController.isClosed) {
       await _rfcommDataController.close();
+    }
+    if (!_rfcommDataEventController.isClosed) {
+      await _rfcommDataEventController.close();
+    }
+    if (!_rfcommClosedEventController.isClosed) {
+      await _rfcommClosedEventController.close();
     }
     _info('RFCOMM 数据监听已释放');
   }
@@ -1074,4 +1329,18 @@ class BleTransport {
       rethrow;
     }
   }
+}
+
+/// One FIFO/write generation per physical RFCOMM endpoint.
+///
+/// The native macOS transport owns a distinct RFCOMM channel for each
+/// peripheral. Keeping the Dart queue at the same granularity prevents a
+/// reconnect or teardown for device A from invalidating writes already queued
+/// for device B.
+class _RfcommWriteLane {
+  int epoch = 0;
+  Future<void> tail = Future<void>.value();
+  int? activeMacOSGeneration;
+  int? highestMacOSGeneration;
+  bool awaitingMacOSGeneration = false;
 }

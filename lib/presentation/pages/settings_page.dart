@@ -1,9 +1,13 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
+import '../../application/device_controller.dart';
 import '../../domain/device_profile.dart';
 import '../../domain/install_preference_store.dart';
+import '../../domain/resource_install_target_policy.dart';
+import '../../domain/rpk_install_limit.dart';
 import '../floating_window_warning_dialog.dart';
 import '../install_preference_selector.dart';
 
@@ -19,30 +23,44 @@ const wristloadPage = WristloadPageModule(
   build: _buildSettingsPage,
 );
 
-Widget _buildSettingsPage(WristloadPageContext context) =>
-    TransferSettingsPage(
-      preferredInstallTarget: context.preferredInstallTarget,
-      connectionMode: context.controller.connectionMode,
-      connectionModeEnabled: !context.controller.isConnected && !context.controller.isConnectionBusy,
-      segmentIntervalMs: context.controller.segmentIntervalMs,
-      massWindowSize: context.controller.massWindowSize,
-      autoTimeSync: context.controller.autoTimeSync,
-      autoConnectLastDevice: context.controller.autoConnectLastDeviceEnabled,
-      floatingInstallWindowEnabled: context.floatingInstallWindowEnabled,
-      autoOpenDiagnosticLog: context.autoOpenDiagnosticLog,
-      themeSeedColor: context.themeSeedColor,
-      onThemeSeedChanged: context.onThemeSeedChanged,
-      onConnectionModeChanged: context.controller.setConnectionMode,
-      onSegmentIntervalChanged: context.controller.setSegmentIntervalMs,
-      onMassWindowSizeChanged: context.controller.setMassWindowSize,
-      onAutoTimeSyncChanged: context.controller.setAutoTimeSync,
-      onAutoConnectLastDeviceChanged: context.controller.setAutoConnectLastDeviceEnabled,
-      onFloatingInstallWindowEnabledChanged: context.onFloatingInstallWindowEnabledChanged,
-      onAutoOpenDiagnosticLogChanged: context.onAutoOpenDiagnosticLogChanged,
-      onPreferredInstallTargetChanged: context.onPreferredInstallTargetChanged,
-      onReplayOobe: context.onReplayOobe,
-      onEditAuthKey: context.onEditAuthKey,
-    );
+Widget _buildSettingsPage(WristloadPageContext context) => TransferSettingsPage(
+  preferredInstallTarget: context.preferredInstallTarget,
+  connectionMode: context.controller.connectionMode,
+  connectionModeEnabled:
+      !context.controller.isConnected && !context.controller.isConnectionBusy,
+  segmentIntervalMs: context.controller.segmentIntervalMs,
+  massWindowSize: context.controller.massWindowSize,
+  rpkMaxPackageBytes: context.controller.rpkMaxPackageBytes,
+  resourceInstallTargetPolicy: context.controller.resourceInstallTargetPolicy,
+  resourceInstallDevices: context.controller.resourceInstallDevices,
+  autoTimeSync: context.controller.autoTimeSync,
+  forceWatchfaceInstall: context.controller.forceWatchfaceInstall,
+  showForceWatchfaceInstall: defaultTargetPlatform == TargetPlatform.macOS,
+  autoConnectLastDevice: context.controller.autoConnectLastDeviceEnabled,
+  floatingInstallWindowEnabled: context.floatingInstallWindowEnabled,
+  autoOpenDiagnosticLog: context.autoOpenDiagnosticLog,
+  themeSeedColor: context.themeSeedColor,
+  onThemeSeedChanged: context.onThemeSeedChanged,
+  onConnectionModeChanged: context.controller.setConnectionMode,
+  onSegmentIntervalChanged: context.controller.setSegmentIntervalMs,
+  onMassWindowSizeChanged: context.controller.setMassWindowSize,
+  onRpkMaxPackageBytesChanged: context.controller.setRpkMaxPackageBytes,
+  onResourceInstallTargetPolicyChanged:
+      context.controller.setResourceInstallTargetPolicy,
+  onAutoTimeSyncChanged: context.controller.setAutoTimeSync,
+  onForceWatchfaceInstallChanged: defaultTargetPlatform == TargetPlatform.macOS
+      ? context.controller.setForceWatchfaceInstall
+      : null,
+  onAutoConnectLastDeviceChanged:
+      context.controller.setAutoConnectLastDeviceEnabled,
+  onFloatingInstallWindowEnabledChanged:
+      context.onFloatingInstallWindowEnabledChanged,
+  onAutoOpenDiagnosticLogChanged: context.onAutoOpenDiagnosticLogChanged,
+  onPreferredInstallTargetChanged: context.onPreferredInstallTargetChanged,
+  onReplayOobe: context.onReplayOobe,
+  onEditAuthKey: context.onEditAuthKey,
+);
+
 class TransferSettingsPage extends StatelessWidget {
   const TransferSettingsPage({
     required this.connectionMode,
@@ -50,7 +68,12 @@ class TransferSettingsPage extends StatelessWidget {
     required this.connectionModeEnabled,
     required this.segmentIntervalMs,
     required this.massWindowSize,
+    this.rpkMaxPackageBytes = RpkInstallLimit.defaultBytes,
+    this.resourceInstallTargetPolicy = const ResourceInstallTargetPolicy(),
+    this.resourceInstallDevices = const <ResourceInstallDevice>[],
     this.autoTimeSync = false,
+    this.forceWatchfaceInstall = false,
+    this.showForceWatchfaceInstall = false,
     this.autoConnectLastDevice = true,
     this.floatingInstallWindowEnabled = false,
     this.autoOpenDiagnosticLog = false,
@@ -58,7 +81,10 @@ class TransferSettingsPage extends StatelessWidget {
     required this.onConnectionModeChanged,
     required this.onSegmentIntervalChanged,
     required this.onMassWindowSizeChanged,
+    this.onRpkMaxPackageBytesChanged,
+    this.onResourceInstallTargetPolicyChanged,
     this.onAutoTimeSyncChanged,
+    this.onForceWatchfaceInstallChanged,
     this.onAutoConnectLastDeviceChanged,
     this.onFloatingInstallWindowEnabledChanged,
     this.onAutoOpenDiagnosticLogChanged,
@@ -74,7 +100,12 @@ class TransferSettingsPage extends StatelessWidget {
   final bool connectionModeEnabled;
   final int segmentIntervalMs;
   final int massWindowSize;
+  final int rpkMaxPackageBytes;
+  final ResourceInstallTargetPolicy resourceInstallTargetPolicy;
+  final List<ResourceInstallDevice> resourceInstallDevices;
   final bool autoTimeSync;
+  final bool forceWatchfaceInstall;
+  final bool showForceWatchfaceInstall;
   final bool autoConnectLastDevice;
   final bool floatingInstallWindowEnabled;
   final bool autoOpenDiagnosticLog;
@@ -82,7 +113,11 @@ class TransferSettingsPage extends StatelessWidget {
   final ValueChanged<ConnectionMode> onConnectionModeChanged;
   final ValueChanged<int> onSegmentIntervalChanged;
   final ValueChanged<int> onMassWindowSizeChanged;
+  final ValueChanged<int>? onRpkMaxPackageBytesChanged;
+  final ValueChanged<ResourceInstallTargetPolicy>?
+  onResourceInstallTargetPolicyChanged;
   final ValueChanged<bool>? onAutoTimeSyncChanged;
+  final ValueChanged<bool>? onForceWatchfaceInstallChanged;
   final ValueChanged<bool>? onAutoConnectLastDeviceChanged;
   final ValueChanged<bool>? onFloatingInstallWindowEnabledChanged;
   final ValueChanged<bool>? onAutoOpenDiagnosticLogChanged;
@@ -115,6 +150,23 @@ class TransferSettingsPage extends StatelessWidget {
               titleStyle: theme.textTheme.titleMedium,
             ),
             const Divider(height: 40),
+            _ResourceInstallTargetSelector(
+              policy: resourceInstallTargetPolicy,
+              devices: resourceInstallDevices,
+              onChanged: onResourceInstallTargetPolicyChanged,
+            ),
+            const Divider(height: 40),
+            if (showForceWatchfaceInstall) ...[
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                secondary: const Icon(Icons.delete_forever_outlined),
+                title: const Text('强制安装表盘'),
+                subtitle: const Text('安装之前删除同id表盘，然后安装新的表盘'),
+                value: forceWatchfaceInstall,
+                onChanged: onForceWatchfaceInstallChanged,
+              ),
+              const Divider(height: 40),
+            ],
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
               secondary: const Icon(Icons.sync),
@@ -153,13 +205,13 @@ class TransferSettingsPage extends StatelessWidget {
                       // 开启前确认：悬浮窗（独立窗口）会抢占键盘焦点，
                       // 导致主窗口内输入框无法输入。
                       unawaited(
-                        showFloatingWindowEnableWarning(context).then(
-                          (confirmed) {
-                            if (confirmed == true) {
-                              onFloatingInstallWindowEnabledChanged!(true);
-                            }
-                          },
-                        ),
+                        showFloatingWindowEnableWarning(context).then((
+                          confirmed,
+                        ) {
+                          if (confirmed == true) {
+                            onFloatingInstallWindowEnabledChanged!(true);
+                          }
+                        }),
                       );
                     },
             ),
@@ -199,6 +251,19 @@ class TransferSettingsPage extends StatelessWidget {
             const Divider(height: 40),
             Text('传输', style: theme.textTheme.titleMedium),
             const SizedBox(height: 12),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.inventory_2_outlined),
+              title: const Text('RPK 安装包大小上限'),
+              subtitle: const Text('仅限制快应用 RPK 源文件；ZIP 解压、清单和资源安全检查仍然生效。'),
+              trailing: Text(
+                '${(rpkMaxPackageBytes / (1024 * 1024)).round()} MB',
+              ),
+              onTap: onRpkMaxPackageBytesChanged == null
+                  ? null
+                  : () => unawaited(_editRpkMaxPackageBytes(context)),
+            ),
+            const Divider(height: 40),
             Row(
               children: [
                 const Icon(Icons.speed_outlined),
@@ -240,6 +305,223 @@ class TransferSettingsPage extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+
+  Future<void> _editRpkMaxPackageBytes(BuildContext context) async {
+    final controller = TextEditingController(
+      text: (rpkMaxPackageBytes / (1024 * 1024)).round().toString(),
+    );
+    final result = await showDialog<int>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('RPK 安装包大小上限'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(
+            labelText: '大小',
+            suffixText: 'MB',
+            helperText: '允许范围：16–100 MB',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () {
+              final mb = int.tryParse(controller.text.trim());
+              if (mb == null || mb < 16 || mb > 100) return;
+              Navigator.pop(dialogContext, mb * 1024 * 1024);
+            },
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (result != null) onRpkMaxPackageBytesChanged?.call(result);
+  }
+}
+
+class _ResourceInstallTargetSelector extends StatelessWidget {
+  const _ResourceInstallTargetSelector({
+    required this.policy,
+    required this.devices,
+    this.onChanged,
+  });
+
+  final ResourceInstallTargetPolicy policy;
+  final List<ResourceInstallDevice> devices;
+  final ValueChanged<ResourceInstallTargetPolicy>? onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final automaticDevice = devices
+        .where((device) => device.id == policy.automaticDeviceId)
+        .firstOrNull;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('资源安装到所有设备？', style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+          '多设备连接时安装资源的处理方式',
+          style: Theme.of(
+            context,
+          ).textTheme.bodySmall?.copyWith(color: colors.onSurfaceVariant),
+        ),
+        const SizedBox(height: 12),
+        RadioListTile<ResourceInstallTargetMode>(
+          contentPadding: EdgeInsets.zero,
+          value: ResourceInstallTargetMode.allConnected,
+          groupValue: policy.mode,
+          title: const Text('为所有已连接的设备安装(可能会出现奇奇怪怪的bug)'),
+          onChanged: onChanged == null
+              ? null
+              : (_) => unawaited(_requestAllConnectedEnable(context)),
+        ),
+        RadioListTile<ResourceInstallTargetMode>(
+          contentPadding: EdgeInsets.zero,
+          value: ResourceInstallTargetMode.manual,
+          groupValue: policy.mode,
+          title: const Text('关闭（我自己选择）'),
+          onChanged: onChanged == null
+              ? null
+              : (mode) => onChanged!(ResourceInstallTargetPolicy(mode: mode!)),
+        ),
+        if (devices.isEmpty)
+          Padding(
+            padding: const EdgeInsets.only(left: 16, top: 4),
+            child: Text(
+              '连接设备后可指定自动安装目标。',
+              style: Theme.of(
+                context,
+              ).textTheme.bodySmall?.copyWith(color: colors.onSurfaceVariant),
+            ),
+          ),
+        for (final device in devices)
+          RadioListTile<ResourceInstallTargetMode>(
+            contentPadding: EdgeInsets.zero,
+            value: ResourceInstallTargetMode.automaticDevice,
+            groupValue: policy.mode,
+            title: Text('自动为${device.name.isEmpty ? '已连接设备' : device.name}安装'),
+            subtitle:
+                automaticDevice != null &&
+                    policy.mode == ResourceInstallTargetMode.automaticDevice &&
+                    automaticDevice.id == device.id
+                ? const Text('当前自动安装目标')
+                : null,
+            onChanged: onChanged == null
+                ? null
+                : (_) => onChanged!(
+                    ResourceInstallTargetPolicy(
+                      mode: ResourceInstallTargetMode.automaticDevice,
+                      automaticDeviceId: device.id,
+                    ),
+                  ),
+          ),
+      ],
+    );
+  }
+
+  Future<void> _requestAllConnectedEnable(BuildContext context) async {
+    if (policy.mode == ResourceInstallTargetMode.allConnected) return;
+    final approved = await showDialog<bool>(
+      context: context,
+      builder: (_) => const _AllConnectedInstallWarningDialog(),
+    );
+    if (approved == true && context.mounted) {
+      onChanged!(
+        const ResourceInstallTargetPolicy(
+          mode: ResourceInstallTargetMode.allConnected,
+        ),
+      );
+    }
+  }
+}
+
+class _AllConnectedInstallWarningDialog extends StatefulWidget {
+  const _AllConnectedInstallWarningDialog();
+
+  @override
+  State<_AllConnectedInstallWarningDialog> createState() =>
+      _AllConnectedInstallWarningDialogState();
+}
+
+class _AllConnectedInstallWarningDialogState
+    extends State<_AllConnectedInstallWarningDialog> {
+  static const _cooldownSeconds = 5;
+
+  Timer? _timer;
+  int _remainingSeconds = _cooldownSeconds;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      if (_remainingSeconds <= 1) {
+        _timer?.cancel();
+        _timer = null;
+        setState(() => _remainingSeconds = 0);
+      } else {
+        setState(() => _remainingSeconds--);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  void _cancel() => Navigator.of(context).pop(false);
+
+  void _confirm() {
+    if (_remainingSeconds == 0) Navigator.of(context).pop(true);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
+    final enabled = _remainingSeconds == 0;
+    final countdownWarning =
+        '经过测试，启用了该功能会触发各式各样的bug。该功能不建议开启。如需开启，等到$_remainingSeconds秒后则可开启';
+
+    return AlertDialog(
+      icon: Icon(Icons.warning_amber_rounded, color: colors.error),
+      title: const Text('确认开启多设备安装？'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('开启后，拖入资源将会给所有已连接的设备安装。这可能会导致兼容性问题。'),
+          const SizedBox(height: 12),
+          Text(
+            countdownWarning,
+            key: const ValueKey('all-connected-install-warning'),
+            style: theme.textTheme.bodyMedium?.copyWith(color: colors.error),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(onPressed: _cancel, child: const Text('取消')),
+        FilledButton(
+          style: FilledButton.styleFrom(
+            backgroundColor: colors.error,
+            foregroundColor: colors.onError,
+          ),
+          onPressed: enabled ? _confirm : null,
+          child: Text(enabled ? '确认开启' : '确认开启（$_remainingSeconds）'),
+        ),
+      ],
     );
   }
 }

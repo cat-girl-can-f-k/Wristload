@@ -12,6 +12,7 @@ import 'dart:typed_data';
 import 'package:archive/archive_io.dart';
 
 import 'install_metadata_reader.dart';
+import 'rpk_install_limit.dart';
 import '../platform/security_scoped_file_access.dart';
 
 enum InstallableFileType { firmware, quickApp, watchface, unsupported }
@@ -133,8 +134,14 @@ class InstallFileClassifier {
     final file = File(path);
     final size = file.lengthSync();
     if (size <= 0) throw const FormatException('安装文件为空');
-    if (size > InstallMetadataReader.maxSourceBytes) {
-      throw const FormatException('安装文件超过 256 MB 安全上限');
+    final isRpk = path.toLowerCase().endsWith('.rpk');
+    final limit = isRpk
+        ? RpkInstallLimit.sourceBytes
+        : InstallMetadataReader.maxSourceBytes;
+    if (size > limit) {
+      throw FormatException(
+        isRpk ? 'RPK 安装包超过当前设置的大小上限' : '安装文件超过 256 MB 安全上限',
+      );
     }
 
     final input = file.openSync(mode: FileMode.read);

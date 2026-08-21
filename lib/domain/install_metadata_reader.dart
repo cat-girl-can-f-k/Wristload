@@ -12,6 +12,7 @@ import 'package:archive/archive_io.dart';
 import 'package:crypto/crypto.dart';
 
 import 'install_models.dart';
+import 'rpk_install_limit.dart';
 import 'install_task.dart';
 import 'device_profile.dart';
 import '../application/diagnostic_log_service.dart';
@@ -114,7 +115,8 @@ class InstallMetadataReader {
 
   Future<InstallMetadata> _readResolved(InstallKind kind, String path) async {
     final value = await Isolate.run<Map<String, Object?>>(
-      () => _readMetadataInWorker(kind.index, path),
+      () =>
+          _readMetadataInWorker(kind.index, path, RpkInstallLimit.sourceBytes),
     );
     return InstallMetadata(
       fileName: value['fileName']! as String,
@@ -147,8 +149,15 @@ class InstallMetadataReader {
     final file = File(path);
     final length = await file.length();
     if (length <= 0) throw const FormatException('安装文件为空');
-    if (length > maxSourceBytes) {
-      throw const FormatException('安装文件超过 256 MB 安全上限');
+    final sourceLimit = kind == InstallKind.quickApp
+        ? RpkInstallLimit.sourceBytes
+        : maxSourceBytes;
+    if (length > sourceLimit) {
+      throw FormatException(
+        kind == InstallKind.quickApp
+            ? 'RPK 安装包超过当前设置的大小上限'
+            : '安装文件超过 256 MB 安全上限',
+      );
     }
     final bytes = await file.readAsBytes();
     if (bytes.isEmpty) throw const FormatException('安装文件为空');
@@ -482,10 +491,12 @@ class InstallMetadataReader {
 Future<Map<String, Object?>> _readMetadataInWorker(
   int kindIndex,
   String path,
+  int rpkSourceBytes,
 ) async {
   if (kindIndex < 0 || kindIndex >= InstallKind.values.length) {
     throw const FormatException('未知安装文件类型');
   }
+  RpkInstallLimit.setSourceBytes(rpkSourceBytes);
   final metadata = await InstallMetadataReader()._readDirect(
     InstallKind.values[kindIndex],
     path,

@@ -457,7 +457,8 @@ class _WristloadAppState extends State<WristloadApp>
         '/': (context) => _buildAppShell(),
         '/oobe': (context) => _buildOobePage(),
         for (final module in generatedPageModules.where(
-          (module) => module.route != '/',
+          (module) =>
+              module.route != '/' && module.isAvailableOnCurrentPlatform,
         ))
           module.route: (context) => _buildRegisteredPage(module),
       },
@@ -538,9 +539,9 @@ class _AppShellState extends State<AppShell> {
   bool get _connectionActive =>
       widget.controller.isConnected || widget.controller.isConnectionBusy;
 
-  List<WristloadPageModule> get _pageModules =>
-      List<WristloadPageModule>.of(generatedPageModules)
-        ..sort((a, b) => a.order.compareTo(b.order));
+  List<WristloadPageModule> get _pageModules => List<WristloadPageModule>.of(
+    generatedPageModules.where((module) => module.isAvailableOnCurrentPlatform),
+  )..sort((a, b) => a.order.compareTo(b.order));
 
   WristloadPageContext _pageContext() => WristloadPageContext(
     controller: widget.controller,

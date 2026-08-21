@@ -2,46 +2,42 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../../application/device_controller.dart';
-import '../../domain/watch_app.dart';
-
-/// Shows the quick apps reported by the connected device.
-///
-/// The list is deliberately refreshed from the device rather than persisted
-/// locally, because package fingerprints are required for a valid uninstall
-/// request and may change after an installation.
+import '../../domain/watchface.dart';
 import '../page_module.dart';
 
 const wristloadPage = WristloadPageModule(
-  id: 'apps',
-  route: '/apps',
-  label: '快应用',
-  icon: Icons.apps_outlined,
-  selectedIcon: Icons.apps,
-  order: 20,
-  build: _buildAppsPage,
+  id: 'watchfaces',
+  route: '/watchfaces',
+  label: '表盘',
+  icon: Icons.watch_outlined,
+  selectedIcon: Icons.watch,
+  order: 25,
+  build: _buildWatchfacesPage,
+  supportedPlatforms: const <TargetPlatform>{TargetPlatform.macOS},
 );
 
-Widget _buildAppsPage(WristloadPageContext context) =>
-    AppsPage(controller: context.controller);
+Widget _buildWatchfacesPage(WristloadPageContext context) =>
+    WatchfacesPage(controller: context.controller);
 
-class AppsPage extends StatefulWidget {
-  const AppsPage({required this.controller, super.key});
+/// Shows the watchfaces reported by the authenticated device.
+///
+/// The device remains the source of truth. This page does not infer installed
+/// faces from local files because the duplicate-ID install path and valid
+/// deletion permission both come from command=4/sub=0.
+class WatchfacesPage extends StatefulWidget {
+  const WatchfacesPage({required this.controller, super.key});
 
   final DeviceController controller;
 
   @override
-  State<AppsPage> createState() => _AppsPageState();
+  State<WatchfacesPage> createState() => _WatchfacesPageState();
 }
 
-class _AppsPageState extends State<AppsPage> {
+class _WatchfacesPageState extends State<WatchfacesPage> {
   DeviceController get controller => widget.controller;
 
-  // A page can be opened before authentication completes.  Keep the refresh
-  // scoped to the authenticated session so controller notifications do not
-  // issue duplicate list requests, while a later reconnect can read again.
   bool _lastSessionReady = false;
   int _sessionEpoch = 0;
   int? _autoRefreshRequestedEpoch;
@@ -53,13 +49,12 @@ class _AppsPageState extends State<AppsPage> {
     if (_lastSessionReady) _sessionEpoch = 1;
     controller.addListener(_onControllerChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      _scheduleAutoRefreshForReadySession();
+      if (mounted) _scheduleAutoRefreshForReadySession();
     });
   }
 
   @override
-  void didUpdateWidget(covariant AppsPage oldWidget) {
+  void didUpdateWidget(covariant WatchfacesPage oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.controller == widget.controller) return;
     oldWidget.controller.removeListener(_onControllerChanged);
@@ -93,8 +88,9 @@ class _AppsPageState extends State<AppsPage> {
   }
 
   void _scheduleAutoRefreshForReadySession() {
-    if (!controller.sessionReady ||
-        controller.quickAppsLoadedForCurrentSession ||
+    if (defaultTargetPlatform != TargetPlatform.macOS ||
+        !controller.sessionReady ||
+        controller.watchfacesLoadedForCurrentSession ||
         _autoRefreshRequestedEpoch == _sessionEpoch) {
       return;
     }
@@ -112,32 +108,36 @@ class _AppsPageState extends State<AppsPage> {
     if (!mounted || epoch != _sessionEpoch || !controller.sessionReady) {
       return;
     }
-    await controller.refreshInstalledWatchApps();
+    await controller.refreshInstalledWatchfaces();
   }
 
   Future<void> _refresh() async {
+    if (defaultTargetPlatform != TargetPlatform.macOS) {
+      _showMessage('表盘管理目前仅支持 macOS', error: true);
+      return;
+    }
     if (!controller.sessionReady) {
       _showMessage('请先连接并完成设备鉴权', error: true);
       return;
     }
-    final sessionEpoch = controller.quickAppSessionEpoch;
-    await controller.refreshInstalledWatchApps();
+    final sessionEpoch = controller.watchfaceSessionEpoch;
+    await controller.refreshInstalledWatchfaces();
     if (!mounted ||
         !controller.sessionReady ||
-        controller.quickAppSessionEpoch != sessionEpoch ||
-        controller.watchAppsError == null) {
+        controller.watchfaceSessionEpoch != sessionEpoch ||
+        controller.watchfacesError == null) {
       return;
     }
-    _showMessage(controller.watchAppsError!, error: true);
+    _showMessage(controller.watchfacesError!, error: true);
   }
 
-  Future<void> _uninstall(WatchAppItem app) async {
+  Future<void> _uninstall(WatchfaceItem watchface) async {
     final confirmed =
         await showDialog<bool>(
           context: context,
           builder: (dialogContext) => AlertDialog(
-            title: const Text('卸载快应用？'),
-            content: Text('将从设备中移除“${app.displayName}”。此操作不可撤销。'),
+            title: const Text('卸载表盘？'),
+            content: Text('将从设备中移除“${watchface.displayName}”。此操作不可撤销。'),
             actions: [
               TextButton(
                 onPressed: () => Navigator.of(dialogContext).pop(false),
@@ -152,38 +152,38 @@ class _AppsPageState extends State<AppsPage> {
         ) ??
         false;
     if (!confirmed || !mounted) return;
-    final sessionEpoch = controller.quickAppSessionEpoch;
-    final success = await controller.uninstallWatchApp(app);
+    final sessionEpoch = controller.watchfaceSessionEpoch;
+    final success = await controller.uninstallWatchface(watchface);
     if (!mounted ||
         !controller.sessionReady ||
-        controller.quickAppSessionEpoch != sessionEpoch) {
+        controller.watchfaceSessionEpoch != sessionEpoch) {
       return;
     }
-    final error = controller.watchAppsError;
     _showMessage(
-      success ? '卸载已确认（SPP ACK）' : (error ?? '卸载失败'),
+      success ? '设备已确认卸载表盘' : (controller.watchfacesError ?? '卸载失败'),
       error: !success,
     );
   }
 
-  Future<void> _launch(WatchAppItem app) async {
+  Future<void> _activate(WatchfaceItem watchface) async {
     if (defaultTargetPlatform != TargetPlatform.macOS) {
-      _showMessage('快应用启动目前仅支持 macOS', error: true);
+      _showMessage('表盘切换目前仅支持 macOS', error: true);
       return;
     }
+    if (watchface.isCurrent) return;
     if (!controller.sessionReady) {
       _showMessage('请先连接并完成设备鉴权', error: true);
       return;
     }
-    final sessionEpoch = controller.quickAppSessionEpoch;
-    final success = await controller.launchWatchApp(app);
+    final sessionEpoch = controller.watchfaceSessionEpoch;
+    final success = await controller.activateWatchface(watchface);
     if (!mounted ||
         !controller.sessionReady ||
-        controller.quickAppSessionEpoch != sessionEpoch) {
+        controller.watchfaceSessionEpoch != sessionEpoch) {
       return;
     }
     _showMessage(
-      success ? '启动请求已发送（SPP ACK）' : (controller.watchAppsError ?? '启动失败'),
+      success ? '设备已确认切换表盘' : (controller.watchfacesError ?? '切换失败'),
       error: !success,
     );
   }
@@ -204,7 +204,7 @@ class _AppsPageState extends State<AppsPage> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
-    final apps = controller.installedWatchApps;
+    final watchfaces = controller.installedWatchfaces;
     final connected = controller.sessionReady;
     final supported = defaultTargetPlatform == TargetPlatform.macOS;
     return Align(
@@ -220,20 +220,21 @@ class _AppsPageState extends State<AppsPage> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text('快应用', style: theme.textTheme.headlineSmall),
+                      Text('表盘', style: theme.textTheme.headlineSmall),
                       const SizedBox(height: 4),
                       Text(
-                        '查看和管理已安装在设备上的快应用',
+                        '查看和管理已安装在设备上的表盘',
                         style: theme.textTheme.bodyMedium,
                       ),
                     ],
                   ),
                 ),
                 FilledButton.tonalIcon(
-                  onPressed: connected && !controller.watchAppsLoading
+                  onPressed:
+                      supported && connected && !controller.watchfacesLoading
                       ? _refresh
                       : null,
-                  icon: controller.watchAppsLoading
+                  icon: controller.watchfacesLoading
                       ? const SizedBox.square(
                           dimension: 18,
                           child: CircularProgressIndicator(strokeWidth: 2),
@@ -244,52 +245,63 @@ class _AppsPageState extends State<AppsPage> {
               ],
             ),
             const SizedBox(height: 20),
-            if (!connected)
-              _EmptyState(
-                icon: Icons.apps_outlined,
-                title: '尚未连接设备',
-                message: '连接并完成鉴权后，可以读取设备中的快应用。',
+            if (!supported)
+              const _WatchfaceEmptyState(
+                icon: Icons.laptop_mac_outlined,
+                title: '仅支持 macOS',
+                message: '表盘管理只在 macOS 版本中提供。',
               )
-            else if (controller.watchAppsLoading && apps.isEmpty)
+            else if (!connected)
+              const _WatchfaceEmptyState(
+                icon: Icons.watch_outlined,
+                title: '尚未连接设备',
+                message: '连接并完成鉴权后，可以读取设备中的表盘。',
+              )
+            else if (controller.watchfacesLoading && watchfaces.isEmpty)
               const Padding(
                 padding: EdgeInsets.only(top: 72),
                 child: Center(child: CircularProgressIndicator()),
               )
-            else if (controller.watchAppsError != null && apps.isEmpty)
-              _EmptyState(
+            else if (controller.watchfacesError != null && watchfaces.isEmpty)
+              _WatchfaceEmptyState(
                 icon: Icons.error_outline,
                 title: '读取失败',
-                message: controller.watchAppsError!,
+                message: controller.watchfacesError!,
                 action: FilledButton.tonalIcon(
                   onPressed: _refresh,
                   icon: const Icon(Icons.refresh),
                   label: const Text('重试'),
                 ),
               )
-            else if (apps.isEmpty)
-              _EmptyState(
-                icon: Icons.apps_outlined,
-                title: '没有已安装的快应用',
-                message: '设备返回的快应用列表为空。',
+            else if (watchfaces.isEmpty)
+              const _WatchfaceEmptyState(
+                icon: Icons.watch_outlined,
+                title: '没有已安装的表盘',
+                message: '设备返回的表盘列表为空。',
               )
             else ...[
-              Text('${apps.length} 个快应用', style: theme.textTheme.titleMedium),
+              Text(
+                '${watchfaces.length} 个表盘',
+                style: theme.textTheme.titleMedium,
+              ),
               const SizedBox(height: 10),
-              for (final app in apps)
-                _AppCard(
-                  app: app,
-                  onLaunch: _launch,
+              for (final watchface in watchfaces)
+                _WatchfaceCard(
+                  watchface: watchface,
+                  onActivate: _activate,
                   onUninstall: _uninstall,
-                  launchEnabled: supported && !controller.watchAppsLoading,
-                  uninstallEnabled: !controller.watchAppsLoading,
-                  showLaunch: supported,
+                  activateEnabled:
+                      supported &&
+                      !watchface.isCurrent &&
+                      !controller.watchfacesLoading,
+                  uninstallEnabled: !controller.watchfacesLoading,
                 ),
             ],
-            if (controller.watchAppsError != null && apps.isNotEmpty)
+            if (controller.watchfacesError != null && watchfaces.isNotEmpty)
               Padding(
                 padding: const EdgeInsets.only(top: 12),
                 child: Text(
-                  controller.watchAppsError!,
+                  controller.watchfacesError!,
                   style: TextStyle(color: colors.error),
                 ),
               ),
@@ -300,47 +312,29 @@ class _AppsPageState extends State<AppsPage> {
   }
 }
 
-class _AppCard extends StatelessWidget {
-  const _AppCard({
-    required this.app,
-    required this.onLaunch,
+class _WatchfaceCard extends StatelessWidget {
+  const _WatchfaceCard({
+    required this.watchface,
+    required this.onActivate,
     required this.onUninstall,
-    required this.launchEnabled,
+    required this.activateEnabled,
     required this.uninstallEnabled,
-    required this.showLaunch,
   });
 
-  final WatchAppItem app;
-  final Future<void> Function(WatchAppItem) onLaunch;
-  final Future<void> Function(WatchAppItem) onUninstall;
-  final bool launchEnabled;
+  final WatchfaceItem watchface;
+  final Future<void> Function(WatchfaceItem) onActivate;
+  final Future<void> Function(WatchfaceItem) onUninstall;
+  final bool activateEnabled;
   final bool uninstallEnabled;
-  final bool showLaunch;
-
-  String _fingerprint() => app.fingerprint
-      .map((value) => value.toRadixString(16).padLeft(2, '0'))
-      .join(':')
-      .toUpperCase();
-
-  Future<void> _copyFingerprint(BuildContext context) async {
-    final value = _fingerprint();
-    if (value.isEmpty) return;
-    await Clipboard.setData(ClipboardData(text: value));
-    if (!context.mounted) return;
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('指纹已复制')));
-  }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
-    final fingerprint = _fingerprint();
     return Card(
       color: colors.surfaceContainer,
       margin: const EdgeInsets.only(bottom: 12),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -353,9 +347,9 @@ class _AppCard extends StatelessWidget {
                   height: 42,
                   decoration: BoxDecoration(
                     color: colors.surfaceContainerHigh,
-                    borderRadius: BorderRadius.circular(12),
+                    borderRadius: BorderRadius.circular(8),
                   ),
-                  child: Icon(Icons.apps, color: colors.primary),
+                  child: Icon(Icons.watch, color: colors.primary),
                 ),
                 const SizedBox(width: 12),
                 Expanded(
@@ -363,13 +357,13 @@ class _AppCard extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        app.displayName,
+                        watchface.displayName,
                         style: theme.textTheme.titleMedium,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                       ),
                       Text(
-                        app.packageName,
+                        'ID ${watchface.id}',
                         style: theme.textTheme.bodySmall,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
@@ -387,26 +381,21 @@ class _AppCard extends StatelessWidget {
                       spacing: 8,
                       runSpacing: 8,
                       children: [
-                        if (showLaunch)
+                        if (!watchface.isCurrent)
                           FilledButton.tonalIcon(
-                            onPressed: launchEnabled
-                                ? () => onLaunch(app)
+                            onPressed: activateEnabled
+                                ? () => onActivate(watchface)
                                 : null,
-                            icon: const Icon(Icons.play_arrow),
-                            label: const Text('启动'),
+                            icon: const Icon(Icons.swap_horiz),
+                            label: const Text('切换'),
                           ),
-                        if (app.canRemove)
+                        if (watchface.canRemove)
                           OutlinedButton.icon(
                             onPressed: uninstallEnabled
-                                ? () => onUninstall(app)
+                                ? () => onUninstall(watchface)
                                 : null,
                             icon: const Icon(Icons.delete_outline),
                             label: const Text('卸载'),
-                          )
-                        else
-                          const Chip(
-                            avatar: Icon(Icons.lock_outline, size: 16),
-                            label: Text('系统应用'),
                           ),
                       ],
                     ),
@@ -416,15 +405,24 @@ class _AppCard extends StatelessWidget {
             ),
             const SizedBox(height: 14),
             Wrap(
-              spacing: 18,
+              spacing: 12,
               runSpacing: 8,
+              crossAxisAlignment: WrapCrossAlignment.center,
               children: [
-                _Detail(label: '版本', value: '${app.versionCode}'),
-                if (fingerprint.isNotEmpty)
-                  InkWell(
-                    onTap: () => _copyFingerprint(context),
-                    borderRadius: BorderRadius.circular(6),
-                    child: _Detail(label: '指纹', value: fingerprint),
+                _WatchfaceDetail(
+                  label: '版本',
+                  value: '${watchface.versionCode}',
+                ),
+                _WatchfaceDetail(label: 'ID', value: watchface.id),
+                if (watchface.isCurrent)
+                  const Chip(
+                    avatar: Icon(Icons.check_circle_outline, size: 16),
+                    label: Text('当前表盘'),
+                  ),
+                if (!watchface.canRemove)
+                  const Chip(
+                    avatar: Icon(Icons.lock_outline, size: 16),
+                    label: Text('不可卸载'),
                   ),
               ],
             ),
@@ -435,8 +433,8 @@ class _AppCard extends StatelessWidget {
   }
 }
 
-class _Detail extends StatelessWidget {
-  const _Detail({required this.label, required this.value});
+class _WatchfaceDetail extends StatelessWidget {
+  const _WatchfaceDetail({required this.label, required this.value});
 
   final String label;
   final String value;
@@ -458,8 +456,8 @@ class _Detail extends StatelessWidget {
   }
 }
 
-class _EmptyState extends StatelessWidget {
-  const _EmptyState({
+class _WatchfaceEmptyState extends StatelessWidget {
+  const _WatchfaceEmptyState({
     required this.icon,
     required this.title,
     required this.message,
@@ -480,7 +478,7 @@ class _EmptyState extends StatelessWidget {
       padding: const EdgeInsets.all(28),
       decoration: BoxDecoration(
         color: colors.surfaceContainer,
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(8),
       ),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,

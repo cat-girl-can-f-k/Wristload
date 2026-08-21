@@ -12,6 +12,7 @@ import '../../domain/protocol/zau.dart';
 import '../../domain/queue_file_importer.dart';
 import '../../platform/scoped_file_picker.dart';
 
+import '../install_request_preflight.dart';
 import '../page_module.dart';
 
 const wristloadPage = WristloadPageModule(
@@ -175,7 +176,17 @@ class _DebugPageState extends State<DebugPage> {
   Future<void> _start() async {
     final request = _request;
     if (request == null || widget.controller.debugInstallInProgress) return;
-    await widget.controller.startDebugInstall(request);
+    if (!Platform.isMacOS) {
+      await widget.controller.startDebugInstall(request);
+      return;
+    }
+    final prepared = await const InstallRequestPreflight().prepare(
+      context,
+      widget.controller,
+      request,
+    );
+    if (!mounted || prepared == null) return;
+    await widget.controller.startDebugInstall(prepared);
   }
 
   Future<void> _cancel() async {

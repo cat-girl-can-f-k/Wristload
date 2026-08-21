@@ -13,6 +13,7 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   const channel = MethodChannel('wristload/rfcomm');
+  const eventChannel = EventChannel('wristload/rfcomm/events');
   const permissionChannel = MethodChannel('wristload/bluetooth_permission');
   const secureStoreChannel = MethodChannel('wristload/secure_store');
   final messenger =
@@ -25,6 +26,7 @@ void main() {
 
   tearDown(() {
     messenger.setMockMethodCallHandler(channel, null);
+    messenger.setMockStreamHandler(eventChannel, null);
     messenger.setMockMethodCallHandler(permissionChannel, null);
     messenger.setMockMethodCallHandler(secureStoreChannel, null);
     debugDefaultTargetPlatformOverride = null;
@@ -38,6 +40,7 @@ void main() {
       return <String, Object>{
         'address': 'AA:BB:CC:DD:EE:FF',
         'name': 'Xiaomi Smart Band 9',
+        'generation': 1,
       };
     });
     final transport = BleTransport();
@@ -338,6 +341,7 @@ void main() {
         return <String, Object>{
           'address': 'AA:BB:CC:DD:EE:FF',
           'name': 'Xiaomi Smart Band 9',
+          'generation': 1,
         };
       });
       final controller = DeviceController();
@@ -362,11 +366,12 @@ void main() {
   );
 
   test(
-    'a reconnect does not wait for writes queued by the old session',
+    'a reconnect invalidates old writes but serializes the next generation',
     () async {
       final firstWriteStarted = Completer<void>();
       final releaseFirstWrite = Completer<void>();
       final nativeWrites = <int>[];
+      var connectGeneration = 0;
       addTearDown(() {
         if (!releaseFirstWrite.isCompleted) releaseFirstWrite.complete();
       });
@@ -375,10 +380,12 @@ void main() {
           return <String, Object>{
             'address': 'AA:BB:CC:DD:EE:FF',
             'name': 'Xiaomi Smart Band 9',
+            'generation': ++connectGeneration,
           };
         }
         if (call.method == 'write') {
-          final bytes = call.arguments as Uint8List;
+          final arguments = call.arguments as Map<Object?, Object?>;
+          final bytes = arguments['data']! as Uint8List;
           nativeWrites.add(bytes.first);
           if (bytes.first == 1) {
             firstWriteStarted.complete();
@@ -408,13 +415,343 @@ void main() {
         identifier,
         advertisedName: 'Xiaomi Smart Band 9',
       );
-      await transport.rfcommWrite(identifier, [3]);
-      expect(nativeWrites, [1, 3]);
+      final nextGenerationWrite = transport.rfcommWrite(identifier, [3]);
+      await Future<void>.delayed(Duration.zero);
+      expect(nativeWrites, [1]);
 
       releaseFirstWrite.complete();
       await inFlightFailure;
       await queuedFailure;
+      await nextGenerationWrite;
       expect(nativeWrites, [1, 3]);
+    },
+  );
+
+  test(
+    'macOS RFCOMM writes for separate devices use independent lanes',
+    () async {
+      final firstWriteStarted = Completer<void>();
+      final releaseFirstWrite = Completer<void>();
+      final secondWriteCompleted = Completer<void>();
+      final writes = <String>[];
+      addTearDown(() {
+        if (!releaseFirstWrite.isCompleted) releaseFirstWrite.complete();
+      });
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        if (call.method == 'connect') {
+          return <String, Object>{
+            'address': 'AA:BB:CC:DD:EE:FF',
+            'name': 'Xiaomi Smart Band 9',
+            'generation': 1,
+          };
+        }
+        if (call.method == 'write') {
+          final arguments = call.arguments as Map<Object?, Object?>;
+          final peripheral = arguments['peripheralId']! as String;
+          final bytes = arguments['data']! as Uint8List;
+          writes.add('$peripheral:${bytes.first}');
+          if (bytes.first == 1) {
+            firstWriteStarted.complete();
+            await releaseFirstWrite.future;
+          } else {
+            secondWriteCompleted.complete();
+          }
+        }
+        return null;
+      });
+
+      final transport = BleTransport();
+      final first = UUID.fromString('12345678-90ab-cdef-1234-567890abcdef');
+      final second = UUID.fromString('abcdefab-cdef-1234-5678-1234567890ab');
+      await transport.connectRfcomm(
+        first,
+        advertisedName: 'Xiaomi Smart Band 9',
+      );
+      await transport.connectRfcomm(
+        second,
+        advertisedName: 'Xiaomi Smart Band 9',
+      );
+
+      final firstWrite = transport.rfcommWrite(first, [1]);
+      await firstWriteStarted.future;
+      await transport.rfcommWrite(second, [2]);
+      expect(secondWriteCompleted.isCompleted, isTrue);
+      expect(writes, <String>['${first}:1', '${second}:2']);
+
+      releaseFirstWrite.complete();
+      await firstWrite;
+    },
+  );
+
+  test('macOS tagged RX reaches only its owning RFCOMM session', () async {
+    MockStreamHandlerEventSink? nativeEvents;
+    messenger.setMockStreamHandler(
+      eventChannel,
+      MockStreamHandler.inline(onListen: (_, events) => nativeEvents = events),
+    );
+    final transport = BleTransport();
+    final first = UUID.fromString('12345678-90ab-cdef-1234-567890abcdef');
+    final second = UUID.fromString('abcdefab-cdef-1234-5678-1234567890ab');
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      if (call.method != 'connect') return null;
+      return <String, Object>{
+        'address': 'AA:BB:CC:DD:EE:FF',
+        'name': 'Xiaomi Smart Band 9',
+        'generation': 1,
+      };
+    });
+    await transport.connectRfcomm(first, advertisedName: 'Xiaomi Smart Band 9');
+    await transport.connectRfcomm(
+      second,
+      advertisedName: 'Xiaomi Smart Band 9',
+    );
+    final firstPackets = <Uint8List>[];
+    final secondPackets = <Uint8List>[];
+    final firstSubscription = transport
+        .rfcommDataFor(first)
+        .listen(firstPackets.add);
+    final secondSubscription = transport
+        .rfcommDataFor(second)
+        .listen(secondPackets.add);
+    addTearDown(firstSubscription.cancel);
+    addTearDown(secondSubscription.cancel);
+    addTearDown(transport.disposeRfcommStream);
+
+    transport.listenRfcommData();
+    await Future<void>.delayed(Duration.zero);
+    expect(nativeEvents, isNotNull);
+
+    nativeEvents!.success(<String, Object>{
+      'kind': 'data',
+      'event': 'read',
+      'peripheral': second.toString().toUpperCase(),
+      'generation': 1,
+      'wireHex': '0A 0B',
+    });
+    await Future<void>.delayed(Duration.zero);
+
+    expect(firstPackets, isEmpty);
+    expect(secondPackets, hasLength(1));
+    expect(secondPackets.single, Uint8List.fromList(<int>[0x0A, 0x0B]));
+  });
+
+  test('macOS adopts a new native generation before connect returns', () async {
+    MockStreamHandlerEventSink? nativeEvents;
+    final connectStarted = Completer<void>();
+    final connectReply = Completer<Object?>();
+    messenger.setMockStreamHandler(
+      eventChannel,
+      MockStreamHandler.inline(onListen: (_, events) => nativeEvents = events),
+    );
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      if (call.method != 'connect') return null;
+      if (!connectStarted.isCompleted) connectStarted.complete();
+      return connectReply.future;
+    });
+    final transport = BleTransport();
+    final device = UUID.fromString('12345678-90ab-cdef-1234-567890abcdef');
+    final packets = <Uint8List>[];
+    final subscription = transport.rfcommDataFor(device).listen(packets.add);
+    addTearDown(subscription.cancel);
+    addTearDown(transport.disposeRfcommStream);
+
+    transport.listenRfcommData();
+    await Future<void>.delayed(Duration.zero);
+    expect(nativeEvents, isNotNull);
+
+    final connecting = transport.connectRfcomm(
+      device,
+      advertisedName: 'Xiaomi Smart Band 9',
+    );
+    await connectStarted.future;
+    nativeEvents!.success(<String, Object>{
+      'kind': 'native',
+      'event': 'sdp_started',
+      'peripheral': device.toString(),
+      'generation': 4,
+    });
+    nativeEvents!.success(<String, Object>{
+      'kind': 'data',
+      'event': 'read',
+      'peripheral': device.toString(),
+      'generation': 4,
+      'wireHex': '0A',
+    });
+    await Future<void>.delayed(Duration.zero);
+
+    expect(packets, hasLength(1));
+    expect(packets.single, Uint8List.fromList(<int>[0x0A]));
+    connectReply.complete(<String, Object>{
+      'address': 'AA:BB:CC:DD:EE:FF',
+      'name': 'Xiaomi Smart Band 9',
+      'generation': 4,
+    });
+    await connecting;
+  });
+
+  test('macOS drops late packets from a previous native generation', () async {
+    MockStreamHandlerEventSink? nativeEvents;
+    var generation = 0;
+    messenger.setMockStreamHandler(
+      eventChannel,
+      MockStreamHandler.inline(onListen: (_, events) => nativeEvents = events),
+    );
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'connect') {
+        return <String, Object>{
+          'address': 'AA:BB:CC:DD:EE:FF',
+          'name': 'Xiaomi Smart Band 9',
+          'generation': ++generation,
+        };
+      }
+      return null;
+    });
+    final transport = BleTransport();
+    final device = UUID.fromString('12345678-90ab-cdef-1234-567890abcdef');
+    final packets = <Uint8List>[];
+    final subscription = transport.rfcommDataFor(device).listen(packets.add);
+    addTearDown(subscription.cancel);
+    addTearDown(transport.disposeRfcommStream);
+
+    transport.listenRfcommData();
+    await Future<void>.delayed(Duration.zero);
+    expect(nativeEvents, isNotNull);
+
+    await transport.connectRfcomm(
+      device,
+      advertisedName: 'Xiaomi Smart Band 9',
+    );
+    nativeEvents!.success(<String, Object>{
+      'kind': 'data',
+      'event': 'read',
+      'peripheral': device.toString(),
+      'generation': 1,
+      'wireHex': '01',
+    });
+    await Future<void>.delayed(Duration.zero);
+
+    await transport.disconnectRfcomm(device);
+    await transport.connectRfcomm(
+      device,
+      advertisedName: 'Xiaomi Smart Band 9',
+    );
+    nativeEvents!.success(<String, Object>{
+      'kind': 'data',
+      'event': 'read',
+      'peripheral': device.toString(),
+      'generation': 1,
+      'wireHex': '02',
+    });
+    nativeEvents!.success(<String, Object>{
+      'kind': 'data',
+      'event': 'read',
+      'peripheral': device.toString(),
+      'generation': 2,
+      'wireHex': '03',
+    });
+    await Future<void>.delayed(Duration.zero);
+
+    expect(packets, hasLength(2));
+    expect(packets[0], Uint8List.fromList(<int>[0x01]));
+    expect(packets[1], Uint8List.fromList(<int>[0x03]));
+  });
+
+  test('macOS tagged close reaches only its owning RFCOMM session', () async {
+    MockStreamHandlerEventSink? nativeEvents;
+    messenger.setMockStreamHandler(
+      eventChannel,
+      MockStreamHandler.inline(onListen: (_, events) => nativeEvents = events),
+    );
+    final transport = BleTransport();
+    final first = UUID.fromString('12345678-90ab-cdef-1234-567890abcdef');
+    final second = UUID.fromString('abcdefab-cdef-1234-5678-1234567890ab');
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      if (call.method != 'connect') return null;
+      return <String, Object>{
+        'address': 'AA:BB:CC:DD:EE:FF',
+        'name': 'Xiaomi Smart Band 9',
+        'generation': 1,
+      };
+    });
+    await transport.connectRfcomm(first, advertisedName: 'Xiaomi Smart Band 9');
+    await transport.connectRfcomm(
+      second,
+      advertisedName: 'Xiaomi Smart Band 9',
+    );
+    final firstClosed = <RfcommClosedEvent>[];
+    final secondClosed = <RfcommClosedEvent>[];
+    final firstSubscription = transport
+        .rfcommClosedFor(first)
+        .listen(firstClosed.add);
+    final secondSubscription = transport
+        .rfcommClosedFor(second)
+        .listen(secondClosed.add);
+    addTearDown(firstSubscription.cancel);
+    addTearDown(secondSubscription.cancel);
+    addTearDown(transport.disposeRfcommStream);
+
+    transport.listenRfcommData();
+    await Future<void>.delayed(Duration.zero);
+    expect(nativeEvents, isNotNull);
+
+    nativeEvents!.success(<String, Object>{
+      'kind': 'closed',
+      'event': 'closed',
+      'peripheral': first.toString().toUpperCase(),
+      'generation': 1,
+      'code': 'rfcomm_closed',
+      'message': 'Remote close',
+    });
+    await Future<void>.delayed(Duration.zero);
+
+    expect(firstClosed, hasLength(1));
+    expect(firstClosed.single.peripheralId, first.toString().toUpperCase());
+    expect(firstClosed.single.code, 'rfcomm_closed');
+    expect(firstClosed.single.generation, 1);
+    expect(secondClosed, isEmpty);
+  });
+
+  test(
+    'macOS rejects untagged RX from device-scoped RFCOMM sessions',
+    () async {
+      MockStreamHandlerEventSink? nativeEvents;
+      messenger.setMockStreamHandler(
+        eventChannel,
+        MockStreamHandler.inline(
+          onListen: (_, events) => nativeEvents = events,
+        ),
+      );
+      final transport = BleTransport();
+      final device = UUID.fromString('12345678-90ab-cdef-1234-567890abcdef');
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        if (call.method != 'connect') return null;
+        return <String, Object>{
+          'address': 'AA:BB:CC:DD:EE:FF',
+          'name': 'Xiaomi Smart Band 9',
+          'generation': 1,
+        };
+      });
+      await transport.connectRfcomm(
+        device,
+        advertisedName: 'Xiaomi Smart Band 9',
+      );
+      final packets = <Uint8List>[];
+      final subscription = transport.rfcommDataFor(device).listen(packets.add);
+      addTearDown(subscription.cancel);
+      addTearDown(transport.disposeRfcommStream);
+
+      transport.listenRfcommData();
+      await Future<void>.delayed(Duration.zero);
+      expect(nativeEvents, isNotNull);
+
+      nativeEvents!.success(<String, Object>{
+        'kind': 'data',
+        'event': 'read',
+        'wireHex': '0A 0B',
+      });
+      await Future<void>.delayed(Duration.zero);
+
+      expect(packets, isEmpty);
     },
   );
 }

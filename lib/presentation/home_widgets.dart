@@ -24,21 +24,15 @@ class DiagnosticLogToggle extends StatelessWidget {
         value: enabled && available,
         onChanged: available ? onChanged : null,
         secondary: const Icon(Icons.receipt_long_outlined),
-        title: const Text('独立诊断日志窗口'),
-        subtitle: Text(available
-            ? 'Trace 级日志、Runtime、Storage 和通信记录 · 当前 $entryCount 条'
-            : '当前平台不支持独立日志窗口'),
+        title: const Text('DevTool'),
+        subtitle: const Text('显示程序日志'),
       ),
     );
   }
 }
 
 class LogPanel extends StatelessWidget {
-  const LogPanel({
-    required this.logs,
-    required this.onClear,
-    super.key,
-  });
+  const LogPanel({required this.logs, required this.onClear, super.key});
 
   final List<String> logs;
   final VoidCallback onClear;
@@ -48,10 +42,12 @@ class LogPanel extends StatelessWidget {
     if (!context.mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(
-        content: Text('已复制全部日志（${logs.length} 行）'),
-        duration: const Duration(seconds: 2),
-      ));
+      ..showSnackBar(
+        SnackBar(
+          content: Text('已复制全部日志（${logs.length} 行）'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
   }
 
   @override
@@ -65,8 +61,10 @@ class LogPanel extends StatelessWidget {
           children: [
             Row(
               children: [
-                Text('运行日志（${logs.length}）',
-                    style: theme.textTheme.titleMedium),
+                Text(
+                  '运行日志（${logs.length}）',
+                  style: theme.textTheme.titleMedium,
+                ),
                 const Spacer(),
                 IconButton(
                   tooltip: '复制全部日志',
@@ -194,11 +192,7 @@ class _ScanResultsListState extends State<ScanResultsList> {
 }
 
 class _ScanGroupHeader extends StatelessWidget {
-  const _ScanGroupHeader({
-    required this.label,
-    this.expanded,
-    this.onToggle,
-  });
+  const _ScanGroupHeader({required this.label, this.expanded, this.onToggle});
 
   final String label;
   final bool? expanded;
@@ -345,10 +339,7 @@ class ScanTile extends StatelessWidget {
               ),
               const SizedBox(width: 12),
               if (installable)
-                FilledButton(
-                  onPressed: onConnect,
-                  child: const Text('连接'),
-                )
+                FilledButton(onPressed: onConnect, child: const Text('连接'))
               else
                 _DeviceLabel(
                   label: '非手环设备',
@@ -379,27 +370,26 @@ class _DeviceLabel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-        decoration: BoxDecoration(
-          color: backgroundColor,
-          borderRadius: BorderRadius.circular(8),
-          border: borderColor == null ? null : Border.all(color: borderColor!),
-        ),
-        child: Text(
-          label,
-          style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                color: foregroundColor,
-              ),
-        ),
-      );
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+    decoration: BoxDecoration(
+      color: backgroundColor,
+      borderRadius: BorderRadius.circular(8),
+      border: borderColor == null ? null : Border.all(color: borderColor!),
+    ),
+    child: Text(
+      label,
+      style: Theme.of(
+        context,
+      ).textTheme.labelSmall?.copyWith(color: foregroundColor),
+    ),
+  );
 }
 
 class ScanningPulseIndicator extends StatefulWidget {
   const ScanningPulseIndicator({super.key});
 
   @override
-  State<ScanningPulseIndicator> createState() =>
-      _ScanningPulseIndicatorState();
+  State<ScanningPulseIndicator> createState() => _ScanningPulseIndicatorState();
 }
 
 class _ScanningPulseIndicatorState extends State<ScanningPulseIndicator>

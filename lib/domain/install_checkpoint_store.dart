@@ -15,19 +15,43 @@ import '../application/diagnostic_log_service.dart';
 class InstallCheckpointStore {
   static const _fileName = 'active_install_checkpoint.json';
 
+  /// Creates a checkpoint store for one authenticated device session.
+  ///
+  /// The original no-argument form intentionally keeps its historical file
+  /// name for the primary session. Secondary macOS sessions receive a scoped
+  /// file so simultaneous installations cannot overwrite each other's resume
+  /// state.
+  InstallCheckpointStore({String? scope}) : _scope = _normalizeScope(scope);
+
+  final String? _scope;
+
+  static String? _normalizeScope(String? value) {
+    final trimmed = value?.trim().toLowerCase();
+    if (trimmed == null || trimmed.isEmpty) return null;
+    final normalized = trimmed.replaceAll(RegExp(r'[^a-z0-9_-]'), '_');
+    return normalized.isEmpty ? null : normalized;
+  }
+
+  String get _scopedFileName =>
+      _scope == null ? _fileName : 'active_install_checkpoint_$_scope.json';
+
   Future<File> _target() async {
     final directory = await getApplicationSupportDirectory();
     await directory.create(recursive: true);
-    return File('${directory.path}${Platform.pathSeparator}$_fileName');
+    return File('${directory.path}${Platform.pathSeparator}$_scopedFileName');
   }
 
   Future<void> save(InstallCheckpoint checkpoint) async {
-    appLogger.trace('安装检查点保存开始', category: DiagnosticLogCategory.storage, fields: <String, Object?>{
-      'kind': checkpoint.kind.name,
-      'phase': checkpoint.phase,
-      'lastAcknowledgedSegment': checkpoint.lastAcknowledgedSegment,
-      'hasBookmark': checkpoint.bookmark?.isNotEmpty == true,
-    });
+    appLogger.trace(
+      '安装检查点保存开始',
+      category: DiagnosticLogCategory.storage,
+      fields: <String, Object?>{
+        'kind': checkpoint.kind.name,
+        'phase': checkpoint.phase,
+        'lastAcknowledgedSegment': checkpoint.lastAcknowledgedSegment,
+        'hasBookmark': checkpoint.bookmark?.isNotEmpty == true,
+      },
+    );
     final target = await _target();
     final temporary = File('${target.path}.new');
     final backup = File('${target.path}.bak');
@@ -37,10 +61,14 @@ class InstallCheckpointStore {
     try {
       await temporary.rename(target.path);
       if (await backup.exists()) await backup.delete();
-      appLogger.info('安装检查点保存完成', category: DiagnosticLogCategory.storage, fields: <String, Object?>{
-        'kind': checkpoint.kind.name,
-        'phase': checkpoint.phase,
-      });
+      appLogger.info(
+        '安装检查点保存完成',
+        category: DiagnosticLogCategory.storage,
+        fields: <String, Object?>{
+          'kind': checkpoint.kind.name,
+          'phase': checkpoint.phase,
+        },
+      );
     } on Object {
       // Windows cannot atomically replace an existing file. Keep the previous
       // valid checkpoint recoverable if the second rename fails or the process
@@ -48,7 +76,11 @@ class InstallCheckpointStore {
       if (!await target.exists() && await backup.exists()) {
         await backup.rename(target.path);
       }
-      appLogger.error('安装检查点保存失败', category: DiagnosticLogCategory.storage, fields: <String, Object?>{'errorType': 'rename'});
+      appLogger.error(
+        '安装检查点保存失败',
+        category: DiagnosticLogCategory.storage,
+        fields: <String, Object?>{'errorType': 'rename'},
+      );
       rethrow;
     }
   }
@@ -68,15 +100,28 @@ class InstallCheckpointStore {
       }
       final value = jsonDecode(await target.readAsString());
       if (value is! Map) {
-        appLogger.warning('安装检查点 JSON 格式无效', category: DiagnosticLogCategory.storage);
+        appLogger.warning(
+          '安装检查点 JSON 格式无效',
+          category: DiagnosticLogCategory.storage,
+        );
         return null;
       }
-      final checkpoint = InstallCheckpoint.fromJson(Map<String, Object?>.from(value));
-      appLogger.info(checkpoint == null ? '安装检查点校验失败' : '安装检查点读取完成', category: DiagnosticLogCategory.storage, fields: <String, Object?>{'valid': checkpoint != null});
+      final checkpoint = InstallCheckpoint.fromJson(
+        Map<String, Object?>.from(value),
+      );
+      appLogger.info(
+        checkpoint == null ? '安装检查点校验失败' : '安装检查点读取完成',
+        category: DiagnosticLogCategory.storage,
+        fields: <String, Object?>{'valid': checkpoint != null},
+      );
       return checkpoint;
     } on Object catch (error) {
       // 损坏的检查点不会阻止正常连接，也不应被当作可恢复安装。
-      appLogger.error('安装检查点读取失败：$error', category: DiagnosticLogCategory.storage, fields: <String, Object?>{'errorType': error.runtimeType.toString()});
+      appLogger.error(
+        '安装检查点读取失败：$error',
+        category: DiagnosticLogCategory.storage,
+        fields: <String, Object?>{'errorType': error.runtimeType.toString()},
+      );
       return null;
     }
   }

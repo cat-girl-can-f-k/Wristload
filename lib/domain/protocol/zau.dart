@@ -4,12 +4,14 @@
 /// 全部独立实现，不复制任何 APK 代码）：
 ///
 /// - `zau`   ：f1=命令号 e、f2=子命令 f、oneof 载荷（f6=a9u 表盘、f22=v8s RPK、f24=o1h Mass）
-/// - `a9u`   ：表盘载荷。oneof：f2=faceId、f5=code、f6=y8u(预装)、f7=x8u(结果)、f9=z8u(错误)
+/// - `a9u`   ：表盘载荷。f1=e9u 列表、f2=faceId、f4=删除结果、f5=code、f6=y8u(预装)、f7=x8u(结果)、f9=z8u(错误)
 /// - `y8u`   ：表盘文件信息。f1=faceId、f2=fileSize、f3=long、f4=int、f5=message
-/// - `x8u`   ：表盘安装结果。id/code/canReplace（设备推送，解析用）
-/// - `v8s`   ：RPK 载荷。oneof：f2=j8s(预装请求)、f3=k8s(预装响应)、f4=l8s(安装结果)
+/// - `x8u`   ：表盘安装结果。id/code（设备推送，解析用）
+/// - `z8u`   ：表盘预装结果。f1=faceId、f2=code、f4=建议分片长度、f5=可覆盖
+/// - `v8s`   ：RPK 载荷。oneof：f2=j8s(预装请求)、f3=k8s(预装响应)、f4=l8s(安装结果)、f5=o8s(卸载)、f6=r8s(启动)
 /// - `j8s`   ：RPK 预装请求。f1=packageName、f2=versionCode、f3=packageSize
 /// - `k8s`   ：RPK 预装响应。f1=status、f2=expectedSliceLength
+/// - `r8s`   ：快应用启动请求。f1=o8s(packageName/fingerprint)、f2=uri
 /// - `o1h`   ：Mass 载荷。oneof：f1=s1h(MassPrepare 请求)、f2=u1h(响应)、f3=q1h(取消)
 /// - `s1h`   ：MassPrepare 请求。f1=dataType、f2=md5、f3=fileLength、f4=0
 /// - `u1h`   ：MassPrepare 响应。f1=bytes、f2=prepareStatus、f3=…、f4=remainLength、f5=expectedSliceLength
@@ -21,6 +23,7 @@ library;
 import 'dart:typed_data';
 
 import '../watch_app.dart';
+import '../watchface.dart';
 import 'proto_wire.dart';
 
 /// 表盘 / RPK / Mass 命令号（zau.e）。
@@ -28,10 +31,12 @@ abstract final class ZauCommand {
   /// Debug transfer cleanup status query. The device returns status 1 while
   /// the previous transfer is still being disposed.
   static const int debugTransfer = 13;
+
   /// Factory/debug build-mode switch. The device restarts immediately after
   /// receiving this command, so the official client does not wait for a
   /// business response.
   static const int debugTransferBootModeSub = 0;
+
   /// FactoryTestFragment.dumpDeviceLog() is fire-and-forget.
   static const int debugTransferDeviceLogSub = 2;
   static const int debugTransferStatusSub = 6;
@@ -41,6 +46,7 @@ abstract final class ZauCommand {
   static const int appList = 20;
   static const int appListSub = 0;
   static const int uninstallAppSub = 3;
+  static const int launchAppSub = 4;
 
   /// Device basic-status requests. Battery is sub-command 1 and storage is
   /// sub-command 62.
@@ -55,7 +61,13 @@ abstract final class ZauCommand {
   static const int deviceLogStartSub = 80;
   static const int deviceLogResultSub = 81;
 
-  static const int setFace = 4; // 表盘：预装(f=4) / setFace(f=1)
+  static const int setFace = 4;
+  static const int watchfaceListSub = 0;
+  static const int activateWatchfaceSub = 1;
+  static const int uninstallWatchfaceSub = 2;
+  static const int prepareWatchfaceInstallSub = 4;
+  static const int watchfaceInstallResultSub = 5;
+  static const int getWatchfaceSub = 14;
   static const int prepareInstallApp = 20; // RPK 预装
   static const int massTransfer = 22; // Mass 文件传输（MassPrepare/MassData 控制）
 }
@@ -128,7 +140,9 @@ abstract final class DeviceLogPayload {
             result.skipField(resultWire);
           }
         }
-        return code == null ? null : DeviceLogControlResult(type: type, code: code);
+        return code == null
+            ? null
+            : DeviceLogControlResult(type: type, code: code);
       }
     } on FormatException {
       return null;
@@ -546,18 +560,119 @@ abstract final class A9u {
     return (6, w.bytes);
   }
 
+  /// Parses command=4/sub=0. The a9u field1 payload is an e9u list wrapper;
+  /// each repeated field1 within that wrapper is one installed watchface.
+  static List<WatchfaceItem> parseInstalledWatchfaces(List<int> data) {
+    final watchfaces = <WatchfaceItem>[];
+    final a9u = ProtoReader(data);
+    var foundListWrapper = false;
+    while (!a9u.isAtEnd) {
+      final (field, wire) = a9u.readFieldHeader();
+      if (field == 1 && wire == 2) {
+        foundListWrapper = true;
+        final wrapper = ProtoReader(a9u.readBytes());
+        while (!wrapper.isAtEnd) {
+          final (entryField, entryWire) = wrapper.readFieldHeader();
+          if (entryField == 1 && entryWire == 2) {
+            watchfaces.add(_parseInstalledWatchface(wrapper.readBytes()));
+          } else {
+            wrapper.skipField(entryWire);
+          }
+        }
+      } else {
+        a9u.skipField(wire);
+      }
+    }
+    if (!foundListWrapper) {
+      throw const FormatException('设备表盘列表缺少列表容器');
+    }
+    return watchfaces;
+  }
+
+  static WatchfaceItem _parseInstalledWatchface(List<int> data) {
+    final reader = ProtoReader(data);
+    var id = '';
+    var name = '';
+    var isCurrent = false;
+    var canRemove = false;
+    var versionCode = 0;
+    while (!reader.isAtEnd) {
+      final (field, wire) = reader.readFieldHeader();
+      switch ((field, wire)) {
+        case (1, 2):
+          id = reader.readString();
+        case (2, 2):
+          name = reader.readString();
+        case (3, 0):
+          isCurrent = reader.readVarint() != 0;
+        case (4, 0):
+          canRemove = reader.readVarint() != 0;
+        case (5, 0):
+          versionCode = reader.readVarint();
+        default:
+          reader.skipField(wire);
+      }
+    }
+    if (id.trim().isEmpty) {
+      throw const FormatException('设备表盘列表包含缺少 ID 的条目');
+    }
+    return WatchfaceItem(
+      id: id,
+      name: name,
+      isCurrent: isCurrent,
+      canRemove: canRemove,
+      versionCode: versionCode,
+    );
+  }
+
+  /// Parses command=4/sub=2's explicit boolean result. A transport ACK alone
+  /// is not enough to claim that a watchface was removed.
+  static bool? parseWatchfaceDeletionResult(List<int> data) {
+    return _parseWatchfaceCommandResult(data);
+  }
+
+  /// Parses command=4/sub=1's explicit activation result. Xiaomi Fitness
+  /// reads the same a9u.field4 boolean for this response as it does for the
+  /// deletion command, but callers keep distinct names so a successful write
+  /// is never confused with a device-confirmed state change.
+  static bool? parseWatchfaceActivationResult(List<int> data) {
+    return _parseWatchfaceCommandResult(data);
+  }
+
+  static bool? _parseWatchfaceCommandResult(List<int> data) {
+    final reader = ProtoReader(data);
+    while (!reader.isAtEnd) {
+      final (field, wire) = reader.readFieldHeader();
+      if (field == 4 && wire == 0) {
+        return reader.readVarint() != 0;
+      }
+      reader.skipField(wire);
+    }
+    return null;
+  }
+
   /// 解析表盘预装响应/结果。返回 (kind, code/id…)。
   /// kind：success → code；error → errorCode；installResult → (id, code)。
-  static ({String kind, int code, String? faceId}) parse(
-    List<int> data, [
-    IntEncoding enc = IntEncoding.varint,
-  ]) {
+  static ({
+    String kind,
+    int code,
+    String? faceId,
+    bool canReplace,
+    int? expectedSliceLength,
+  })
+  parse(List<int> data, [IntEncoding enc = IntEncoding.varint]) {
     final r = ProtoReader(data);
     while (!r.isAtEnd) {
       final (field, wt) = r.readFieldHeader();
       switch ((field, wt)) {
         case (5, 0): // 成功：code
-          return (kind: 'success', code: r.readVarint(), faceId: null);
+          return (
+            kind: 'success',
+            code: r.readVarint(),
+            faceId: null,
+            canReplace: false,
+            expectedSliceLength: null,
+          );
         case (7, 2): // 安装结果 x8u：{id, code}
           final sub = ProtoReader(r.readBytes());
           String? id;
@@ -573,11 +688,19 @@ abstract final class A9u {
                 sub.skipField(w2);
             }
           }
-          return (kind: 'installResult', code: code, faceId: id);
+          return (
+            kind: 'installResult',
+            code: code,
+            faceId: id,
+            canReplace: false,
+            expectedSliceLength: null,
+          );
         case (9, 2): // 错误 z8u：{id, code, canReplace}
           final sub = ProtoReader(r.readBytes());
           String? id;
           var code = -1;
+          var canReplace = false;
+          int? expectedSliceLength;
           while (!sub.isAtEnd) {
             final (f2, w2) = sub.readFieldHeader();
             switch ((f2, w2)) {
@@ -585,16 +708,32 @@ abstract final class A9u {
                 id = sub.readString();
               case (2, 0):
                 code = sub.readVarint();
+              case (4, 0):
+                expectedSliceLength = sub.readVarint();
+              case (5, 0):
+                canReplace = sub.readVarint() != 0;
               default:
                 sub.skipField(w2);
             }
           }
-          return (kind: 'error', code: code, faceId: id);
+          return (
+            kind: 'error',
+            code: code,
+            faceId: id,
+            canReplace: canReplace,
+            expectedSliceLength: expectedSliceLength,
+          );
         default:
           r.skipField(wt);
       }
     }
-    return (kind: 'unknown', code: -1, faceId: null);
+    return (
+      kind: 'unknown',
+      code: -1,
+      faceId: null,
+      canReplace: false,
+      expectedSliceLength: null,
+    );
   }
 }
 
@@ -616,6 +755,38 @@ abstract final class V8s {
       ..writeString(1, packageName)
       ..writeBytes(2, fingerprint);
     final v8s = ProtoWriter()..writeMessage(5, app.bytes);
+    return (22, v8s.bytes);
+  }
+
+  /// command=20/sub=4 carries v8s.field6=r8s.
+  ///
+  /// Xiaomi Fitness uses `/` as the ordinary root entry point when opening a
+  /// listed watch app. The fingerprint is optional at the protobuf level, but
+  /// the device-provided value is preserved whenever it is available.
+  static (int, List<int>) launchRequest({
+    required String packageName,
+    required List<int> fingerprint,
+    String uri = '/',
+  }) {
+    if (packageName.trim().isEmpty) {
+      throw ArgumentError.value(
+        packageName,
+        'packageName',
+        'must not be empty',
+      );
+    }
+    if (uri.isEmpty) {
+      throw ArgumentError.value(uri, 'uri', 'must not be empty');
+    }
+
+    final app = ProtoWriter()..writeString(1, packageName);
+    if (fingerprint.isNotEmpty) {
+      app.writeBytes(2, fingerprint);
+    }
+    final launch = ProtoWriter()
+      ..writeMessage(1, app.bytes)
+      ..writeString(2, uri);
+    final v8s = ProtoWriter()..writeMessage(6, launch.bytes);
     return (22, v8s.bytes);
   }
 

@@ -7,34 +7,39 @@ import 'package:wristload/presentation/home_widgets.dart';
 void main() {
   testWidgets('主页诊断日志开关转发状态且平台不可用时禁用', (tester) async {
     bool? changed;
-    await tester.pumpWidget(MaterialApp(
-      home: Scaffold(
-        body: DiagnosticLogToggle(
-          entryCount: 12,
-          enabled: false,
-          onChanged: (value) => changed = value,
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: DiagnosticLogToggle(
+            entryCount: 12,
+            enabled: false,
+            onChanged: (value) => changed = value,
+          ),
         ),
       ),
-    ));
+    );
 
-    expect(find.text('独立诊断日志窗口'), findsOneWidget);
-    expect(find.textContaining('当前 12 条'), findsOneWidget);
+    expect(find.text('DevTool'), findsOneWidget);
+    expect(find.text('显示程序日志'), findsOneWidget);
     final tile = tester.widget<SwitchListTile>(find.byType(SwitchListTile));
     expect(tile.value, isFalse);
-    await tester.tap(find.text('独立诊断日志窗口'));
+    await tester.tap(find.text('DevTool'));
     expect(changed, isTrue);
 
-    await tester.pumpWidget(const MaterialApp(
-      home: Scaffold(
-        body: DiagnosticLogToggle(
-          entryCount: 12,
-          enabled: true,
-          onChanged: null,
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: DiagnosticLogToggle(
+            entryCount: 12,
+            enabled: true,
+            onChanged: null,
+          ),
         ),
       ),
-    ));
-    final unavailable =
-        tester.widget<SwitchListTile>(find.byType(SwitchListTile));
+    );
+    final unavailable = tester.widget<SwitchListTile>(
+      find.byType(SwitchListTile),
+    );
     expect(unavailable.value, isFalse);
     expect(unavailable.onChanged, isNull);
     expect(find.text('当前平台不支持独立日志窗口'), findsOneWidget);
@@ -53,14 +58,16 @@ void main() {
     );
     DiscoveredEventArgs? connected;
 
-    await tester.pumpWidget(MaterialApp(
-      home: Scaffold(
-        body: ScanResultsList(
-          results: [installable, other],
-          onConnect: (result) => connected = result,
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ScanResultsList(
+            results: [installable, other],
+            onConnect: (result) => connected = result,
+          ),
         ),
       ),
-    ));
+    );
 
     expect(find.text('可安装的设备 · 1'), findsOneWidget);
     expect(find.text('其他设备 · 1（不支持安装）'), findsOneWidget);
@@ -86,27 +93,29 @@ void main() {
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
 
-    await tester.pumpWidget(MaterialApp(
-      home: Scaffold(
-        body: SingleChildScrollView(
-          child: ScanResultsList(
-            results: [
-              _discovery(
-                address: 'A1:B2:C3:D4:E5:F6',
-                name: 'Xiaomi Smart Band 10 Pro With A Very Long Name',
-                rssi: 0,
-              ),
-              _discovery(
-                address: '10:20:30:40:50:60',
-                name: 'A Very Long Unsupported Bluetooth Device Name',
-                rssi: -80,
-              ),
-            ],
-            onConnect: (_) {},
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SingleChildScrollView(
+            child: ScanResultsList(
+              results: [
+                _discovery(
+                  address: 'A1:B2:C3:D4:E5:F6',
+                  name: 'Xiaomi Smart Band 10 Pro With A Very Long Name',
+                  rssi: 0,
+                ),
+                _discovery(
+                  address: '10:20:30:40:50:60',
+                  name: 'A Very Long Unsupported Bluetooth Device Name',
+                  rssi: -80,
+                ),
+              ],
+              onConnect: (_) {},
+            ),
           ),
         ),
       ),
-    ));
+    );
 
     expect(find.textContaining('RSSI'), findsNothing);
     expect(find.byType(FilledButton), findsOneWidget);
@@ -114,20 +123,22 @@ void main() {
   });
 
   testWidgets('正数 RSSI 才按数据卫生规则显示', (tester) async {
-    await tester.pumpWidget(MaterialApp(
-      home: Scaffold(
-        body: ScanResultsList(
-          results: [
-            _discovery(
-              address: 'A1:B2:C3:D4:E5:F6',
-              name: 'Xiaomi Smart Band 9 Pro',
-              rssi: 42,
-            ),
-          ],
-          onConnect: (_) {},
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ScanResultsList(
+            results: [
+              _discovery(
+                address: 'A1:B2:C3:D4:E5:F6',
+                name: 'Xiaomi Smart Band 9 Pro',
+                rssi: 42,
+              ),
+            ],
+            onConnect: (_) {},
+          ),
         ),
       ),
-    ));
+    );
 
     expect(find.text('RSSI 42'), findsOneWidget);
   });
@@ -137,12 +148,11 @@ DiscoveredEventArgs _discovery({
   required String address,
   required String name,
   required int rssi,
-}) =>
-    DiscoveredEventArgs(
-      _TestPeripheral(UUID.fromAddress(address)),
-      rssi,
-      Advertisement(name: name),
-    );
+}) => DiscoveredEventArgs(
+  _TestPeripheral(UUID.fromAddress(address)),
+  rssi,
+  Advertisement(name: name),
+);
 
 class _TestPeripheral implements Peripheral {
   const _TestPeripheral(this.uuid);

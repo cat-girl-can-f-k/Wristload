@@ -14,6 +14,7 @@ import '../../domain/install_file_classifier.dart';
 import '../../domain/install_models.dart';
 import '../../domain/install_task.dart';
 import '../../domain/install_preference_store.dart';
+import '../../domain/resource_install_target_policy.dart';
 import '../../domain/queue_file_importer.dart';
 import '../../platform/scoped_file_picker.dart';
 import '../../platform/security_scoped_file_access.dart';
@@ -119,7 +120,11 @@ class HomePage extends StatelessWidget {
     }
   }
 
-  Future<void> _pickAndTry(BuildContext context, InstallKind kind) async {
+  Future<void> _pickAndTry(
+    BuildContext context,
+    InstallKind kind, {
+    List<String>? targetDeviceIds,
+  }) async {
     final extensions = kind == InstallKind.watchface
         ? const ['bin', 'face']
         : Platform.isMacOS
@@ -130,14 +135,25 @@ class HomePage extends StatelessWidget {
     );
     final source = selected?.single;
     if (source == null) return;
+    if (!context.mounted) return;
     // The content inspection below is macOS-specific because it must retain
     // the security-scoped bookmark returned by the native file picker. Other
     // platforms keep their established extension-based import path.
     if (!Platform.isMacOS) {
-      await _prepareAndTry(context, source, kind);
+      await _prepareAndTry(
+        context,
+        source,
+        kind,
+        targetDeviceIds: targetDeviceIds,
+      );
       return;
     }
-    await _tryImportSource(context, source, expectedKind: kind);
+    await _tryImportSource(
+      context,
+      source,
+      expectedKind: kind,
+      targetDeviceIds: targetDeviceIds,
+    );
   }
 
   Future<void> _handleDrop(
@@ -160,6 +176,7 @@ class HomePage extends StatelessWidget {
     BuildContext context,
     ScopedFileRef source, {
     InstallKind? expectedKind,
+    List<String>? targetDeviceIds,
   }) async {
     final fileName = source.path.split(RegExp(r'[/\\]')).last;
     if (!_isMacOSInstallCandidate(source.path)) {
@@ -185,7 +202,12 @@ class HomePage extends StatelessWidget {
             controller.reportError('所选文件是快应用，请从快应用入口安装。');
             return;
           }
-          await _prepareAndTry(context, resolvedSource, InstallKind.quickApp);
+          await _prepareAndTry(
+            context,
+            resolvedSource,
+            InstallKind.quickApp,
+            targetDeviceIds: targetDeviceIds,
+          );
           return;
         case InstallableFileType.watchface:
           if (expectedKind == InstallKind.quickApp) {
@@ -195,7 +217,12 @@ class HomePage extends StatelessWidget {
             controller.reportError('所选文件不是合法的快应用$suffix。');
             return;
           }
-          await _prepareAndTry(context, resolvedSource, InstallKind.watchface);
+          await _prepareAndTry(
+            context,
+            resolvedSource,
+            InstallKind.watchface,
+            targetDeviceIds: targetDeviceIds,
+          );
           return;
         case InstallableFileType.unsupported:
           controller.reportError('不支持的安装文件：$fileName');
@@ -219,8 +246,9 @@ class HomePage extends StatelessWidget {
   Future<void> _prepareAndTry(
     BuildContext context,
     ScopedFileRef source,
-    InstallKind kind,
-  ) async {
+    InstallKind kind, {
+    List<String>? targetDeviceIds,
+  }) async {
     try {
       final importedRequest = await QueueFileImporter().prepareSingle(
         source,
@@ -230,33 +258,43 @@ class HomePage extends StatelessWidget {
       var unsupportedLuaConfirmed = false;
       var watchfaceResolutionConfirmed = false;
       if (!context.mounted) return;
+      final targets = targetDeviceIds == null
+          ? await _resolveInstallTargets(context)
+          : _resolveExplicitInstallTargets(targetDeviceIds);
+      if (!context.mounted) return;
+      if (targets == null || targets.isEmpty) return;
       if (kind == InstallKind.watchface) {
-        final compatibilityError = controller.watchfaceCompatibilityError(
+        final compatibilityIssues = _watchfaceCompatibilityIssues(
           metadata,
+          targets,
         );
-        if (compatibilityError != null) {
+        if (compatibilityIssues.isNotEmpty) {
           watchfaceResolutionConfirmed = await _confirmWatchfaceResolution(
             context,
             metadata,
+            compatibilityIssues,
           );
           if (!watchfaceResolutionConfirmed) return;
           if (!context.mounted) return;
         }
-        if (controller.requiresUnsupportedLuaConfirmation(metadata)) {
+        final luaTargets = _unsupportedLuaTargets(metadata, targets);
+        if (luaTargets.isNotEmpty) {
           unsupportedLuaConfirmed = await _confirmUnsupportedLuaWatchface(
             context,
             metadata,
+            luaTargets,
           );
           if (!unsupportedLuaConfirmed) return;
+          if (!context.mounted) return;
         }
         if (!context.mounted) return;
         final edited = await _editFaceId(context, metadata);
-        if (edited == null) return;
+        if (edited == null || !context.mounted) return;
         metadata = edited;
       } else if (metadata.versionCode == null) {
         if (!context.mounted) return;
         final edited = await _editRpkVersion(context, metadata);
-        if (edited == null) return;
+        if (edited == null || !context.mounted) return;
         metadata = edited;
       }
       if (kind == InstallKind.watchface &&
@@ -274,6 +312,7 @@ class HomePage extends StatelessWidget {
           metadata: metadata,
           unsupportedLuaConfirmed: unsupportedLuaConfirmed,
           watchfaceResolutionConfirmed: watchfaceResolutionConfirmed,
+          targetDeviceIds: targets.map((target) => target.id).toList(),
         ),
       );
       await controller.runQueue();
@@ -282,12 +321,90 @@ class HomePage extends StatelessWidget {
     }
   }
 
+  Future<List<ResourceInstallDevice>?> _resolveInstallTargets(
+    BuildContext context,
+  ) async {
+    final devices = controller.resourceInstallDevices;
+    if (devices.isEmpty) {
+      controller.reportError('没有已连接且已验证的设备。');
+      return null;
+    }
+    final policy = controller.resourceInstallTargetPolicy;
+    if (policy.mode == ResourceInstallTargetMode.allConnected) return devices;
+    if (policy.mode == ResourceInstallTargetMode.automaticDevice) {
+      final matched = devices.where(
+        (item) => item.id == policy.automaticDeviceId,
+      );
+      if (matched.isNotEmpty) return matched.toList();
+      controller.reportError('自动安装目标已不在当前连接列表中，请重新选择安装设备。');
+      return null;
+    }
+    return _showInstallTargetPicker(context, devices);
+  }
+
+  List<ResourceInstallDevice>? _resolveExplicitInstallTargets(
+    List<String> targetDeviceIds,
+  ) {
+    final byId = <String, ResourceInstallDevice>{
+      for (final device in controller.resourceInstallDevices)
+        device.id.trim().toLowerCase(): device,
+    };
+    final targets = <ResourceInstallDevice>[];
+    final seen = <String>{};
+    for (final rawId in targetDeviceIds) {
+      final normalized = rawId.trim().toLowerCase();
+      if (normalized.isEmpty || !seen.add(normalized)) continue;
+      final device = byId[normalized];
+      if (device == null) {
+        controller.reportError('目标设备已断开或尚未完成验证，未发送资源。');
+        return null;
+      }
+      targets.add(device);
+    }
+    if (targets.isEmpty) {
+      controller.reportError('没有可用的安装目标设备。');
+      return null;
+    }
+    return targets;
+  }
+
+  List<_WatchfaceTargetIssue> _watchfaceCompatibilityIssues(
+    InstallMetadata metadata,
+    List<ResourceInstallDevice> targets,
+  ) => [
+    for (final target in targets)
+      if (controller.watchfaceCompatibilityErrorForDevice(metadata, target.id)
+          case final error?)
+        _WatchfaceTargetIssue(device: target, error: error),
+  ];
+
+  List<ResourceInstallDevice> _unsupportedLuaTargets(
+    InstallMetadata metadata,
+    List<ResourceInstallDevice> targets,
+  ) => [
+    for (final target in targets)
+      if (controller.requiresUnsupportedLuaConfirmationForDevice(
+        metadata,
+        target.id,
+      ))
+        target,
+  ];
+
+  Future<List<ResourceInstallDevice>?> _showInstallTargetPicker(
+    BuildContext context,
+    List<ResourceInstallDevice> devices,
+  ) => showModalBottomSheet<List<ResourceInstallDevice>>(
+    context: context,
+    showDragHandle: true,
+    builder: (_) => _InstallTargetPicker(devices: devices),
+  );
+
   Future<bool> _confirmWatchfaceResolution(
     BuildContext context,
     InstallMetadata metadata,
+    List<_WatchfaceTargetIssue> issues,
   ) async {
     var confirmed = false;
-    final profile = controller.connectedProfile;
     final resolutions = metadata.watchfaceResolutions.isEmpty
         ? '未识别'
         : metadata.watchfaceResolutions.join('、');
@@ -299,7 +416,13 @@ class HomePage extends StatelessWidget {
         message: '安装后可能无法正常显示或使用',
         rows: [
           ('表盘分辨率', resolutions, false),
-          ('设备分辨率', profile?.watchfaceResolution?.toString() ?? '未知', true),
+          for (final issue in issues)
+            (
+              '设备分辨率',
+              '${issue.device.name}：'
+                  '${controller.sessionForDeviceId(issue.device.id)?.connectedProfile?.watchfaceResolution ?? '未知'}',
+              true,
+            ),
           ('文件名', metadata.fileName, false),
         ],
         onConfirm: () => confirmed = true,
@@ -311,6 +434,7 @@ class HomePage extends StatelessWidget {
   Future<bool> _confirmUnsupportedLuaWatchface(
     BuildContext context,
     InstallMetadata metadata,
+    List<ResourceInstallDevice> targets,
   ) async {
     var confirmed = false;
     await showDialog<bool>(
@@ -322,7 +446,7 @@ class HomePage extends StatelessWidget {
         rows: [
           ('文件名', metadata.fileName, false),
           ('检测结果', '检测到lua文件', true),
-          ('目标设备', controller.connectedProfile?.displayName ?? '未知设备', false),
+          ('目标设备', targets.map((target) => target.name).join('、'), false),
         ],
         onConfirm: () => confirmed = true,
       ),
@@ -514,6 +638,137 @@ class HomePage extends StatelessWidget {
     }
   }
 
+  /// An extra device must never overwrite the primary controller's in-memory
+  /// authkey. The child session created by [connectAdditional] owns this value
+  /// and persists it only after that device finishes f=27 authentication.
+  Future<void> _connectAdditionalWithAuthKey(
+    BuildContext context,
+    DiscoveredEventArgs result,
+  ) async {
+    final deviceId = result.peripheral.uuid.toString();
+    final saved = await controller.readAuthKeyFor(deviceId);
+    if (!context.mounted) return;
+
+    final authKey =
+        saved ??
+        await _requestAdditionalDeviceAuthKey(
+          context,
+          title: '输入附加设备 authkey',
+          deviceName: result.advertisement.name,
+        );
+    if (authKey == null || !context.mounted) return;
+    await controller.connectAdditional(result, authKeyOverride: authKey);
+  }
+
+  Future<bool> _connectAdditionalSavedDeviceWithAuthKey(
+    BuildContext context,
+    AuthKeyBinding binding,
+  ) async {
+    final saved = await controller.readAuthKeyFor(binding.id);
+    if (!context.mounted) return false;
+    if (saved != null) {
+      return controller.connectAdditionalSavedDevice(binding);
+    }
+    final authKey = await _requestAdditionalDeviceAuthKey(
+      context,
+      title: '输入附加设备 authkey',
+      deviceName: binding.name,
+    );
+    if (authKey == null || !context.mounted) return false;
+    return controller.connectAdditionalSavedDevice(
+      binding,
+      authKeyOverride: authKey,
+    );
+  }
+
+  Future<void> _reconnectAdditionalDeviceWithAuthKey(
+    BuildContext context,
+    DeviceSessionView session,
+  ) async {
+    // A previously entered but not-yet-persisted authkey belongs to this child
+    // controller. Do not force the user to re-enter it after a transient
+    // pairing, SDP, or RFCOMM failure. A rejected f=27 clears it deliberately.
+    if (session.controller.authKey != null) {
+      await controller.reconnectAdditionalDevice(session.id);
+      return;
+    }
+    final saved = await controller.readAuthKeyFor(session.id);
+    if (!context.mounted) return;
+    if (saved != null) {
+      await controller.reconnectAdditionalDevice(session.id);
+      return;
+    }
+    final authKey = await _requestAdditionalDeviceAuthKey(
+      context,
+      title: '重新输入 authkey',
+      deviceName: session.name,
+    );
+    if (authKey == null || !context.mounted) return;
+    await controller.reconnectAdditionalDevice(
+      session.id,
+      authKeyOverride: authKey,
+    );
+  }
+
+  Future<String?> _requestAdditionalDeviceAuthKey(
+    BuildContext context, {
+    required String title,
+    String? deviceName,
+  }) async {
+    var authKey = '';
+    final formKey = GlobalKey<FormState>();
+    final label = deviceName?.trim() ?? '';
+    return showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(title),
+        content: Form(
+          key: formKey,
+          child: TextFormField(
+            initialValue: authKey,
+            onChanged: (value) => authKey = value,
+            autofocus: true,
+            maxLength: 32,
+            autocorrect: false,
+            enableSuggestions: false,
+            decoration: InputDecoration(
+              labelText: label.isEmpty ? '32 位十六进制' : label,
+              hintText: '绑定 token，16 字节',
+              counterText: '',
+              border: const OutlineInputBorder(),
+            ),
+            validator: (value) {
+              final normalized = value?.trim() ?? '';
+              return RegExp(r'^[0-9a-fA-F]{32}$').hasMatch(normalized)
+                  ? null
+                  : '请输入 32 位十六进制字符';
+            },
+            onFieldSubmitted: (value) {
+              authKey = value;
+              if (formKey.currentState!.validate()) {
+                Navigator.pop(dialogContext, authKey.trim());
+              }
+            },
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () {
+              if (formKey.currentState!.validate()) {
+                Navigator.pop(dialogContext, authKey.trim());
+              }
+            },
+            child: const Text('连接'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     // A selected peripheral is only a transport candidate until the
@@ -542,6 +797,14 @@ class HomePage extends StatelessWidget {
         storageTotal != null &&
         storageTotal > 0 &&
         storageUsed <= storageTotal;
+    final additionalSessions = controller.additionalDeviceSessions;
+    final additionalScanResults = controller.scanResults
+        .where(controller.isAdditionalMacOSDeviceCandidate)
+        .toList(growable: false);
+    final additionalSavedBindings = controller.authKeyBindings
+        .where((binding) => !controller.isDeviceAlreadyInSession(binding.id))
+        .toList(growable: false);
+    final primaryDeviceId = device?.uuid.toString();
     final content = SafeArea(
       child: Align(
         alignment: Alignment.topCenter,
@@ -754,6 +1017,31 @@ class HomePage extends StatelessWidget {
                               icon: const Icon(Icons.link_off),
                               label: const Text('断开连接'),
                             ),
+                            if (Platform.isMacOS &&
+                                controller.supportsAdditionalMacOSDevices)
+                              controller.isScanning
+                                  ? OutlinedButton.icon(
+                                      key: const ValueKey(
+                                        'stop-additional-device-scan-button',
+                                      ),
+                                      onPressed: controller.stopScan,
+                                      icon: const Icon(
+                                        Icons.stop_circle_outlined,
+                                      ),
+                                      label: const Text('停止添加设备扫描'),
+                                    )
+                                  : FilledButton.tonalIcon(
+                                      key: const ValueKey(
+                                        'connect-additional-device-button',
+                                      ),
+                                      onPressed:
+                                          controller.canScan &&
+                                              !controller.isConnectionBusy
+                                          ? controller.beginScan
+                                          : null,
+                                      icon: const Icon(Icons.add_link),
+                                      label: const Text('连接多设备'),
+                                    ),
                           ],
                         ),
                     ],
@@ -770,7 +1058,22 @@ class HomePage extends StatelessWidget {
                     ),
                   ),
                 ),
-              if (!connected && controller.authKeyBindings.isNotEmpty) ...[
+              if (Platform.isMacOS &&
+                  controller.supportsAdditionalMacOSDevices &&
+                  (connected || additionalSessions.isNotEmpty) &&
+                  additionalSavedBindings.isNotEmpty) ...[
+                const SizedBox(height: 12),
+                _SavedDevicesSection(
+                  bindings: additionalSavedBindings,
+                  enabled: controller.canScan,
+                  onConnect: (binding) =>
+                      _connectAdditionalSavedDeviceWithAuthKey(
+                        context,
+                        binding,
+                      ),
+                ),
+              ] else if (!connected &&
+                  controller.authKeyBindings.isNotEmpty) ...[
                 const SizedBox(height: 12),
                 _SavedDevicesSection(
                   bindings: controller.authKeyBindings,
@@ -778,13 +1081,25 @@ class HomePage extends StatelessWidget {
                   onConnect: controller.connectSavedDevice,
                 ),
               ],
-              if (!connected && !controller.isConnectionBusy) ...[
+              if (Platform.isMacOS &&
+                  controller.supportsAdditionalMacOSDevices &&
+                  (connected || additionalSessions.isNotEmpty) &&
+                  controller.isScanning &&
+                  additionalScanResults.isNotEmpty) ...[
+                const SizedBox(height: 12),
+                _AdditionalDeviceScanResults(
+                  results: additionalScanResults,
+                  onConnect: (result) =>
+                      _connectAdditionalWithAuthKey(context, result),
+                ),
+              ] else if (!connected && !controller.isConnectionBusy) ...[
                 const SizedBox(height: 12),
                 ScanResultsList(
                   results: controller.scanResults,
                   onConnect: (result) => _connectWithAuthKey(context, result),
                 ),
-              ] else if (connected) ...[
+              ],
+              if (connected) ...[
                 const SizedBox(height: 12),
                 Text('安装', style: Theme.of(context).textTheme.titleMedium),
                 const Text('完成设备验证后，可连续安装多个文件。'),
@@ -796,7 +1111,13 @@ class HomePage extends StatelessWidget {
                       !controller.installInProgress &&
                       !controller.timeSyncInProgress &&
                       !controller.statusRefreshInProgress,
-                  onInstall: (target) => _pickAndTry(context, target),
+                  onInstall: (target) => _pickAndTry(
+                    context,
+                    target,
+                    targetDeviceIds: primaryDeviceId == null
+                        ? null
+                        : <String>[primaryDeviceId],
+                  ),
                   onInstallFirmware: () => _pickFirmware(context),
                 ),
                 if (controller.latestTask case final task?)
@@ -806,6 +1127,23 @@ class HomePage extends StatelessWidget {
                     onRetry: controller.retryInstall,
                     onClear: controller.clearLatestTask,
                   ),
+              ],
+              for (final session in additionalSessions) ...[
+                const SizedBox(height: 12),
+                _AdditionalDeviceSessionSection(
+                  session: session,
+                  preferredInstallTarget: preferredInstallTarget,
+                  onInstall: (target) => _pickAndTry(
+                    context,
+                    target,
+                    targetDeviceIds: <String>[session.id],
+                  ),
+                  onInstallFirmware: () => _pickFirmware(context),
+                  onReconnect: () =>
+                      _reconnectAdditionalDeviceWithAuthKey(context, session),
+                  onDisconnect: () =>
+                      controller.disconnectAdditionalDevice(session.id),
+                ),
               ],
               const SizedBox(height: 12),
               DiagnosticLogToggle(
@@ -824,6 +1162,13 @@ class HomePage extends StatelessWidget {
       child: content,
     );
   }
+}
+
+class _WatchfaceTargetIssue {
+  const _WatchfaceTargetIssue({required this.device, required this.error});
+
+  final ResourceInstallDevice device;
+  final String error;
 }
 
 class _SavedDevicesSection extends StatelessWidget {
@@ -913,6 +1258,260 @@ class _SavedDeviceTile extends StatelessWidget {
       label: const Text('连接'),
     ),
   );
+}
+
+class _AdditionalDeviceScanResults extends StatelessWidget {
+  const _AdditionalDeviceScanResults({
+    required this.results,
+    required this.onConnect,
+  });
+
+  final List<DiscoveredEventArgs> results;
+  final ValueChanged<DiscoveredEventArgs> onConnect;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        for (final result in results)
+          ScanTile(
+            key: ValueKey(
+              'additional-scan-' + result.peripheral.uuid.toString(),
+            ),
+            result: result,
+            installable: true,
+            onConnect: () => onConnect(result),
+          ),
+      ],
+    );
+  }
+}
+
+class _AdditionalDeviceSessionSection extends StatelessWidget {
+  const _AdditionalDeviceSessionSection({
+    required this.session,
+    required this.preferredInstallTarget,
+    required this.onInstall,
+    required this.onInstallFirmware,
+    required this.onReconnect,
+    required this.onDisconnect,
+  });
+
+  final DeviceSessionView session;
+  final InstallPreference preferredInstallTarget;
+  final Future<void> Function(InstallKind target) onInstall;
+  final Future<void> Function() onInstallFirmware;
+  final Future<void> Function() onReconnect;
+  final Future<void> Function() onDisconnect;
+
+  @override
+  Widget build(BuildContext context) {
+    final controller = session.controller;
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
+    final connected = controller.isConnected;
+    final connecting = !connected && controller.isConnecting;
+    final busy = controller.isConnectionBusy;
+    final name = session.name.trim().isEmpty ? '附加设备' : session.name.trim();
+    final status = connected
+        ? '已连接'
+        : connecting
+        ? '正在连接'
+        : busy
+        ? '正在释放连接'
+        : '连接失败，可重试';
+    final statusColor = connected
+        ? colors.tertiary
+        : connecting || busy
+        ? colors.primary
+        : colors.error;
+    final installEnabled =
+        connected &&
+        controller.sessionReady &&
+        !controller.installInProgress &&
+        !controller.timeSyncInProgress &&
+        !controller.statusRefreshInProgress;
+    final canOpenDeviceInfo = DeviceInfoPage.hasVerifiedSession(controller);
+    final battery = controller.batteryPercent;
+    final hasBattery = battery != null && battery >= 0 && battery <= 100;
+    final storageUsed = controller.storageUsedBytes;
+    final storageTotal = controller.storageTotalBytes;
+    final hasStorage =
+        storageUsed != null &&
+        storageTotal != null &&
+        storageTotal > 0 &&
+        storageUsed <= storageTotal;
+
+    return Column(
+      key: ValueKey('additional-device-session-' + session.id),
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      width: 42,
+                      height: 42,
+                      decoration: BoxDecoration(
+                        color: colors.secondaryContainer,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Icon(
+                        connected ? Icons.watch : Icons.bluetooth,
+                        color: colors.onSecondaryContainer,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            name,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.titleMedium,
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            session.id,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: colors.onSurfaceVariant,
+                              fontFamily: 'monospace',
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Flexible(
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Container(
+                            width: 8,
+                            height: 8,
+                            decoration: BoxDecoration(
+                              color: statusColor,
+                              shape: BoxShape.circle,
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          Flexible(
+                            child: Text(
+                              status,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: theme.textTheme.bodySmall,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    if (canOpenDeviceInfo)
+                      IconButton(
+                        key: ValueKey('additional-device-info-' + session.id),
+                        tooltip: '查看设备信息',
+                        visualDensity: VisualDensity.compact,
+                        icon: const Icon(Icons.chevron_right),
+                        onPressed: () => unawaited(
+                          openVerifiedDeviceInfo(context, controller),
+                        ),
+                      ),
+                  ],
+                ),
+                if (connected && (hasBattery || hasStorage)) ...[
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      if (hasBattery)
+                        Expanded(
+                          child: _DeviceStat(
+                            icon: Icons.battery_std,
+                            value: battery.toString() + '%',
+                            detail: '电量',
+                            progress: battery / 100,
+                            progressColor: battery < 20 ? colors.error : null,
+                          ),
+                        ),
+                      if (hasBattery && hasStorage) const SizedBox(width: 12),
+                      if (hasStorage)
+                        Expanded(
+                          child: _DeviceStat(
+                            icon: Icons.sd_storage,
+                            value:
+                                _formatBytes(storageUsed) +
+                                ' / ' +
+                                _formatBytes(storageTotal),
+                            detail: '存储',
+                            progress: storageUsed / storageTotal,
+                          ),
+                        ),
+                    ],
+                  ),
+                ],
+                if (controller.error case final error?) ...[
+                  const SizedBox(height: 10),
+                  Text(error, style: TextStyle(color: colors.error)),
+                ],
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    FilledButton.icon(
+                      key: ValueKey('reconnect-additional-' + session.id),
+                      onPressed: busy ? null : () => unawaited(onReconnect()),
+                      icon: busy
+                          ? const SizedBox.square(
+                              dimension: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.refresh),
+                      label: Text(connecting ? '正在连接' : '重新连接'),
+                    ),
+                    OutlinedButton.icon(
+                      key: ValueKey('disconnect-additional-' + session.id),
+                      onPressed: () => unawaited(onDisconnect()),
+                      icon: const Icon(Icons.link_off),
+                      label: const Text('断开设备'),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+        if (connected) ...[
+          const SizedBox(height: 10),
+          Text('安装到 ' + name, style: theme.textTheme.titleMedium),
+          const Text('此安装入口只操作当前设备。'),
+          const SizedBox(height: 8),
+          InstallSplitButton(
+            preferredTarget: preferredInstallTarget,
+            enabled: installEnabled,
+            onInstall: onInstall,
+            onInstallFirmware: onInstallFirmware,
+          ),
+          if (controller.latestTask case final task?)
+            InstallTaskCard(
+              task: task,
+              onCancel: controller.cancelInstall,
+              onRetry: controller.retryInstall,
+              onClear: controller.clearLatestTask,
+            ),
+        ],
+      ],
+    );
+  }
 }
 
 class _BluetoothUnavailableBanner extends StatelessWidget {
@@ -1041,4 +1640,103 @@ String _formatBytes(int bytes) {
     return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
   }
   return '${(bytes / 1024).toStringAsFixed(1)} KB';
+}
+
+class _InstallTargetPicker extends StatefulWidget {
+  const _InstallTargetPicker({required this.devices});
+
+  final List<ResourceInstallDevice> devices;
+
+  @override
+  State<_InstallTargetPicker> createState() => _InstallTargetPickerState();
+}
+
+class _InstallTargetPickerState extends State<_InstallTargetPicker> {
+  bool _multiple = false;
+  late final Set<String> _selected = {widget.devices.first.id};
+
+  void _toggle(ResourceInstallDevice device, bool selected) {
+    setState(() {
+      if (_multiple) {
+        selected ? _selected.add(device.id) : _selected.remove(device.id);
+      } else {
+        _selected
+          ..clear()
+          ..add(device.id);
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final selectedDevices = widget.devices
+        .where((device) => _selected.contains(device.id))
+        .toList(growable: false);
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    '选择安装设备',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                ),
+                TextButton(
+                  onPressed: () => setState(() {
+                    _multiple = !_multiple;
+                    if (!_multiple && _selected.length > 1) {
+                      _selected
+                        ..clear()
+                        ..add(widget.devices.first.id);
+                    }
+                  }),
+                  child: Text(_multiple ? '单选' : '多选'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            for (final device in widget.devices)
+              Card(
+                margin: const EdgeInsets.only(top: 8),
+                child: ListTile(
+                  leading: const Icon(Icons.watch_outlined),
+                  title: Text(device.name.isEmpty ? '已连接设备' : device.name),
+                  subtitle: Text(
+                    device.id,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  trailing: _multiple
+                      ? Checkbox(
+                          value: _selected.contains(device.id),
+                          onChanged: (value) => _toggle(device, value ?? false),
+                        )
+                      : Radio<String>(
+                          value: device.id,
+                          groupValue: _selected.firstOrNull,
+                          onChanged: (_) => _toggle(device, true),
+                        ),
+                  onTap: () => _toggle(device, !_selected.contains(device.id)),
+                ),
+              ),
+            const SizedBox(height: 16),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton(
+                onPressed: selectedDevices.isEmpty
+                    ? null
+                    : () => Navigator.pop(context, selectedDevices),
+                child: Text('安装到 ${selectedDevices.length} 台设备'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }

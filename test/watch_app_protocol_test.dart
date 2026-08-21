@@ -92,6 +92,46 @@ void main() {
     expect(request.isAtEnd, isTrue);
   });
 
+  test('encodes a launch request with package fingerprint and root URI', () {
+    final payload = V8s.launchRequest(
+      packageName: 'com.example.demo',
+      fingerprint: [0x01, 0xab, 0xff],
+    );
+
+    expect(payload.$1, 22);
+    final v8s = ProtoReader(payload.$2);
+    expect(v8s.readFieldHeader(), (6, 2));
+
+    final launch = ProtoReader(v8s.readBytes());
+    expect(launch.readFieldHeader(), (1, 2));
+    final app = ProtoReader(launch.readBytes());
+    expect(app.readFieldHeader(), (1, 2));
+    expect(app.readString(), 'com.example.demo');
+    expect(app.readFieldHeader(), (2, 2));
+    expect(app.readBytes(), [0x01, 0xab, 0xff]);
+    expect(app.isAtEnd, isTrue);
+    expect(launch.readFieldHeader(), (2, 2));
+    expect(launch.readString(), '/');
+    expect(launch.isAtEnd, isTrue);
+    expect(v8s.isAtEnd, isTrue);
+  });
+
+  test('omits an unavailable fingerprint from a launch request', () {
+    final payload = V8s.launchRequest(
+      packageName: 'com.example.system',
+      fingerprint: const [],
+    );
+
+    final v8s = ProtoReader(payload.$2);
+    expect(v8s.readFieldHeader(), (6, 2));
+    final launch = ProtoReader(v8s.readBytes());
+    expect(launch.readFieldHeader(), (1, 2));
+    final app = ProtoReader(launch.readBytes());
+    expect(app.readFieldHeader(), (1, 2));
+    expect(app.readString(), 'com.example.system');
+    expect(app.isAtEnd, isTrue);
+  });
+
   test('rejects an installed app entry without package name', () {
     final app = ProtoWriter()..writeInt(3, 1);
     final appList = ProtoWriter()..writeMessage(1, app.bytes);

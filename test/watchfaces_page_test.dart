@@ -1,12 +1,10 @@
-import 'dart:typed_data';
-
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:wristload/application/device_controller.dart';
-import 'package:wristload/domain/watch_app.dart';
-import 'package:wristload/presentation/pages/apps_page.dart';
+import 'package:wristload/domain/watchface.dart';
+import 'package:wristload/presentation/pages/watchfaces_page.dart';
 
 void main() {
   setUp(() {
@@ -17,13 +15,13 @@ void main() {
     debugDefaultTargetPlatformOverride = null;
   });
 
-  testWidgets('快应用页在会话就绪后只自动读取一次，并在断开后为下一会话重置', (tester) async {
-    final controller = _AppsPageController();
+  testWidgets('表盘页在会话就绪后只自动读取一次，并在断开后为下一会话重置', (tester) async {
+    final controller = _WatchfacesPageController();
     addTearDown(controller.dispose);
 
     await tester.pumpWidget(
       MaterialApp(
-        home: Scaffold(body: AppsPage(controller: controller)),
+        home: Scaffold(body: WatchfacesPage(controller: controller)),
       ),
     );
     await tester.pump();
@@ -46,15 +44,15 @@ void main() {
     expect(controller.refreshCalls, 2);
   });
 
-  testWidgets('macOS 快应用卡片会启动对应的设备应用', (tester) async {
-    final controller = _AppsPageController()
-      ..installedWatchApps = <WatchAppItem>[
-        WatchAppItem(
-          packageName: 'com.example.demo',
-          fingerprint: Uint8List.fromList(const [0x01, 0xab]),
-          versionCode: 1,
+  testWidgets('macOS 表盘卡片会切换对应的设备表盘', (tester) async {
+    final controller = _WatchfacesPageController()
+      ..installedWatchfaces = const <WatchfaceItem>[
+        WatchfaceItem(
+          id: '42',
+          name: 'Classic',
+          isCurrent: false,
           canRemove: true,
-          appName: 'Demo',
+          versionCode: 1,
         ),
       ]
       ..setSessionReady(true);
@@ -62,24 +60,24 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: Scaffold(body: AppsPage(controller: controller)),
+        home: Scaffold(body: WatchfacesPage(controller: controller)),
       ),
     );
     await tester.pump();
 
-    expect(find.text('启动'), findsOneWidget);
-    await tester.tap(find.text('启动'));
+    expect(find.text('切换'), findsOneWidget);
+    await tester.tap(find.text('切换'));
     await tester.pump();
 
-    expect(controller.launchCalls, 1);
-    expect(controller.lastLaunched?.packageName, 'com.example.demo');
+    expect(controller.activationCalls, 1);
+    expect(controller.lastActivated?.id, '42');
   });
 }
 
-class _AppsPageController extends DeviceController {
+class _WatchfacesPageController extends DeviceController {
   int refreshCalls = 0;
-  int launchCalls = 0;
-  WatchAppItem? lastLaunched;
+  int activationCalls = 0;
+  WatchfaceItem? lastActivated;
 
   void setSessionReady(bool value) {
     sessionReady = value;
@@ -87,15 +85,15 @@ class _AppsPageController extends DeviceController {
   }
 
   @override
-  Future<List<WatchAppItem>> refreshInstalledWatchApps() async {
+  Future<List<WatchfaceItem>> refreshInstalledWatchfaces() async {
     refreshCalls++;
-    return installedWatchApps;
+    return installedWatchfaces;
   }
 
   @override
-  Future<bool> launchWatchApp(WatchAppItem app) async {
-    launchCalls++;
-    lastLaunched = app;
+  Future<bool> activateWatchface(WatchfaceItem watchface) async {
+    activationCalls++;
+    lastActivated = watchface;
     return true;
   }
 }

@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
@@ -19,8 +18,11 @@ import '../domain/install_checkpoint_store.dart';
 import '../domain/install_metadata_reader.dart';
 import '../domain/install_task.dart';
 import '../domain/watch_app.dart';
+import '../domain/watchface.dart';
 import '../domain/mass_ack_idle_timeout.dart';
 import '../domain/transfer_settings_store.dart';
+import '../domain/rpk_install_limit.dart';
+import '../domain/resource_install_target_policy.dart';
 import '../domain/protocol/auth_handshake.dart';
 import '../domain/protocol/session_cipher.dart';
 import '../domain/protocol/spp_protocol.dart';
@@ -40,6 +42,16 @@ import 'diagnostic_log_service.dart';
 typedef QueueInstallPreparer =
     Future<InstallRequest?> Function(InstallRequest request);
 
+typedef _ManagedSessionAuthenticated =
+    Future<void> Function({
+      required DeviceController session,
+      required Peripheral device,
+      required String advertisedName,
+      required String? authKey,
+    });
+
+typedef _ManagedSessionAuthKeyRejected = Future<void> Function(String deviceId);
+
 class DeviceController extends ChangeNotifier {
   DeviceController({
     BleTransport? transport,
@@ -49,7 +61,10 @@ class DeviceController extends ChangeNotifier {
   }) : _transport = transport ?? BleTransport(logger: logger ?? appLogger),
        _checkpointStore = checkpointStore ?? InstallCheckpointStore(),
        _metadataReader = metadataReader ?? InstallMetadataReader(),
-       _logger = logger ?? appLogger {
+       _logger = logger ?? appLogger,
+       _isManagedSession = false,
+       _onManagedSessionAuthenticated = null,
+       _onManagedSessionAuthKeyRejected = null {
     _authKeyBindingsReady = _restoreAuthKeyBindings();
     unawaited(_authKeyBindingsReady);
     _lastDeviceRestore = _restoreLastDeviceRecord();
@@ -61,11 +76,52 @@ class DeviceController extends ChangeNotifier {
     _bluetoothInitialization = _initializeBluetoothState();
   }
 
+  /// A secondary macOS device owns a complete, independent protocol state
+  /// machine while sharing the app-wide scanner and native RFCOMM pool.
+  ///
+  /// It deliberately does not restore global preferences, create a second
+  /// CoreBluetooth manager, start scanning, or dispose the shared event stream.
+  /// The primary controller remains the sole owner of those application-wide
+  /// lifecycles.
+  DeviceController._managedSession({
+    required BleTransport transport,
+    required InstallCheckpointStore checkpointStore,
+    required InstallMetadataReader metadataReader,
+    required DiagnosticLogService logger,
+    required Future<void> transferSettingsReady,
+    required int segmentIntervalMs,
+    required int massWindowSize,
+    required int rpkMaxPackageBytes,
+    required bool autoTimeSync,
+    required _ManagedSessionAuthenticated onAuthenticated,
+    required _ManagedSessionAuthKeyRejected onAuthKeyRejected,
+  }) : _transport = transport,
+       _checkpointStore = checkpointStore,
+       _metadataReader = metadataReader,
+       _logger = logger,
+       _isManagedSession = true,
+       _onManagedSessionAuthenticated = onAuthenticated,
+       _onManagedSessionAuthKeyRejected = onAuthKeyRejected {
+    this.segmentIntervalMs = segmentIntervalMs;
+    this.massWindowSize = massWindowSize;
+    this.rpkMaxPackageBytes = rpkMaxPackageBytes;
+    this.autoTimeSync = autoTimeSync;
+    _authKeyBindingsReady = Future<void>.value();
+    _lastDeviceRestore = Future<void>.value();
+    _autoConnectPreferenceReady = Future<void>.value();
+    _transferSettingsReady = transferSettingsReady;
+    _checkpointRestore = Future<void>.value();
+    _bluetoothInitialization = Future<void>.value();
+  }
+
   final BleTransport _transport;
   final ConnectionIssueTracker _connectionIssues = ConnectionIssueTracker();
   final InstallCheckpointStore _checkpointStore;
   final InstallMetadataReader _metadataReader;
   final DiagnosticLogService _logger;
+  final bool _isManagedSession;
+  final _ManagedSessionAuthenticated? _onManagedSessionAuthenticated;
+  final _ManagedSessionAuthKeyRejected? _onManagedSessionAuthKeyRejected;
   late final Future<void> _transferSettingsReady;
   late final Future<void> _checkpointRestore;
   late final Future<void> _authKeyBindingsReady;
@@ -108,6 +164,23 @@ class DeviceController extends ChangeNotifier {
   bool _logNotificationPending = false;
   static const _logNotifyInterval = Duration(milliseconds: 100);
   final Map<String, DiscoveredEventArgs> _pendingScanResults = {};
+  final Map<String, DeviceController> _additionalSessions =
+      <String, DeviceController>{};
+  final Map<String, VoidCallback> _additionalSessionListeners =
+      <String, VoidCallback>{};
+  final Map<String, String> _additionalSessionNames = <String, String>{};
+  // Connection preparation metadata is deliberately kept separate from the
+  // child controller's mutable presentation state. A failed pairing/SDP/RFCOMM
+  // attempt clears the child candidate, but an explicit retry still needs the
+  // original opaque CoreBluetooth identity and advertised-name validation.
+  final Map<String, _AdditionalSessionContext> _additionalSessionContexts =
+      <String, _AdditionalSessionContext>{};
+  // A multi-target installation is only an orchestration layer. Each value
+  // remains a full protocol controller with its own cipher, ACK waiters,
+  // sequence numbers and checkpoint store. The primary controller is stored
+  // under [_primaryInstallSessionKey]; children use their normalized UUID.
+  final Set<String> _multiInstallSessionIds = <String>{};
+  static const _primaryInstallSessionKey = '__primary__';
 
   List<DiscoveredEventArgs> scanResults = const [];
   Peripheral? connectedDevice;
@@ -136,6 +209,9 @@ class DeviceController extends ChangeNotifier {
   List<WatchAppItem> installedWatchApps = const [];
   bool watchAppsLoading = false;
   String? watchAppsError;
+  List<WatchfaceItem> installedWatchfaces = const [];
+  bool watchfacesLoading = false;
+  String? watchfacesError;
   int _sessionEpoch = 0;
   // A quick-app read and an uninstall both own the same visible loading/error
   // state. A disconnect clears [watchAppsLoading] immediately so a new
@@ -145,6 +221,13 @@ class DeviceController extends ChangeNotifier {
   int _quickAppReadGeneration = 0;
   int _quickAppOperationGeneration = 0;
   int? _quickAppsLoadedSessionEpoch;
+  // Watchface list reads have a shared completion because an installation
+  // preflight needs the device's authoritative list, not a stale cache while
+  // the management page is already refreshing it.
+  int _watchfaceReadGeneration = 0;
+  int _watchfaceOperationGeneration = 0;
+  int? _watchfacesLoadedSessionEpoch;
+  Completer<List<WatchfaceItem>>? _watchfaceReadCompleter;
   int? _statusRefreshEpoch;
   LastDeviceRecord? _lastDeviceRecord;
   String? _requestedSavedDeviceId;
@@ -159,6 +242,10 @@ class DeviceController extends ChangeNotifier {
   /// presenting the outcome of an operation from a previous connection.
   int get quickAppSessionEpoch => _sessionEpoch;
 
+  /// Monotonic identity of the authenticated connection used by watchface
+  /// management and duplicate-ID install checks.
+  int get watchfaceSessionEpoch => _sessionEpoch;
+
   /// True after this authenticated session has produced a device list, or an
   /// uninstall request has been transport-confirmed and applied locally.
   /// The page uses this to avoid issuing another automatic command merely
@@ -166,6 +253,11 @@ class DeviceController extends ChangeNotifier {
   /// available.
   bool get quickAppsLoadedForCurrentSession =>
       _quickAppsLoadedSessionEpoch == _sessionEpoch;
+
+  /// True after the current authenticated session has read the device-side
+  /// watchface list or has confirmed a watchface deletion.
+  bool get watchfacesLoadedForCurrentSession =>
+      _watchfacesLoadedSessionEpoch == _sessionEpoch;
 
   /// A pending user-facing connection notice. Diagnostic details remain in
   /// [logs] and are never used as presentation state.
@@ -198,6 +290,13 @@ class DeviceController extends ChangeNotifier {
     _quickAppsLoadedSessionEpoch = null;
     watchAppsLoading = false;
     watchAppsError = null;
+    _watchfaceReadGeneration++;
+    _watchfaceOperationGeneration++;
+    _watchfacesLoadedSessionEpoch = null;
+    _watchfaceReadCompleter = null;
+    installedWatchfaces = const [];
+    watchfacesLoading = false;
+    watchfacesError = null;
     // A recovery task belongs to the session that scheduled it.  Invalidating
     // the session must also prevent an older task from clearing state owned by
     // a newer connection.
@@ -243,6 +342,14 @@ class DeviceController extends ChangeNotifier {
       ..stage = QueueStage.waiting
       ..message = null;
     notifyListeners();
+    // A multi-target request owns a complete authenticated session for every
+    // selected device. Restoring only the primary controller here would both
+    // be misleading and prevent a valid secondary-only retry. The dispatcher
+    // below revalidates each selected session before any bytes are sent.
+    if (!_isManagedSession && entry.request.targetDeviceIds.isNotEmpty) {
+      await runQueue(preferredEntry: entry);
+      return;
+    }
     if (!await _restoreInstallSessionForRetry()) {
       if (installQueue.contains(entry) && entry.stage == QueueStage.waiting) {
         entry
@@ -421,12 +528,21 @@ class DeviceController extends ChangeNotifier {
   /// control or ACK validation.
   int segmentIntervalMs = 5;
   int massWindowSize = 50;
+  int rpkMaxPackageBytes = RpkInstallLimit.defaultBytes;
+  ResourceInstallTargetPolicy resourceInstallTargetPolicy =
+      const ResourceInstallTargetPolicy();
   bool autoTimeSync = false;
+
+  /// macOS-only opt-in for replacing a same-ID watchface without showing the
+  /// per-install confirmation. The preflight still reads the real device list
+  /// and waits for an explicit deletion result before allowing upload.
+  bool forceWatchfaceInstall = false;
 
   /// Whether startup should reconnect the persisted last authenticated device.
   /// Enabled by default to preserve the historical Wristload behavior.
   bool autoConnectLastDeviceEnabled = AutoConnectPreferenceStore.defaultEnabled;
   bool _autoTimeSyncChangedByUser = false;
+  bool _forceWatchfaceInstallChangedByUser = false;
 
   Future<void> get autoConnectPreferenceReady => _autoConnectPreferenceReady;
 
@@ -449,11 +565,15 @@ class DeviceController extends ChangeNotifier {
   }
 
   void _persistTransferSettings() {
+    if (_isManagedSession) return;
     unawaited(
       _transferSettings.write(
         segmentIntervalMs: segmentIntervalMs,
         massWindowSize: massWindowSize,
         autoTimeSync: autoTimeSync,
+        rpkMaxPackageBytes: rpkMaxPackageBytes,
+        forceWatchfaceInstall: forceWatchfaceInstall,
+        resourceInstallTargetPolicy: resourceInstallTargetPolicy,
       ),
     );
   }
@@ -462,6 +582,7 @@ class DeviceController extends ChangeNotifier {
     if (autoTimeSync == value) return;
     _autoTimeSyncChangedByUser = true;
     autoTimeSync = value;
+    _propagateTransferSettingsToManagedSessions();
     _persistTransferSettings();
     _log('自动同步时间与时区已${value ? '开启' : '关闭'}。');
     notifyListeners();
@@ -470,10 +591,20 @@ class DeviceController extends ChangeNotifier {
     }
   }
 
+  void setForceWatchfaceInstall(bool value) {
+    if (!_isMacOS || forceWatchfaceInstall == value) return;
+    _forceWatchfaceInstallChangedByUser = true;
+    forceWatchfaceInstall = value;
+    _persistTransferSettings();
+    _log('强制安装表盘已${value ? '开启' : '关闭'}。');
+    notifyListeners();
+  }
+
   void setSegmentIntervalMs(int value) {
     final clamped = value.clamp(1, 20);
     if (segmentIntervalMs == clamped) return;
     segmentIntervalMs = clamped;
+    _propagateTransferSettingsToManagedSessions();
     _persistTransferSettings();
     _log('传输窗口间隔已设为 $clamped ms，下一个发送窗口起生效。');
     notifyListeners();
@@ -483,6 +614,7 @@ class DeviceController extends ChangeNotifier {
     final clamped = value.clamp(1, 50).toInt();
     if (massWindowSize == clamped) return;
     massWindowSize = clamped;
+    _propagateTransferSettingsToManagedSessions();
     _persistTransferSettings();
     _log(
       clamped <= 3
@@ -492,10 +624,529 @@ class DeviceController extends ChangeNotifier {
     notifyListeners();
   }
 
+  void setRpkMaxPackageBytes(int value) {
+    final clamped = value
+        .clamp(RpkInstallLimit.minimumBytes, RpkInstallLimit.maximumBytes)
+        .toInt();
+    if (rpkMaxPackageBytes == clamped) return;
+    rpkMaxPackageBytes = clamped;
+    _propagateTransferSettingsToManagedSessions();
+    RpkInstallLimit.setSourceBytes(clamped);
+    _persistTransferSettings();
+    _log('RPK 安装包大小上限已设为 ${_formatBytes(clamped)}。');
+    notifyListeners();
+  }
+
+  void setResourceInstallTargetPolicy(ResourceInstallTargetPolicy value) {
+    if (resourceInstallTargetPolicy.mode == value.mode &&
+        resourceInstallTargetPolicy.automaticDeviceId ==
+            value.automaticDeviceId) {
+      return;
+    }
+    resourceInstallTargetPolicy = value;
+    _persistTransferSettings();
+    notifyListeners();
+  }
+
+  /// Authenticated sessions available to resource routing. The first entry is
+  /// retained for the existing single-session protocol path. On macOS, every
+  /// additional RFCOMM channel has an isolated protocol controller and is
+  /// surfaced here only after f=27 has authenticated that particular device.
+  List<ResourceInstallDevice> get resourceInstallDevices {
+    final devices = <ResourceInstallDevice>[];
+    final primary = connectedDevice;
+    if (isConnected && primary != null) {
+      devices.add(
+        ResourceInstallDevice(
+          id: primary.uuid.toString(),
+          name:
+              (connectedDeviceName ?? connectedProfile?.displayName ?? '已连接设备')
+                  .trim(),
+        ),
+      );
+    }
+    for (final entry in _additionalSessions.entries) {
+      final session = entry.value;
+      final device = session.connectedDevice;
+      if (!session.isConnected || device == null) continue;
+      devices.add(
+        ResourceInstallDevice(
+          id: device.uuid.toString(),
+          name:
+              (session.connectedDeviceName ??
+                      session.connectedProfile?.displayName ??
+                      '已连接设备')
+                  .trim(),
+        ),
+      );
+    }
+    return List<ResourceInstallDevice>.unmodifiable(devices);
+  }
+
+  /// Extra macOS device sessions, including a pending or failed attempt so the
+  /// home page can expose its own retry/disconnect controls without affecting
+  /// the primary watch.
+  List<DeviceSessionView> get additionalDeviceSessions =>
+      List<DeviceSessionView>.unmodifiable(
+        _additionalSessions.entries.map(
+          (entry) => DeviceSessionView(
+            id: entry.key,
+            name:
+                _additionalSessionNames[entry.key] ??
+                entry.value.connectedDeviceName ??
+                '已连接设备',
+            controller: entry.value,
+            isPrimary: false,
+          ),
+        ),
+      );
+
+  List<DeviceSessionView> get connectedDeviceSessions {
+    final sessions = <DeviceSessionView>[];
+    final primary = connectedDevice;
+    if (isConnected && primary != null) {
+      sessions.add(
+        DeviceSessionView(
+          id: primary.uuid.toString(),
+          name:
+              (connectedDeviceName ?? connectedProfile?.displayName ?? '已连接设备')
+                  .trim(),
+          controller: this,
+          isPrimary: true,
+        ),
+      );
+    }
+    sessions.addAll(
+      additionalDeviceSessions.where(
+        (session) => session.controller.isConnected,
+      ),
+    );
+    return List<DeviceSessionView>.unmodifiable(sessions);
+  }
+
+  /// Resolves an authenticated device identity to the protocol controller that
+  /// owns its RFCOMM channel. It is intentionally read-only: callers cannot
+  /// create a second controller for an existing device by looking it up.
+  DeviceController? sessionForDeviceId(String deviceId) {
+    final normalized = _sessionKey(deviceId);
+    final primary = connectedDevice;
+    if (primary != null && _sessionKey(primary.uuid.toString()) == normalized) {
+      return this;
+    }
+    return _additionalSessions[normalized];
+  }
+
+  /// Resolves validation against the actual selected device rather than always
+  /// using the primary watch profile. This matters when multiple watches have
+  /// different screen resolutions.
+  String? watchfaceCompatibilityErrorForDevice(
+    InstallMetadata metadata,
+    String deviceId,
+  ) => sessionForDeviceId(deviceId)?.watchfaceCompatibilityError(metadata);
+
+  bool requiresUnsupportedLuaConfirmationForDevice(
+    InstallMetadata metadata,
+    String deviceId,
+  ) =>
+      sessionForDeviceId(
+        deviceId,
+      )?.requiresUnsupportedLuaConfirmation(metadata) ??
+      false;
+
+  bool get supportsAdditionalMacOSDevices =>
+      !_isManagedSession && defaultTargetPlatform == TargetPlatform.macOS;
+
+  bool isSessionManagedByThisController(String deviceId) =>
+      _additionalSessions.containsKey(_sessionKey(deviceId));
+
+  bool isDeviceAlreadyInSession(String deviceId) {
+    final primary = connectedDevice;
+    if (primary != null && _sameDeviceId(primary.uuid.toString(), deviceId)) {
+      return true;
+    }
+    return _additionalSessions.containsKey(_sessionKey(deviceId));
+  }
+
+  /// The generic scanner also exposes older experimental models. They must not
+  /// enter the macOS multi-session RFCOMM pool until their own protocol is
+  /// verified, so the add-device UI only offers authenticated V2 candidates.
+  bool isAdditionalMacOSDeviceCandidate(DiscoveredEventArgs result) {
+    if (!supportsAdditionalMacOSDevices) return false;
+    final name = (result.advertisement.name ?? '').trim();
+    final profile = DeviceProfile.matchAdvertisementName(name);
+    return profile?.generation == ProtocolGeneration.v2Vela &&
+        !isDeviceAlreadyInSession(result.peripheral.uuid.toString());
+  }
+
+  String _sessionKey(String value) => value.trim().toLowerCase();
+
+  void _propagateTransferSettingsToManagedSessions() {
+    if (_isManagedSession) return;
+    for (final session in _additionalSessions.values) {
+      session
+        ..segmentIntervalMs = segmentIntervalMs
+        ..massWindowSize = massWindowSize
+        ..rpkMaxPackageBytes = rpkMaxPackageBytes
+        ..autoTimeSync = autoTimeSync;
+    }
+  }
+
+  /// Starts an additional macOS V2 session without disturbing the primary
+  /// device. The native transport serializes only system pairing UI; after
+  /// pairing, every device retains its own SDP query and RFCOMM channel.
+  Future<bool> connectAdditional(
+    DiscoveredEventArgs result, {
+    String? authKeyOverride,
+  }) async {
+    if (!supportsAdditionalMacOSDevices) {
+      error = '多设备连接当前仅由 macOS 原生 RFCOMM 传输支持。';
+      _log(error!);
+      notifyListeners();
+      return false;
+    }
+    // A scanned result may outlive a TCC state transition. Mirror the saved
+    // device path and do not create a secondary native pairing request until
+    // macOS has confirmed Bluetooth authorization for this process.
+    await _bluetoothInitialization;
+    if (_disposed || !_macOSBluetoothAuthorization.isAuthorized) {
+      error = 'macOS 蓝牙权限尚未授权，无法连接附加设备。';
+      _log(error!);
+      notifyListeners();
+      return false;
+    }
+    final advertisedName = (result.advertisement.name ?? '').trim();
+    final profile = DeviceProfile.matchAdvertisementName(advertisedName);
+    final deviceId = result.peripheral.uuid.toString();
+    if (profile == null || profile.generation != ProtocolGeneration.v2Vela) {
+      error = '只能将已识别的现代 V2 设备加入多设备连接。';
+      _log(error!);
+      notifyListeners();
+      return false;
+    }
+    if (isDeviceAlreadyInSession(deviceId)) {
+      error = '该设备已经在当前连接列表中。';
+      _log(error!);
+      notifyListeners();
+      return false;
+    }
+    final supplied = authKeyOverride?.trim().toLowerCase();
+    if (supplied != null && !_authKeyPattern.hasMatch(supplied)) {
+      error = 'authkey 必须是 32 位十六进制字符。';
+      _log(error!);
+      notifyListeners();
+      return false;
+    }
+    final key = supplied ?? await readAuthKeyFor(deviceId);
+    if (key == null) {
+      error = '该设备缺少可用 authkey；请输入后再连接。';
+      _log(error!);
+      notifyListeners();
+      return false;
+    }
+    await stopScan();
+    return _startAdditionalDesktopV2(
+      peripheral: result.peripheral,
+      profile: profile,
+      advertisedName: advertisedName,
+      authKeyValue: key,
+      directIdentity: false,
+    );
+  }
+
+  /// Reuses a confirmed macOS classic identity for a saved additional device.
+  Future<bool> connectAdditionalSavedDevice(
+    AuthKeyBinding binding, {
+    String? authKeyOverride,
+  }) async {
+    if (!supportsAdditionalMacOSDevices) return false;
+    await _bluetoothInitialization;
+    if (_disposed || !_macOSBluetoothAuthorization.isAuthorized) {
+      error = 'macOS 蓝牙权限尚未授权，无法连接附加设备。';
+      _log(error!);
+      notifyListeners();
+      return false;
+    }
+    final id = binding.id.trim();
+    if (id.isEmpty || isDeviceAlreadyInSession(id)) {
+      error = id.isEmpty ? '已保存设备缺少有效标识。' : '该设备已经在当前连接列表中。';
+      _log(error!);
+      notifyListeners();
+      return false;
+    }
+    final profile = DeviceProfile.matchAdvertisementName(binding.name);
+    UUID? uuid;
+    try {
+      uuid = UUID.fromString(id);
+    } on Object {
+      uuid = null;
+    }
+    if (uuid == null ||
+        profile == null ||
+        profile.generation != ProtocolGeneration.v2Vela) {
+      error = '该已保存设备不能用于 macOS 多设备 RFCOMM 直连。';
+      _log(error!);
+      notifyListeners();
+      return false;
+    }
+    final supplied = authKeyOverride?.trim().toLowerCase();
+    if (supplied != null && !_authKeyPattern.hasMatch(supplied)) {
+      error = 'authkey 必须是 32 位十六进制字符。';
+      _log(error!);
+      notifyListeners();
+      return false;
+    }
+    final key = supplied ?? await readAuthKeyFor(id);
+    if (key == null) {
+      error = '已保存设备缺少可用 authkey，请手动输入后再连接。';
+      _log(error!);
+      notifyListeners();
+      return false;
+    }
+    await stopScan();
+    return _startAdditionalDesktopV2(
+      peripheral: _PersistedPeripheral(uuid),
+      profile: profile,
+      advertisedName: binding.name.trim(),
+      authKeyValue: key,
+      directIdentity: true,
+    );
+  }
+
+  Future<bool> _startAdditionalDesktopV2({
+    required Peripheral peripheral,
+    required DeviceProfile profile,
+    required String advertisedName,
+    required String authKeyValue,
+    required bool directIdentity,
+  }) async {
+    final id = peripheral.uuid.toString();
+    final key = _sessionKey(id);
+    if (_disposed || _additionalSessions.containsKey(key)) return false;
+    final session = DeviceController._managedSession(
+      transport: _transport,
+      checkpointStore: InstallCheckpointStore(scope: id),
+      metadataReader: _metadataReader,
+      logger: _logger,
+      transferSettingsReady: _transferSettingsReady,
+      segmentIntervalMs: segmentIntervalMs,
+      massWindowSize: massWindowSize,
+      rpkMaxPackageBytes: rpkMaxPackageBytes,
+      autoTimeSync: autoTimeSync,
+      onAuthenticated: _persistManagedSessionAuthenticated,
+      onAuthKeyRejected: _forgetManagedSessionAuthKey,
+    );
+    _registerAdditionalSession(
+      key: key,
+      name: advertisedName,
+      session: session,
+    );
+    _additionalSessionContexts[key] = _AdditionalSessionContext(
+      peripheral: peripheral,
+      profile: profile,
+      advertisedName: advertisedName,
+      directIdentity: directIdentity,
+    );
+    final accepted = await session.setAuthKey(authKeyValue, deviceId: id);
+    if (!accepted) {
+      _removeAdditionalSession(key, dispose: true);
+      return false;
+    }
+    // A parent dispose or an explicit device removal can interleave with the
+    // asynchronous credential setup. Do not restart pairing for a child whose
+    // owner has already released the session slot.
+    if (_disposed ||
+        session._disposed ||
+        !identical(_additionalSessions[key], session)) {
+      return false;
+    }
+    _prepareAdditionalSessionCandidate(
+      session: session,
+      peripheral: peripheral,
+      profile: profile,
+      advertisedName: advertisedName,
+    );
+    session._log('已作为附加设备加入 macOS 独立 RFCOMM 会话。');
+    session.notifyListeners();
+    try {
+      await session._connectDesktopV2(
+        peripheral,
+        profile,
+        directIdentity: directIdentity,
+      );
+      if (!session.isConnected && session.error != null) {
+        error = '附加设备连接失败：' + session.error!;
+        _log(error!);
+      }
+      return session.isConnected;
+    } finally {
+      notifyListeners();
+    }
+  }
+
+  void _registerAdditionalSession({
+    required String key,
+    required String name,
+    required DeviceController session,
+  }) {
+    final listener = () {
+      if (!_disposed) notifyListeners();
+    };
+    _additionalSessions[key] = session;
+    _additionalSessionNames[key] = name.trim().isEmpty ? '已连接设备' : name.trim();
+    _additionalSessionListeners[key] = listener;
+    session.addListener(listener);
+    notifyListeners();
+  }
+
+  void _removeAdditionalSession(String key, {required bool dispose}) {
+    final session = _additionalSessions.remove(key);
+    final listener = _additionalSessionListeners.remove(key);
+    _additionalSessionNames.remove(key);
+    _additionalSessionContexts.remove(key);
+    _multiInstallSessionIds.remove(key);
+    if (session != null && listener != null) session.removeListener(listener);
+    if (dispose && session != null) session.dispose();
+    if (!_disposed) notifyListeners();
+  }
+
+  /// Disconnects only one secondary RFCOMM session. Other watches keep their
+  /// raw transport, authenticated cipher, and in-flight transfer untouched.
+  Future<void> disconnectAdditionalDevice(String deviceId) async {
+    final key = _sessionKey(deviceId);
+    final session = _additionalSessions[key];
+    if (session == null) return;
+    await session.disconnect();
+    _removeAdditionalSession(key, dispose: true);
+  }
+
+  /// Re-runs the complete device-scoped macOS preparation sequence for one
+  /// failed or disconnected secondary session. A replacement authkey, when
+  /// supplied, is scoped to this device only and is never copied to another
+  /// live session.
+  Future<void> reconnectAdditionalDevice(
+    String deviceId, {
+    String? authKeyOverride,
+  }) async {
+    final key = _sessionKey(deviceId);
+    final session = _additionalSessions[key];
+    final context = _additionalSessionContexts[key];
+    if (session == null || context == null || session.isConnectionBusy) return;
+
+    // An authkey rejected by f=27 is intentionally removed from the child and
+    // secure storage. Never silently retry with another device's credential.
+    final supplied = authKeyOverride?.trim().toLowerCase();
+    if (supplied != null && !_authKeyPattern.hasMatch(supplied)) {
+      session.error = 'authkey 必须是 32 位十六进制字符。';
+      session._log(session.error!);
+      session.notifyListeners();
+      return;
+    }
+    final authKey =
+        supplied ??
+        session.authKey ??
+        await readAuthKeyFor(context.peripheral.uuid.toString());
+    if (authKey == null || !_authKeyPattern.hasMatch(authKey)) {
+      session.error = '该设备的 authkey 已失效，请重新输入后再连接。';
+      session._log(session.error!);
+      session.notifyListeners();
+      return;
+    }
+
+    // Do not use the generic child reconnect path here. It only knows how to
+    // reopen an existing RFCOMM channel, while a failed first attempt may have
+    // lost its candidate fields. Re-run the complete macOS preparation with
+    // the device-scoped native connection-pool entry.
+    await session.disconnect();
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+    if (_disposed ||
+        session._disposed ||
+        !identical(_additionalSessions[key], session)) {
+      return;
+    }
+    if (!await session.setAuthKey(
+      authKey,
+      deviceId: context.peripheral.uuid.toString(),
+    )) {
+      return;
+    }
+    _prepareAdditionalSessionCandidate(
+      session: session,
+      peripheral: context.peripheral,
+      profile: context.profile,
+      advertisedName: context.advertisedName,
+    );
+    session._log('正在重试附加设备连接：重新执行 macOS 身份准备、SDP、RFCOMM 与鉴权。');
+    try {
+      await session._connectDesktopV2(
+        context.peripheral,
+        context.profile,
+        directIdentity: context.directIdentity,
+      );
+    } finally {
+      notifyListeners();
+    }
+  }
+
+  void _prepareAdditionalSessionCandidate({
+    required DeviceController session,
+    required Peripheral peripheral,
+    required DeviceProfile profile,
+    required String advertisedName,
+  }) {
+    final id = peripheral.uuid.toString();
+    session
+      .._connectionIssues.selectTarget(id)
+      .._authKeyRejectedEpoch = null
+      .._resumeScanningAfterConnectionEnd = false
+      .._clearConnectionCandidate()
+      .._connectionAttemptInProgress = true
+      .._connectionTearingDown = false
+      .._lastPeripheral = peripheral
+      ..connectedDeviceName = advertisedName
+      ..connectedClassicAddress = null
+      ..connectedProfile = profile;
+  }
+
+  Future<void> _persistManagedSessionAuthenticated({
+    required DeviceController session,
+    required Peripheral device,
+    required String advertisedName,
+    required String? authKey,
+  }) {
+    final normalized = authKey?.trim().toLowerCase();
+    final id = device.uuid.toString();
+    return _enqueueSavedDeviceMutation(() async {
+      final identityConfirmed = defaultTargetPlatform == TargetPlatform.macOS
+          ? await _confirmMacOSRfcommIdentity(device, advertisedName)
+          : false;
+      final context = _additionalSessionContexts[_sessionKey(id)];
+      if (context != null && identityConfirmed) context.directIdentity = true;
+      if (normalized != null && _authKeyPattern.hasMatch(normalized)) {
+        await _rememberAuthKeyBindingNow(
+          id: id,
+          name: advertisedName.trim().isEmpty ? '已保存设备' : advertisedName,
+          normalizedKey: normalized,
+        );
+      }
+      _additionalSessionNames[_sessionKey(id)] = advertisedName.trim().isEmpty
+          ? '已连接设备'
+          : advertisedName.trim();
+      notifyListeners();
+    });
+  }
+
+  Future<void> _forgetManagedSessionAuthKey(String deviceId) async {
+    await forgetAuthKeyForDevice(deviceId, clearActiveKey: false);
+  }
+
+  String _formatBytes(int bytes) => '${(bytes / (1024 * 1024)).round()} MB';
+
   Future<void> _restoreTransferSettings() async {
     final saved = await _transferSettings.read();
     final interval = saved.segmentIntervalMs;
     final window = saved.massWindowSize;
+    final rpkLimit = saved.rpkMaxPackageBytes;
+    final targetMode = saved.resourceInstallTargetMode;
     if (!_autoTimeSyncChangedByUser) {
       autoTimeSync = saved.autoTimeSync ?? false;
     }
@@ -505,6 +1156,22 @@ class DeviceController extends ChangeNotifier {
     if (window != null && window >= 1 && window <= 50) {
       massWindowSize = window;
     }
+    if (rpkLimit != null) {
+      rpkMaxPackageBytes = rpkLimit
+          .clamp(RpkInstallLimit.minimumBytes, RpkInstallLimit.maximumBytes)
+          .toInt();
+      RpkInstallLimit.setSourceBytes(rpkMaxPackageBytes);
+    }
+    if (_isMacOS && !_forceWatchfaceInstallChangedByUser) {
+      forceWatchfaceInstall = saved.forceWatchfaceInstall ?? false;
+    }
+    if (targetMode != null) {
+      resourceInstallTargetPolicy = ResourceInstallTargetPolicy(
+        mode: targetMode,
+        automaticDeviceId: saved.automaticInstallDeviceId,
+      );
+    }
+    _propagateTransferSettingsToManagedSessions();
     notifyListeners();
   }
 
@@ -637,6 +1304,13 @@ class DeviceController extends ChangeNotifier {
     installedWatchApps = const [];
     watchAppsLoading = false;
     watchAppsError = null;
+    _watchfaceReadGeneration++;
+    _watchfaceOperationGeneration++;
+    _watchfacesLoadedSessionEpoch = null;
+    _watchfaceReadCompleter = null;
+    installedWatchfaces = const [];
+    watchfacesLoading = false;
+    watchfacesError = null;
     sessionReady = false;
     _authenticatedAt = null;
     _resumeAuthenticatedSession = false;
@@ -1249,6 +1923,19 @@ class DeviceController extends ChangeNotifier {
     required String advertisedName,
     required String? key,
   }) {
+    // A managed child must never persist its empty local binding list. The
+    // primary controller serializes the shared secure-store metadata so one
+    // child's f=27 completion cannot erase devices saved by another session.
+    if (_isManagedSession) {
+      final callback = _onManagedSessionAuthenticated;
+      if (callback == null) return Future<void>.value();
+      return callback(
+        session: this,
+        device: device,
+        advertisedName: advertisedName,
+        authKey: key,
+      );
+    }
     final normalized = key?.trim().toLowerCase();
     _authKeyPersistenceGeneration++;
     return _enqueueSavedDeviceMutation(() async {
@@ -1271,7 +1958,17 @@ class DeviceController extends ChangeNotifier {
     });
   }
 
-  bool get installInProgress => _installInProgress;
+  bool get installInProgress {
+    if (_installInProgress) return true;
+    if (_isManagedSession || _multiInstallSessionIds.isEmpty) return false;
+    for (final sessionKey in _multiInstallSessionIds) {
+      final session = sessionKey == _primaryInstallSessionKey
+          ? this
+          : _additionalSessions[sessionKey];
+      if (session?._installInProgress ?? false) return true;
+    }
+    return false;
+  }
 
   bool get timeSyncInProgress => _timeSyncInProgress;
 
@@ -1385,6 +2082,59 @@ class DeviceController extends ChangeNotifier {
   }
 
   void _logQuickAppRead(
+    String message, {
+    DiagnosticLogLevel level = DiagnosticLogLevel.info,
+    required String event,
+    Map<String, Object?> fields = const <String, Object?>{},
+  }) {
+    final entry = switch (level) {
+      DiagnosticLogLevel.trace => _logger.trace(
+        message,
+        category: DiagnosticLogCategory.communication,
+        component: 'wristload.DeviceManager',
+        event: event,
+        fields: fields,
+      ),
+      DiagnosticLogLevel.debug => _logger.debug(
+        message,
+        category: DiagnosticLogCategory.communication,
+        component: 'wristload.DeviceManager',
+        event: event,
+        fields: fields,
+      ),
+      DiagnosticLogLevel.info => _logger.info(
+        message,
+        category: DiagnosticLogCategory.communication,
+        component: 'wristload.DeviceManager',
+        event: event,
+        fields: fields,
+      ),
+      DiagnosticLogLevel.warning => _logger.warning(
+        message,
+        category: DiagnosticLogCategory.communication,
+        component: 'wristload.DeviceManager',
+        event: event,
+        fields: fields,
+      ),
+      DiagnosticLogLevel.error => _logger.error(
+        message,
+        category: DiagnosticLogCategory.communication,
+        component: 'wristload.DeviceManager',
+        event: event,
+        fields: fields,
+      ),
+      DiagnosticLogLevel.fatal => _logger.fatal(
+        message,
+        category: DiagnosticLogCategory.communication,
+        component: 'wristload.DeviceManager',
+        event: event,
+        fields: fields,
+      ),
+    };
+    _appendLogEntry(entry);
+  }
+
+  void _logWatchface(
     String message, {
     DiagnosticLogLevel level = DiagnosticLogLevel.info,
     required String event,
@@ -2331,15 +3081,23 @@ class DeviceController extends ChangeNotifier {
       _sppSub = null;
       if (!_isCurrentSppConnection(connectionEpoch)) return;
       _transport.listenRfcommData();
-      _sppSub = _transport.rfcommData.listen(
-        (data) => _handleSppData(data, connectionEpoch),
-        onError: (Object exception, StackTrace stackTrace) {
-          if (!_isCurrentSppConnection(connectionEpoch)) return;
-          _log('RFCOMM 数据流错误：$exception');
-          _handleRfcommEof(connectionEpoch);
-        },
-        onDone: () => _handleRfcommEof(connectionEpoch),
-      );
+      _sppSub = _transport
+          .rfcommDataFor(device.uuid)
+          .listen(
+            (data) => _handleSppData(data, connectionEpoch),
+            onError: (Object exception, StackTrace stackTrace) {
+              if (!_isCurrentSppConnection(connectionEpoch)) return;
+              _log('RFCOMM 数据流错误：$exception');
+              _handleRfcommEof(connectionEpoch);
+            },
+            onDone: () => _handleRfcommEof(connectionEpoch),
+          );
+      await _sppClosedSub?.cancel();
+      _sppClosedSub = _transport.rfcommClosedFor(device.uuid).listen((event) {
+        if (!_isCurrentSppConnection(connectionEpoch)) return;
+        _log('RFCOMM 通道已关闭：${event.message ?? event.code ?? '远端关闭'}。');
+        _handleRfcommEof(connectionEpoch);
+      });
       _log('正在建立经典蓝牙 RFCOMM 链路，并独立检查 SPP 配对状态…');
       final platformName = switch (defaultTargetPlatform) {
         TargetPlatform.macOS => 'macOS',
@@ -2388,6 +3146,7 @@ class DeviceController extends ChangeNotifier {
   }
 
   StreamSubscription<Uint8List>? _sppSub;
+  StreamSubscription<RfcommClosedEvent>? _sppClosedSub;
   Future<void>? _sppConnectInFlight;
   Accumulator _sppAcc = Accumulator();
   int _sppSeq = 0;
@@ -2739,6 +3498,8 @@ class DeviceController extends ChangeNotifier {
     // be able to restart a handshake or re-publish a candidate device.
     final subscription = _sppSub;
     _sppSub = null;
+    final closedSubscription = _sppClosedSub;
+    _sppClosedSub = null;
     final invalidatedEpoch = ++_sppConnectionEpoch;
     _connectionTearingDown = true;
     sessionReady = false;
@@ -2760,6 +3521,13 @@ class DeviceController extends ChangeNotifier {
           await subscription.cancel();
         } on Object catch (cancelError) {
           _log('RFCOMM 数据流取消失败：$cancelError');
+        }
+      }
+      if (closedSubscription != null) {
+        try {
+          await closedSubscription.cancel();
+        } on Object catch (cancelError) {
+          _log('RFCOMM 关闭事件流取消失败：$cancelError');
         }
       }
       await _transport
@@ -2793,7 +3561,18 @@ class DeviceController extends ChangeNotifier {
       targetName: name,
     );
     if (published) notifyListeners();
-    await forgetAuthKeyForDevice(id, clearActiveKey: true);
+    if (_isManagedSession) {
+      // A managed session has its own in-memory authkey but deliberately no
+      // copy of the shared binding list. Let the primary controller remove
+      // only this device's persisted key; calling this child's generic
+      // deletion path would overwrite the parent's other saved bindings.
+      authKey = null;
+      _authKeyDeviceId = null;
+      final callback = _onManagedSessionAuthKeyRejected;
+      if (callback != null) await callback(id);
+    } else {
+      await forgetAuthKeyForDevice(id, clearActiveKey: true);
+    }
     await _cleanupFailedSppConnect(
       device,
       StateError('设备拒绝 authkey 身份验证：$reason'),
@@ -3033,7 +3812,7 @@ class DeviceController extends ChangeNotifier {
     }
   }
 
-  Future<void> _confirmMacOSRfcommIdentity(
+  Future<bool> _confirmMacOSRfcommIdentity(
     Peripheral device,
     String advertisedName,
   ) async {
@@ -3043,8 +3822,10 @@ class DeviceController extends ChangeNotifier {
         advertisedName: advertisedName,
       );
       _log('已在 authkey 鉴权成功后保存 macOS 经典蓝牙设备关联。');
+      return true;
     } on Object catch (exception) {
       _log('macOS 经典蓝牙设备关联未持久化：$exception');
+      return false;
     }
   }
 
@@ -3379,6 +4160,8 @@ class DeviceController extends ChangeNotifier {
     _clearSppHandshakeState();
     final sppSubscription = _sppSub;
     _sppSub = null;
+    final sppClosedSubscription = _sppClosedSub;
+    _sppClosedSub = null;
     // The selected scan result may still be waiting on the macOS pairing
     // sheet, in which case only _lastPeripheral is populated. Capture it
     // before clearing presentation state so an explicit cancel can still
@@ -3408,7 +4191,14 @@ class DeviceController extends ChangeNotifier {
           _log('断开时取消 RFCOMM 数据流失败：$exception');
         }
       }
-      if (_installInProgress) {
+      if (sppClosedSubscription != null) {
+        try {
+          await sppClosedSubscription.cancel();
+        } on Object catch (exception) {
+          _log('断开时取消 RFCOMM 关闭事件流失败：$exception');
+        }
+      }
+      if (installInProgress) {
         await cancelInstall();
         _log('RFCOMM/GATT 正在断开：安装已停止，设备可能保留部分数据。');
       }
@@ -3502,7 +4292,191 @@ class DeviceController extends ChangeNotifier {
     }
   }
 
+  /// Starts the selected sessions without sharing any protocol state between
+  /// devices. Each child calls the same established single-session installer
+  /// used by the primary connection, but with an empty target list so it can
+  /// never recursively dispatch to another device.
+  Future<void> _startInstallForTargets(InstallRequest request) async {
+    final normalizedIds = <String>[];
+    final seenIds = <String>{};
+    for (final rawId in request.targetDeviceIds) {
+      final id = rawId.trim();
+      final normalized = _sessionKey(id);
+      if (id.isEmpty || !seenIds.add(normalized)) continue;
+      normalizedIds.add(id);
+    }
+    if (normalizedIds.isEmpty) {
+      await _startInstallSingle(
+        request.copyWith(targetDeviceIds: const <String>[]),
+      );
+      return;
+    }
+
+    // Keep the original target set as the retry contract. Per-device install
+    // controllers intentionally receive a local request with an empty target
+    // list so they cannot recursively fan out again.
+    _lastInstallRequest = request;
+
+    if (_multiInstallSessionIds.isNotEmpty ||
+        _installInProgress ||
+        _additionalSessions.values.any(
+          (session) => session._installInProgress,
+        )) {
+      error = '安装被拒绝：已有设备正在安装资源。';
+      _log(error!);
+      notifyListeners();
+      return;
+    }
+
+    final sessions = <DeviceController>[];
+    final sessionKeys = <String>[];
+    final names = <String>[];
+    for (final id in normalizedIds) {
+      final session = sessionForDeviceId(id);
+      if (session == null ||
+          !session.isConnected ||
+          !session.sessionReady ||
+          session._sessionCipher == null ||
+          (session.connectedDevice ?? session._lastPeripheral) == null) {
+        error = '安装被拒绝：${id} 尚未完成 authkey 会话认证。';
+        _log(error!);
+        _publishMultiInstallTask(
+          request,
+          InstallStage.waitingForProtocol,
+          error!,
+          names,
+        );
+        return;
+      }
+      if (session._timeSyncInProgress || session.statusRefreshInProgress) {
+        error = '安装被拒绝：${session.connectedDeviceName ?? id} 正在处理设备状态。';
+        _log(error!);
+        _publishMultiInstallTask(
+          request,
+          InstallStage.waitingForProtocol,
+          error!,
+          names,
+        );
+        return;
+      }
+      sessions.add(session);
+      sessionKeys.add(
+        identical(session, this)
+            ? _primaryInstallSessionKey
+            : _sessionKey(session.connectedDevice!.uuid.toString()),
+      );
+      names.add(
+        (session.connectedDeviceName ??
+                session.connectedProfile?.displayName ??
+                id)
+            .trim(),
+      );
+    }
+
+    final localRequest = request.copyWith(targetDeviceIds: const <String>[]);
+    if (sessions.length == 1 && identical(sessions.single, this)) {
+      try {
+        await _startInstallSingle(localRequest);
+      } finally {
+        // Preserve the selected target for an explicit retry while retaining
+        // the legacy installer internals that intentionally see an empty list.
+        _lastInstallRequest = request;
+      }
+      return;
+    }
+
+    _multiInstallSessionIds.addAll(sessionKeys);
+    _lastInstallRequest = request;
+    _publishMultiInstallTask(
+      request,
+      InstallStage.validating,
+      '正在向 ${sessions.length} 台设备分别校验并准备安装。',
+      names,
+    );
+    try {
+      await Future.wait<void>([
+        for (final session in sessions)
+          session._startInstallSingle(localRequest),
+      ]);
+      _publishMultiInstallTask(
+        request,
+        _multiInstallResultStage(sessions),
+        _multiInstallResultMessage(sessions, names),
+        names,
+      );
+    } finally {
+      _multiInstallSessionIds.removeAll(sessionKeys);
+      _lastInstallRequest = request;
+      notifyListeners();
+    }
+  }
+
+  InstallStage _multiInstallResultStage(List<DeviceController> sessions) {
+    final stages = sessions.map((session) => session.latestTask?.stage).toSet();
+    if (stages.isNotEmpty &&
+        stages.every((stage) => stage == InstallStage.succeeded)) {
+      return InstallStage.succeeded;
+    }
+    if (stages.contains(InstallStage.stateUnknown)) {
+      return InstallStage.stateUnknown;
+    }
+    if (stages.contains(InstallStage.failed)) return InstallStage.failed;
+    if (stages.contains(InstallStage.cancelled)) return InstallStage.cancelled;
+    return InstallStage.stateUnknown;
+  }
+
+  String _multiInstallResultMessage(
+    List<DeviceController> sessions,
+    List<String> names,
+  ) {
+    final succeeded = sessions
+        .where((session) => session.latestTask?.stage == InstallStage.succeeded)
+        .length;
+    final total = sessions.length;
+    final stage = _multiInstallResultStage(sessions);
+    return switch (stage) {
+      InstallStage.succeeded => '资源已成功安装到 $succeeded/$total 台设备。',
+      InstallStage.cancelled => '已取消多设备安装；成功 $succeeded/$total 台。',
+      InstallStage.failed => '多设备安装失败；成功 $succeeded/$total 台。',
+      InstallStage.stateUnknown => '多设备安装存在状态未知的设备；成功 $succeeded/$total 台。',
+      _ => '多设备安装已结束；成功 $succeeded/$total 台。',
+    };
+  }
+
+  void _publishMultiInstallTask(
+    InstallRequest request,
+    InstallStage stage,
+    String message,
+    List<String> deviceNames,
+  ) {
+    latestTask = InstallTask(
+      kind: request.kind,
+      fileName: request.metadata.fileName,
+      stage: stage,
+      message: message,
+      targetDeviceName: deviceNames.isEmpty
+          ? '多设备'
+          : '多设备（${deviceNames.join('、')}）',
+      md5Hex: request.metadata.md5Hex,
+      faceId: request.metadata.faceId,
+      packageName: request.metadata.packageName,
+      versionCode: request.metadata.versionCode,
+    );
+    _log('多设备安装任务：${stage.name} — $message');
+    notifyListeners();
+  }
+
   Future<void> startInstall(InstallRequest request) async {
+    if (!_isManagedSession && request.targetDeviceIds.isNotEmpty) {
+      await _startInstallForTargets(request);
+      return;
+    }
+    await _startInstallSingle(
+      request.copyWith(targetDeviceIds: const <String>[]),
+    );
+  }
+
+  Future<void> _startInstallSingle(InstallRequest request) async {
     if (_timeSyncInProgress) {
       _log('安装被拒绝：系统时间同步正在进行，请等待同步完成。');
       return;
@@ -3599,6 +4573,26 @@ class DeviceController extends ChangeNotifier {
   }
 
   Future<void> cancelInstall() async {
+    if (!_isManagedSession && _multiInstallSessionIds.isNotEmpty) {
+      final sessions = <DeviceController>[];
+      for (final sessionKey in _multiInstallSessionIds.toList()) {
+        final session = sessionKey == _primaryInstallSessionKey
+            ? this
+            : _additionalSessions[sessionKey];
+        if (session != null && !sessions.contains(session)) {
+          sessions.add(session);
+        }
+      }
+      await Future.wait<void>([
+        for (final session in sessions) session._cancelInstallSingle(),
+      ]);
+      _log('已向所有正在安装的设备请求停止。');
+      return;
+    }
+    await _cancelInstallSingle();
+  }
+
+  Future<void> _cancelInstallSingle() async {
     if (!_installInProgress) return;
     _installCancelled = true;
     for (final waiter in _pendingAcks.values) {
@@ -4017,6 +5011,618 @@ class DeviceController extends ChangeNotifier {
     }
   }
 
+  /// Opens a listed quick app through the authenticated macOS SPP session.
+  ///
+  /// Xiaomi Fitness sends command=20/sub=4 as a fire-and-ACK operation: there
+  /// is no separate encrypted business result to await after the device has
+  /// accepted the command on the transport. The original package fingerprint
+  /// is required for devices which validate the installed app identity.
+  Future<bool> launchWatchApp(WatchAppItem app) async {
+    if (!_isMacOS) {
+      watchAppsError = '快应用启动目前仅支持 macOS';
+      notifyListeners();
+      return false;
+    }
+    if (watchAppsLoading) return false;
+    if (installInProgress) {
+      watchAppsError = '资源安装正在进行，请等待任务结束后再启动快应用';
+      notifyListeners();
+      return false;
+    }
+    if (app.packageName.trim().isEmpty) {
+      watchAppsError = '快应用包名为空，无法启动';
+      notifyListeners();
+      return false;
+    }
+    final sessionCipher = _sessionCipher;
+    if (!sessionReady || sessionCipher == null) {
+      watchAppsError = '请先完成设备鉴权';
+      notifyListeners();
+      return false;
+    }
+
+    final sessionEpoch = _sessionEpoch;
+    final operationGeneration = ++_quickAppOperationGeneration;
+    // A list response which started before this command must not overwrite
+    // the visible operation state after the device has accepted the launch.
+    _quickAppReadGeneration++;
+
+    bool isCurrentOperation() =>
+        operationGeneration == _quickAppOperationGeneration &&
+        sessionEpoch == _sessionEpoch &&
+        sessionReady &&
+        identical(_sessionCipher, sessionCipher);
+
+    watchAppsLoading = true;
+    watchAppsError = null;
+    _logQuickAppRead(
+      '发送设备快应用启动命令。',
+      event: 'quick_app_launch_request',
+      fields: <String, Object?>{
+        'command': ZauCommand.appList,
+        'sub': ZauCommand.launchAppSub,
+        'packageName': app.packageName,
+        'fingerprintBytes': app.fingerprint.length,
+        'uri': '/',
+        'sessionEpoch': sessionEpoch,
+        'operationGeneration': operationGeneration,
+      },
+    );
+    notifyListeners();
+    try {
+      await _sendBusinessNoResponse(
+        Zau(
+          command: ZauCommand.appList,
+          sub: ZauCommand.launchAppSub,
+          payload: V8s.launchRequest(
+            packageName: app.packageName,
+            fingerprint: app.fingerprint,
+          ),
+        ),
+      );
+      if (!isCurrentOperation()) {
+        _logQuickAppRead(
+          '已忽略过期会话的快应用启动 ACK。',
+          level: DiagnosticLogLevel.trace,
+          event: 'quick_app_launch_stale',
+          fields: <String, Object?>{
+            'result': 'ack',
+            'packageName': app.packageName,
+            'operationSessionEpoch': sessionEpoch,
+            'currentSessionEpoch': _sessionEpoch,
+            'operationGeneration': operationGeneration,
+            'currentOperationGeneration': _quickAppOperationGeneration,
+          },
+        );
+        return false;
+      }
+      _logQuickAppRead(
+        '快应用启动命令已收到 SPP ACK。',
+        event: 'quick_app_launch_ack',
+        fields: <String, Object?>{
+          'command': ZauCommand.appList,
+          'sub': ZauCommand.launchAppSub,
+          'packageName': app.packageName,
+          'sessionEpoch': sessionEpoch,
+          'operationGeneration': operationGeneration,
+        },
+      );
+      return true;
+    } on Object catch (exception) {
+      if (!isCurrentOperation()) {
+        _logQuickAppRead(
+          '已忽略过期会话的快应用启动失败。',
+          level: DiagnosticLogLevel.trace,
+          event: 'quick_app_launch_stale',
+          fields: <String, Object?>{
+            'result': 'error',
+            'packageName': app.packageName,
+            'operationSessionEpoch': sessionEpoch,
+            'currentSessionEpoch': _sessionEpoch,
+            'operationGeneration': operationGeneration,
+            'currentOperationGeneration': _quickAppOperationGeneration,
+            'errorType': exception.runtimeType.toString(),
+          },
+        );
+        return false;
+      }
+      watchAppsError = '启动快应用失败：$exception';
+      _logQuickAppRead(
+        watchAppsError!,
+        level: DiagnosticLogLevel.error,
+        event: 'quick_app_launch_failed',
+        fields: <String, Object?>{
+          'packageName': app.packageName,
+          'sessionEpoch': sessionEpoch,
+          'operationGeneration': operationGeneration,
+          'errorType': exception.runtimeType.toString(),
+          'exception': exception.toString(),
+        },
+      );
+      return false;
+    } finally {
+      if (operationGeneration == _quickAppOperationGeneration &&
+          sessionEpoch == _sessionEpoch) {
+        watchAppsLoading = false;
+        notifyListeners();
+      }
+    }
+  }
+
+  /// Reads the installed watchfaces from the authenticated device.
+  ///
+  /// Unlike quick-app deletion, a watchface operation has to wait for the
+  /// explicit command=4/sub=2 business response. The same read is shared by
+  /// the management page and installation preflight so a duplicate ID cannot
+  /// slip through merely because another refresh is in flight.
+  Future<List<WatchfaceItem>> refreshInstalledWatchfaces() async {
+    if (!_isMacOS) {
+      watchfacesError = '表盘管理目前仅支持 macOS';
+      notifyListeners();
+      return installedWatchfaces;
+    }
+    final pending = _watchfaceReadCompleter;
+    if (pending != null) {
+      _logWatchface(
+        '表盘列表读取已在进行，等待当前请求完成。',
+        level: DiagnosticLogLevel.trace,
+        event: 'watchface_list_deduplicated',
+      );
+      return pending.future;
+    }
+    if (watchfacesLoading) {
+      watchfacesError = '设备表盘正在被修改，请稍后再试';
+      _logWatchface(
+        '表盘列表读取被拒绝：另一个表盘操作正在进行。',
+        level: DiagnosticLogLevel.warning,
+        event: 'watchface_list_rejected',
+      );
+      notifyListeners();
+      return installedWatchfaces;
+    }
+    if (installInProgress) {
+      watchfacesError = '资源安装正在进行，请等待任务结束后再读取表盘';
+      _logWatchface(
+        '表盘列表读取被拒绝：资源安装正在进行。',
+        level: DiagnosticLogLevel.warning,
+        event: 'watchface_list_rejected',
+      );
+      notifyListeners();
+      return installedWatchfaces;
+    }
+    final sessionCipher = _sessionCipher;
+    if (!sessionReady || sessionCipher == null) {
+      watchfacesError = '请先完成设备鉴权';
+      _logWatchface(
+        '表盘列表读取被拒绝：设备鉴权会话未就绪。',
+        level: DiagnosticLogLevel.warning,
+        event: 'watchface_list_rejected',
+        fields: <String, Object?>{
+          'sessionReady': sessionReady,
+          'sessionCipherReady': sessionCipher != null,
+        },
+      );
+      notifyListeners();
+      return installedWatchfaces;
+    }
+
+    final sessionEpoch = _sessionEpoch;
+    final requestGeneration = ++_watchfaceReadGeneration;
+    final completion = Completer<List<WatchfaceItem>>();
+    _watchfaceReadCompleter = completion;
+
+    bool isCurrentRequest() =>
+        requestGeneration == _watchfaceReadGeneration &&
+        sessionEpoch == _sessionEpoch &&
+        sessionReady &&
+        identical(_sessionCipher, sessionCipher);
+
+    watchfacesLoading = true;
+    watchfacesError = null;
+    _logWatchface(
+      '读取设备表盘列表。',
+      event: 'watchface_list_request',
+      fields: <String, Object?>{
+        'command': ZauCommand.setFace,
+        'sub': ZauCommand.watchfaceListSub,
+        'sessionEpoch': sessionEpoch,
+        'requestGeneration': requestGeneration,
+      },
+    );
+    notifyListeners();
+    try {
+      final response = await _requestBusiness(
+        Zau(command: ZauCommand.setFace, sub: ZauCommand.watchfaceListSub),
+        ZauCommand.setFace,
+        ZauCommand.watchfaceListSub,
+      );
+      final payload = response.payload;
+      _logWatchface(
+        '收到设备表盘列表响应。',
+        level: DiagnosticLogLevel.trace,
+        event: 'watchface_list_response',
+        fields: <String, Object?>{
+          'responseCommand': response.command,
+          'responseSub': response.sub,
+          'payloadField': payload?.$1,
+          'payloadBytes': payload?.$2.length,
+          'sessionEpoch': sessionEpoch,
+          'requestGeneration': requestGeneration,
+        },
+      );
+      if (!isCurrentRequest()) {
+        _logWatchface(
+          '已忽略过期会话的表盘列表响应。',
+          level: DiagnosticLogLevel.trace,
+          event: 'watchface_list_stale',
+          fields: <String, Object?>{
+            'requestSessionEpoch': sessionEpoch,
+            'currentSessionEpoch': _sessionEpoch,
+            'requestGeneration': requestGeneration,
+            'currentGeneration': _watchfaceReadGeneration,
+          },
+        );
+        return installedWatchfaces;
+      }
+      if (payload == null || payload.$1 != 6) {
+        throw const FormatException('设备表盘列表缺少 a9u 载荷');
+      }
+      final parsed = A9u.parseInstalledWatchfaces(payload.$2);
+      installedWatchfaces = List<WatchfaceItem>.unmodifiable(parsed);
+      _watchfacesLoadedSessionEpoch = sessionEpoch;
+      _logWatchface(
+        '设备表盘列表读取完成。',
+        event: 'watchface_list_parsed',
+        fields: <String, Object?>{
+          'watchfaceCount': parsed.length,
+          'removableCount': parsed.where((face) => face.canRemove).length,
+          'currentCount': parsed.where((face) => face.isCurrent).length,
+        },
+      );
+      return installedWatchfaces;
+    } on Object catch (exception) {
+      if (!isCurrentRequest()) {
+        _logWatchface(
+          '已忽略过期会话的表盘列表读取失败。',
+          level: DiagnosticLogLevel.trace,
+          event: 'watchface_list_stale',
+          fields: <String, Object?>{
+            'requestSessionEpoch': sessionEpoch,
+            'currentSessionEpoch': _sessionEpoch,
+            'requestGeneration': requestGeneration,
+            'currentGeneration': _watchfaceReadGeneration,
+            'errorType': exception.runtimeType.toString(),
+          },
+        );
+        return installedWatchfaces;
+      }
+      watchfacesError = '读取表盘列表失败：$exception';
+      _logWatchface(
+        '读取设备表盘列表失败。',
+        level: DiagnosticLogLevel.error,
+        event: 'watchface_list_failed',
+        fields: <String, Object?>{
+          'errorType': exception.runtimeType.toString(),
+          'exception': exception.toString(),
+        },
+      );
+      return installedWatchfaces;
+    } finally {
+      if (!completion.isCompleted) completion.complete(installedWatchfaces);
+      if (identical(_watchfaceReadCompleter, completion)) {
+        _watchfaceReadCompleter = null;
+      }
+      // A later operation or a newer authenticated session owns visible
+      // loading state. Delayed old responses must never unlock the new one.
+      if (requestGeneration == _watchfaceReadGeneration &&
+          sessionEpoch == _sessionEpoch) {
+        watchfacesLoading = false;
+        notifyListeners();
+      }
+    }
+  }
+
+  /// Removes a device-reported removable watchface after a confirmed 4/2
+  /// business response. Returns false for a rejected or stale operation.
+  Future<bool> uninstallWatchface(WatchfaceItem watchface) async {
+    if (!_isMacOS) {
+      watchfacesError = '表盘管理目前仅支持 macOS';
+      notifyListeners();
+      return false;
+    }
+    if (!watchface.canRemove || watchfacesLoading) return false;
+    if (installInProgress) {
+      watchfacesError = '资源安装正在进行，请等待任务结束后再卸载表盘';
+      notifyListeners();
+      return false;
+    }
+    if (watchface.id.trim().isEmpty) {
+      watchfacesError = '表盘 ID 为空，无法卸载';
+      notifyListeners();
+      return false;
+    }
+    final sessionCipher = _sessionCipher;
+    if (!sessionReady || sessionCipher == null) {
+      watchfacesError = '请先完成设备鉴权';
+      notifyListeners();
+      return false;
+    }
+
+    final sessionEpoch = _sessionEpoch;
+    final operationGeneration = ++_watchfaceOperationGeneration;
+    // A list response that began before deletion must never put the removed
+    // watchface back into local state after the device has confirmed removal.
+    _watchfaceReadGeneration++;
+
+    bool isCurrentOperation() =>
+        operationGeneration == _watchfaceOperationGeneration &&
+        sessionEpoch == _sessionEpoch &&
+        sessionReady &&
+        identical(_sessionCipher, sessionCipher);
+
+    watchfacesLoading = true;
+    watchfacesError = null;
+    _logWatchface(
+      '发送设备表盘卸载命令。',
+      event: 'watchface_uninstall_request',
+      fields: <String, Object?>{
+        'command': ZauCommand.setFace,
+        'sub': ZauCommand.uninstallWatchfaceSub,
+        'faceId': watchface.id,
+        'sessionEpoch': sessionEpoch,
+        'operationGeneration': operationGeneration,
+      },
+    );
+    notifyListeners();
+    try {
+      final response = await _requestBusiness(
+        Zau(
+          command: ZauCommand.setFace,
+          sub: ZauCommand.uninstallWatchfaceSub,
+          payload: A9u.withFaceId(watchface.id),
+        ),
+        ZauCommand.setFace,
+        ZauCommand.uninstallWatchfaceSub,
+      );
+      if (!isCurrentOperation()) {
+        _logWatchface(
+          '已忽略过期会话的表盘卸载响应。',
+          level: DiagnosticLogLevel.trace,
+          event: 'watchface_uninstall_stale',
+          fields: <String, Object?>{
+            'faceId': watchface.id,
+            'operationSessionEpoch': sessionEpoch,
+            'currentSessionEpoch': _sessionEpoch,
+            'operationGeneration': operationGeneration,
+            'currentOperationGeneration': _watchfaceOperationGeneration,
+          },
+        );
+        return false;
+      }
+      final payload = response.payload;
+      if (payload == null || payload.$1 != 6) {
+        throw const FormatException('设备表盘卸载响应缺少 a9u 载荷');
+      }
+      final accepted = A9u.parseWatchfaceDeletionResult(payload.$2);
+      if (accepted != true) {
+        throw StateError(
+          accepted == false ? '设备拒绝卸载表盘 ID ${watchface.id}' : '设备表盘卸载响应缺少成功标志',
+        );
+      }
+
+      final previousCount = installedWatchfaces.length;
+      installedWatchfaces = List<WatchfaceItem>.unmodifiable(
+        installedWatchfaces.where((installed) => installed.id != watchface.id),
+      );
+      watchfacesError = null;
+      _watchfacesLoadedSessionEpoch = sessionEpoch;
+      _logWatchface(
+        '设备确认表盘已卸载，本地列表已更新。',
+        event: 'watchface_uninstall_confirmed',
+        fields: <String, Object?>{
+          'faceId': watchface.id,
+          'removedLocal': previousCount != installedWatchfaces.length,
+          'remainingCount': installedWatchfaces.length,
+          'sessionEpoch': sessionEpoch,
+          'operationGeneration': operationGeneration,
+        },
+      );
+      return true;
+    } on Object catch (exception) {
+      if (!isCurrentOperation()) {
+        _logWatchface(
+          '已忽略过期会话的表盘卸载失败。',
+          level: DiagnosticLogLevel.trace,
+          event: 'watchface_uninstall_stale',
+          fields: <String, Object?>{
+            'faceId': watchface.id,
+            'operationSessionEpoch': sessionEpoch,
+            'currentSessionEpoch': _sessionEpoch,
+            'operationGeneration': operationGeneration,
+            'currentOperationGeneration': _watchfaceOperationGeneration,
+            'errorType': exception.runtimeType.toString(),
+          },
+        );
+        return false;
+      }
+      watchfacesError = '卸载表盘失败：$exception';
+      _logWatchface(
+        watchfacesError!,
+        level: DiagnosticLogLevel.error,
+        event: 'watchface_uninstall_failed',
+        fields: <String, Object?>{
+          'faceId': watchface.id,
+          'sessionEpoch': sessionEpoch,
+          'operationGeneration': operationGeneration,
+          'errorType': exception.runtimeType.toString(),
+          'exception': exception.toString(),
+        },
+      );
+      return false;
+    } finally {
+      if (operationGeneration == _watchfaceOperationGeneration &&
+          sessionEpoch == _sessionEpoch) {
+        watchfacesLoading = false;
+        notifyListeners();
+      }
+    }
+  }
+
+  /// Activates an installed watchface after the device confirms command=4/1.
+  ///
+  /// The current-face marker remains device-derived: it is changed locally
+  /// only after Xiaomi's a9u.field4 success flag is present and true.
+  Future<bool> activateWatchface(WatchfaceItem watchface) async {
+    if (!_isMacOS) {
+      watchfacesError = '表盘切换目前仅支持 macOS';
+      notifyListeners();
+      return false;
+    }
+    if (watchface.isCurrent || watchfacesLoading) return false;
+    if (installInProgress) {
+      watchfacesError = '资源安装正在进行，请等待任务结束后再切换表盘';
+      notifyListeners();
+      return false;
+    }
+    if (watchface.id.trim().isEmpty) {
+      watchfacesError = '表盘 ID 为空，无法切换';
+      notifyListeners();
+      return false;
+    }
+    final sessionCipher = _sessionCipher;
+    if (!sessionReady || sessionCipher == null) {
+      watchfacesError = '请先完成设备鉴权';
+      notifyListeners();
+      return false;
+    }
+
+    final sessionEpoch = _sessionEpoch;
+    final operationGeneration = ++_watchfaceOperationGeneration;
+    // A list response which began before switching may describe the old
+    // current face. It must not replace state after a confirmed activation.
+    _watchfaceReadGeneration++;
+
+    bool isCurrentOperation() =>
+        operationGeneration == _watchfaceOperationGeneration &&
+        sessionEpoch == _sessionEpoch &&
+        sessionReady &&
+        identical(_sessionCipher, sessionCipher);
+
+    watchfacesLoading = true;
+    watchfacesError = null;
+    _logWatchface(
+      '发送设备表盘切换命令。',
+      event: 'watchface_activate_request',
+      fields: <String, Object?>{
+        'command': ZauCommand.setFace,
+        'sub': ZauCommand.activateWatchfaceSub,
+        'faceId': watchface.id,
+        'sessionEpoch': sessionEpoch,
+        'operationGeneration': operationGeneration,
+      },
+    );
+    notifyListeners();
+    try {
+      final response = await _requestBusiness(
+        Zau(
+          command: ZauCommand.setFace,
+          sub: ZauCommand.activateWatchfaceSub,
+          payload: A9u.withFaceId(watchface.id),
+        ),
+        ZauCommand.setFace,
+        ZauCommand.activateWatchfaceSub,
+      );
+      if (!isCurrentOperation()) {
+        _logWatchface(
+          '已忽略过期会话的表盘切换响应。',
+          level: DiagnosticLogLevel.trace,
+          event: 'watchface_activate_stale',
+          fields: <String, Object?>{
+            'faceId': watchface.id,
+            'operationSessionEpoch': sessionEpoch,
+            'currentSessionEpoch': _sessionEpoch,
+            'operationGeneration': operationGeneration,
+            'currentOperationGeneration': _watchfaceOperationGeneration,
+          },
+        );
+        return false;
+      }
+      final payload = response.payload;
+      if (payload == null || payload.$1 != 6) {
+        throw const FormatException('设备表盘切换响应缺少 a9u 载荷');
+      }
+      final accepted = A9u.parseWatchfaceActivationResult(payload.$2);
+      if (accepted != true) {
+        throw StateError(
+          accepted == false ? '设备拒绝切换到表盘 ID ${watchface.id}' : '设备表盘切换响应缺少成功标志',
+        );
+      }
+
+      installedWatchfaces = List<WatchfaceItem>.unmodifiable(
+        installedWatchfaces
+            .map(
+              (installed) => WatchfaceItem(
+                id: installed.id,
+                name: installed.name,
+                isCurrent: installed.id == watchface.id,
+                canRemove: installed.canRemove,
+                versionCode: installed.versionCode,
+              ),
+            )
+            .toList(growable: false),
+      );
+      watchfacesError = null;
+      _watchfacesLoadedSessionEpoch = sessionEpoch;
+      _logWatchface(
+        '设备确认表盘已切换，本地当前表盘标记已更新。',
+        event: 'watchface_activate_confirmed',
+        fields: <String, Object?>{
+          'faceId': watchface.id,
+          'sessionEpoch': sessionEpoch,
+          'operationGeneration': operationGeneration,
+        },
+      );
+      return true;
+    } on Object catch (exception) {
+      if (!isCurrentOperation()) {
+        _logWatchface(
+          '已忽略过期会话的表盘切换失败。',
+          level: DiagnosticLogLevel.trace,
+          event: 'watchface_activate_stale',
+          fields: <String, Object?>{
+            'faceId': watchface.id,
+            'operationSessionEpoch': sessionEpoch,
+            'currentSessionEpoch': _sessionEpoch,
+            'operationGeneration': operationGeneration,
+            'currentOperationGeneration': _watchfaceOperationGeneration,
+            'errorType': exception.runtimeType.toString(),
+          },
+        );
+        return false;
+      }
+      watchfacesError = '切换表盘失败：$exception';
+      _logWatchface(
+        watchfacesError!,
+        level: DiagnosticLogLevel.error,
+        event: 'watchface_activate_failed',
+        fields: <String, Object?>{
+          'faceId': watchface.id,
+          'sessionEpoch': sessionEpoch,
+          'operationGeneration': operationGeneration,
+          'errorType': exception.runtimeType.toString(),
+          'exception': exception.toString(),
+        },
+      );
+      return false;
+    } finally {
+      if (operationGeneration == _watchfaceOperationGeneration &&
+          sessionEpoch == _sessionEpoch) {
+        watchfacesLoading = false;
+        notifyListeners();
+      }
+    }
+  }
+
   /// 只校验本地检查点和源文件；没有设备侧状态查询证据时绝不自行续传。
   Future<void> reconnectAndCheckInstall() async {
     final checkpoint = await _checkpointStore.load();
@@ -4107,6 +5713,7 @@ class DeviceController extends ChangeNotifier {
       source: source,
       unsupportedLuaConfirmed: request.unsupportedLuaConfirmed,
       watchfaceResolutionConfirmed: request.watchfaceResolutionConfirmed,
+      targetDeviceIds: request.targetDeviceIds,
     );
 
     final lastRequest = _lastInstallRequest;
@@ -4144,6 +5751,13 @@ class DeviceController extends ChangeNotifier {
         .firstOrNull;
     if (queuedEntry != null) {
       await _retryQueueEntry(queuedEntry);
+      return;
+    }
+    if (!_isManagedSession && request.targetDeviceIds.isNotEmpty) {
+      // Each selected session retains its own checkpoint and authentication
+      // state. Do not force a primary-device reconnect for a multi-target
+      // retry; startInstall will validate and dispatch to the selected lanes.
+      await startInstall(request);
       return;
     }
     final checkpoint = await _checkpointStore.load();
@@ -4235,7 +5849,10 @@ class DeviceController extends ChangeNotifier {
     // all Mass data is acknowledged; otherwise a large file can time out while
     // it is still being transferred.
     final watchCompletion = request.kind == InstallKind.watchface
-        ? _listenBusiness(ZauCommand.setFace, 5)
+        ? _listenBusiness(
+            ZauCommand.setFace,
+            ZauCommand.watchfaceInstallResultSub,
+          )
         : null;
     final appCompletion = request.kind == InstallKind.quickApp
         ? _listenQuickAppInstallResult(metadata.packageName!)
@@ -4245,19 +5862,24 @@ class DeviceController extends ChangeNotifier {
       final preinstall = await _requestBusiness(
         Zau(
           command: ZauCommand.setFace,
-          sub: 4,
+          sub: ZauCommand.prepareWatchfaceInstallSub,
           payload: A9u.withFileInfo(
             faceId: metadata.faceId!,
             fileSize: bytes.length,
           ),
         ),
         ZauCommand.setFace,
-        4,
+        ZauCommand.prepareWatchfaceInstallSub,
       );
       final payload = preinstall.payload;
       if (payload == null) throw StateError('表盘预安装响应缺少载荷');
       final result = A9u.parse(payload.$2);
       if (result.code != 0) {
+        if (result.canReplace) {
+          throw _DeviceInstallFailed(
+            '设备检测到同 ID 表盘且允许覆盖。请重新开始安装，并在覆盖确认中先卸载旧表盘。',
+          );
+        }
         throw _DeviceInstallFailed('设备拒绝表盘预安装，状态=${result.code}');
       }
       _log('表盘预安装通过：faceId=${metadata.faceId}');
@@ -4463,11 +6085,11 @@ class DeviceController extends ChangeNotifier {
       await _requestBusiness(
         Zau(
           command: ZauCommand.setFace,
-          sub: 1,
+          sub: ZauCommand.activateWatchfaceSub,
           payload: A9u.withFaceId(metadata.faceId!),
         ),
         ZauCommand.setFace,
-        1,
+        ZauCommand.activateWatchfaceSub,
       );
       await _clearCheckpointBestEffort();
       _publishTask(
@@ -5298,10 +6920,28 @@ class DeviceController extends ChangeNotifier {
     _sppConnectionEpoch++;
     _closingFailedSppEpoch = null;
     _clearSppHandshakeState();
+    if (!_isManagedSession) {
+      // Child sessions share the transport EventChannel with the primary
+      // controller. Remove their listeners and dispose their per-device
+      // channels before the primary releases that shared stream.
+      final children = _additionalSessions.entries.toList(growable: false);
+      _additionalSessions.clear();
+      _additionalSessionNames.clear();
+      _additionalSessionContexts.clear();
+      _multiInstallSessionIds.clear();
+      for (final entry in children) {
+        final listener = _additionalSessionListeners.remove(entry.key);
+        if (listener != null) entry.value.removeListener(listener);
+        entry.value.dispose();
+      }
+      _additionalSessionListeners.clear();
+    }
     unawaited(_scanSubscription?.cancel());
     unawaited(_bluetoothStateSubscription?.cancel());
     unawaited(_sppSub?.cancel());
     _sppSub = null;
+    unawaited(_sppClosedSub?.cancel());
+    _sppClosedSub = null;
     for (final waiter in _completionWaiters) {
       unawaited(waiter.cancel());
     }
@@ -5311,9 +6951,56 @@ class DeviceController extends ChangeNotifier {
     if (device != null) {
       unawaited(_transport.disconnectRfcomm(device.uuid).catchError((_) {}));
     }
-    unawaited(_transport.disposeRfcommStream());
+    // Only the primary controller owns the shared native EventChannel. A
+    // secondary session releases its own subscriptions and RFCOMM UUID above,
+    // but must never silence the other connected devices.
+    if (!_isManagedSession) {
+      unawaited(_transport.disposeRfcommStream());
+    }
     super.dispose();
   }
+}
+
+/// A presentation-safe view of one independently authenticated device session.
+/// The primary controller owns lifecycle and routing; callers use this only to
+/// render the device card and invoke that session's established actions.
+class DeviceSessionView {
+  const DeviceSessionView({
+    required this.id,
+    required this.name,
+    required this.controller,
+    required this.isPrimary,
+  });
+
+  final String id;
+  final String name;
+  final DeviceController controller;
+  final bool isPrimary;
+}
+
+/// Immutable physical identity and model information retained by the primary
+/// controller for a secondary macOS session. It deliberately contains no
+/// authkey: authentication material remains in the child controller and the
+/// device-scoped secure store only.
+class _AdditionalSessionContext {
+  _AdditionalSessionContext({
+    required this.peripheral,
+    required this.profile,
+    required this.advertisedName,
+    required this.directIdentity,
+  });
+
+  final Peripheral peripheral;
+  final DeviceProfile profile;
+  final String advertisedName;
+  bool directIdentity;
+}
+
+class ResourceInstallDevice {
+  const ResourceInstallDevice({required this.id, required this.name});
+
+  final String id;
+  final String name;
 }
 
 /// Lightweight peripheral identity used only by the macOS RFCOMM bridge.
